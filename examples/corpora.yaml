@@ -1,0 +1,35 @@
+corpora:
+  - corpus_id: product_docs
+    name: Product Documentation
+    description: >
+      Product manuals, release notes, API references, and user-facing documentation.
+      Use this corpus for product behavior, configuration, integration, and version questions.
+      Do not use it for internal incidents or customer-specific contracts.
+    domain: product
+    owner: product-engineering
+    collection_name: product_docs
+    metadata_filters: {}
+    access_policy: {}
+
+  - corpus_id: engineering_wiki
+    name: Engineering Wiki
+    description: >
+      Internal architecture notes, ADRs, runbooks, service dependency documents,
+      deployment guides, and postmortems. Use this corpus for implementation,
+      incident analysis, runtime behavior, and system dependency questions.
+    domain: engineering
+    owner: platform
+    collection_name: engineering_wiki
+    metadata_filters: {}
+    access_policy: {}
+
+  - corpus_id: support_tickets
+    name: Support Tickets
+    description: >
+      Customer support cases, issue histories, workarounds, symptoms, and resolution notes.
+      Use this corpus for recurring customer problems, operational symptoms, and known fixes.
+    domain: support
+    owner: customer-success
+    collection_name: support_tickets
+    metadata_filters: {}
+    access_policy: {}
