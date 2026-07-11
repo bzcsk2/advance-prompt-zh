@@ -222,17 +222,30 @@ class MetadataStore:
         cur.execute("BEGIN IMMEDIATE")
         try:
             lease = cur.execute(
-                "SELECT owner_job_id, status, lease_generation FROM document_builds "
+                "SELECT owner_job_id, status, lease_generation, previous_active_version "
+                "FROM document_builds "
                 "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND document_version=?",
                 (tenant_id, corpus_id, document_id, document_version),
             ).fetchone()
             if lease is None:
                 generation = 1
+                # P1-2: capture the version this BUILD replaces at the FIRST lease
+                # claim. It is bound to the build (lease) identity, not to a job,
+                # so a replacement job taking over the lease later inherits it and
+                # never recomputes it against the (already-switched) active version
+                # (E-008.4 P1-2).
+                active = cur.execute(
+                    "SELECT version FROM documents "
+                    "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active'",
+                    (tenant_id, corpus_id, document_id),
+                ).fetchone()
+                previous_version = active["version"] if active else None
                 cur.execute(
                     "INSERT INTO document_builds "
                     "(tenant_id, corpus_id, document_id, document_version, "
-                    " owner_job_id, status, base_revision, acquired_at, lease_generation) "
-                    "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)",
+                    " owner_job_id, status, base_revision, acquired_at, lease_generation, "
+                    " previous_active_version) "
+                    "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
                     (
                         tenant_id,
                         corpus_id,
@@ -242,11 +255,15 @@ class MetadataStore:
                         base_revision,
                         _now_iso(),
                         generation,
+                        previous_version,
                     ),
                 )
             else:
                 owner = lease["owner_job_id"]
                 generation = int(lease["lease_generation"]) + 1
+                # Carry the lease-bound previous_active_version forward; never
+                # recompute it on takeover/resume (E-008.4 P1-2).
+                previous_version = lease["previous_active_version"]
                 if owner != job_id:
                     owner_status = self.get_job_status(owner)
                     if owner_status in (
@@ -259,11 +276,12 @@ class MetadataStore:
                             f"{document_version}) owned by in-flight job {owner!r}"
                         )
                     # Terminal owner (succeeded/failed/cancelled): take over the
-                    # lease so a re-delivered job can rebuild idempotently.
+                    # lease so a re-delivered job can rebuild idempotently. The
+                    # lease-bound previous_active_version travels with the lease.
                     cur.execute(
                         "UPDATE document_builds "
                         "SET owner_job_id=?, status='running', base_revision=?, "
-                        "acquired_at=?, lease_generation=? "
+                        "acquired_at=?, lease_generation=?, previous_active_version=? "
                         "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
                         "AND document_version=?",
                         (
@@ -271,6 +289,7 @@ class MetadataStore:
                             base_revision,
                             _now_iso(),
                             generation,
+                            previous_version,
                             tenant_id,
                             corpus_id,
                             document_id,
@@ -280,17 +299,19 @@ class MetadataStore:
                 else:
                     # Same owner resume / retry: reset job + lease to running and
                     # advance the fencing token so a taken-over stale owner is
-                    # rejected before mutating shared state (E-008.3 P1-2).
+                    # rejected before mutating shared state (E-008.3 P1-2). The
+                    # lease-bound previous_active_version is carried forward.
                     cur.execute(
                         "UPDATE document_builds "
                         "SET status='running', base_revision=?, acquired_at=?, "
-                        "lease_generation=? "
+                        "lease_generation=?, previous_active_version=? "
                         "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
                         "AND document_version=?",
                         (
                             base_revision,
                             _now_iso(),
                             generation,
+                            previous_version,
                             tenant_id,
                             corpus_id,
                             document_id,
@@ -320,8 +341,9 @@ class MetadataStore:
                     INSERT INTO ingestion_jobs (
                         job_id, document_id, document_version, corpus_id, tenant_id,
                         status, started_at, raw_hash, parent_count, child_count,
-                        parser_version, chunking_version, embedding_version, base_revision
-                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0, 0, ?, ?, ?, ?)
+                        parser_version, chunking_version, embedding_version, base_revision,
+                        previous_active_version
+                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0, 0, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id,
@@ -335,6 +357,7 @@ class MetadataStore:
                         chunking_version,
                         embedding_version,
                         base_revision,
+                        previous_version,
                     ),
                 )
                 status: JobStatus = JobStatus.RUNNING
@@ -355,32 +378,15 @@ class MetadataStore:
                 status = JobStatus(row["status"])
                 if status != JobStatus.RUNNING:
                     # Resuming a terminal/failed job: reset to running so a
-                    # retrying owner is not seen as takeable (P1-2).
+                    # retrying owner is not seen as takeable (P1-2). Carry the
+                    # lease-bound previous_active_version forward (E-008.4 P1-2).
                     cur.execute(
                         "UPDATE ingestion_jobs SET status='running', finished_at=NULL, "
-                        "error_code=NULL, error_message=NULL WHERE job_id=?",
-                        (job_id,),
+                        "error_code=NULL, error_message=NULL, previous_active_version=? "
+                        "WHERE job_id=?",
+                        (previous_version, job_id),
                     )
                     status = JobStatus.RUNNING
-
-            # Capture the version this job replaces at acquire time (stable
-            # across resume); the commit-phase CAS may return a different value
-            # on resume, so it must not overwrite the persisted acquire value.
-            prev_row = cur.execute(
-                "SELECT previous_active_version FROM ingestion_jobs WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()
-            if prev_row["previous_active_version"] is None:
-                active = cur.execute(
-                    "SELECT version FROM documents "
-                    "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active'",
-                    (tenant_id, corpus_id, document_id),
-                ).fetchone()
-                previous_version = active["version"] if active else None
-                cur.execute(
-                    "UPDATE ingestion_jobs SET previous_active_version = ? WHERE job_id = ?",
-                    (previous_version, job_id),
-                )
 
             cur.execute("COMMIT")
             # The "acquire" step marker lets a resumed run skip re-claiming the

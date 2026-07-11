@@ -14,6 +14,7 @@ can resume without producing duplicate business IDs or Chunks (§10.10 #3).
 from __future__ import annotations
 
 import hashlib
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -51,6 +52,37 @@ def _sha256(text: str) -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# In-process execution-attempt guard (E-008.4 P1-3). A build identity
+# ``(tenant, corpus, document, version)`` may have at most ONE live execution of
+# ``run()`` per process. A second concurrent ``run()`` for the same build is a
+# duplicate delivery (not a recovery) and is rejected with ``BUILD_CONFLICT``
+# before it touches the lease or data plane. A retry after the prior execution
+# has exited (crashed or finished) is a genuine recovery and proceeds. This
+# separates the job identity (immutable binding) from the execution attempt
+# (lease holder); it is deliberately in-process only -- cross-process liveness
+# requires a lease timeout/heartbeat, which is out of scope for this fix.
+_BUILD_GUARD_LOCK = threading.Lock()
+_BUILD_GUARDS: dict[tuple[str, str, str, str], int] = {}
+
+
+def _claim_build_guard(key: tuple[str, str, str, str]) -> bool:
+    """Return True (and register) if no live execution holds ``key`` in this process.
+
+    Returns False if a live execution already holds the guard (a concurrent
+    duplicate delivery within the same process).
+    """
+    with _BUILD_GUARD_LOCK:
+        if key in _BUILD_GUARDS:
+            return False
+        _BUILD_GUARDS[key] = 1
+        return True
+
+
+def _release_build_guard(key: tuple[str, str, str, str]) -> None:
+    with _BUILD_GUARD_LOCK:
+        _BUILD_GUARDS.pop(key, None)
 
 
 class IngestionStatus(str, Enum):
@@ -174,6 +206,39 @@ class IngestionJob:
         # Hash the content up front; it drives identity and idempotency.
         self._raw_hash = _sha256(self._req.content)
 
+        # P1-3 (E-008.4): at most ONE live execution attempt per build identity
+        # per process. A second concurrent run() for the same build is a duplicate
+        # delivery (not a recovery); reject it with BUILD_CONFLICT before it
+        # touches the lease or data plane, so the in-flight execution keeps its
+        # fencing authority and the lease generation is never advanced for a
+        # duplicate. A retry after the prior execution has exited (crashed or
+        # finished) is a genuine recovery and proceeds. This separates the job
+        # identity (immutable binding) from the execution attempt (lease holder).
+        key = (
+            self._req.tenant_id,
+            self._req.corpus_id,
+            self._req.document_id,
+            self._req.document_version,
+        )
+        if not _claim_build_guard(key):
+            return IngestionResult(
+                status=IngestionStatus.BUILD_CONFLICT,
+                job_id=self._req.job_id,
+                document_version=self._req.document_version,
+                error_code="build_conflict",
+                error_message=f"build {key!r} already in-flight in this process",
+            )
+        try:
+            return self._run_body(_max_step=max_step, steps=steps, stopped_early=stopped_early)
+        finally:
+            _release_build_guard(key)
+
+    def _run_body(
+        self,
+        _max_step: Optional[str],
+        steps: list[str],
+        stopped_early: bool,
+    ) -> IngestionResult:
         # P1-4 (fast pre-check): a job_id is an immutable binding. Reject reuse
         # with a different request up front; the authoritative atomic check lives
         # in acquire_job (single transaction) and guards concurrent deliveries.
@@ -219,32 +284,19 @@ class IngestionJob:
                 )
                 owner_status = self._store.get_job_status(owner) if owner else None
                 if owner_status == JobStatus.SUCCEEDED:
-                    # Fully published. Still guard the job_id immutable binding
-                    # (a reused job_id with a different request must fail closed).
-                    identity = self._store.get_job_identity(self._req.job_id)
-                    if identity is not None and (
-                        identity["tenant_id"] != self._req.tenant_id
-                        or identity["corpus_id"] != self._req.corpus_id
-                        or identity["document_id"] != self._req.document_id
-                        or identity["document_version"] != self._req.document_version
-                        or (identity["raw_hash"] or "") != self._raw_hash
-                    ):
-                        raise JobIdentityConflict(
-                            f"job_id={self._req.job_id!r} already bound to a "
-                            f"different request"
-                        )
-                    # P2-1: only mark terminal if this job actually owns a row.
-                    if self._store.get_job_status(self._req.job_id) is not None:
-                        self._store.mark_job_terminal(
-                            self._req.job_id, JobStatus.SUCCEEDED
-                        )
-                    return IngestionResult(
-                        status=IngestionStatus.ALREADY_INDEXED,
-                        job_id=self._req.job_id,
-                        document_version=self._req.document_version,
-                    )
-            # processing/active-but-not-fully-published same-content re-delivery:
-            # fall through and run (resume) rather than clobbering active state.
+                    return self._short_circuit_already_indexed()
+            elif existing.status == DocumentStatus.DEPRECATED:
+                # P1-1: a superseded (deprecated) version re-delivered with
+                # identical content is already materialized in the data plane.
+                # Short-circuit to ALREADY_INDEXED: never re-claim the lease, never
+                # rewrite, and never compensate (which would DELETE the superseded
+                # version's data plane). The job_id immutable-binding guard still
+                # applies (a reused job_id bound to a different request fails
+                # closed).
+                return self._short_circuit_already_indexed()
+            # processing/failed/active-but-not-fully-published same-content
+            # re-delivery: fall through and run (resume) rather than clobbering
+            # active state.
 
         # FIRST mutation: claim/renew the build lease atomically. This creates the
         # processing document row, the job row, and captures the previous active
@@ -321,6 +373,34 @@ class IngestionJob:
     # ------------------------------------------------------------------ #
     # Steps
     # ------------------------------------------------------------------ #
+    def _short_circuit_already_indexed(self) -> IngestionResult:
+        """Return ALREADY_INDEXED for an already-materialized published version.
+
+        Still enforces the job_id immutable binding: a reused ``job_id`` bound to
+        a different request fails closed with :class:`JobIdentityConflict`. A
+        ``job_id`` that owns no row (e.g. a fresh re-delivery of an existing
+        version) is left untouched (P2-1). Never claims the lease, never writes
+        the data plane, never compensates (E-008.4 P1-1).
+        """
+        identity = self._store.get_job_identity(self._req.job_id)
+        if identity is not None and (
+            identity["tenant_id"] != self._req.tenant_id
+            or identity["corpus_id"] != self._req.corpus_id
+            or identity["document_id"] != self._req.document_id
+            or identity["document_version"] != self._req.document_version
+            or (identity["raw_hash"] or "") != self._raw_hash
+        ):
+            raise JobIdentityConflict(
+                f"job_id={self._req.job_id!r} already bound to a different request"
+            )
+        if self._store.get_job_status(self._req.job_id) is not None:
+            self._store.mark_job_terminal(self._req.job_id, JobStatus.SUCCEEDED)
+        return IngestionResult(
+            status=IngestionStatus.ALREADY_INDEXED,
+            job_id=self._req.job_id,
+            document_version=self._req.document_version,
+        )
+
     def _step_acquire(self) -> None:
         # P1-3: capture and persist the monotonic lifecycle revision at acquire
         # time. The commit phase CASes against THIS value, so a newer revision

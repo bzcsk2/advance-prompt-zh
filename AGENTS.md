@@ -10,6 +10,8 @@
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
 - Issue: **E-008.1** — Audit-remediation of E-008 (7 MUST violations) — CLOSED at this commit; full contract at `docs/issue-e0081-contract.md`.
 - Issue: **E-008.2** — Audit-remediation of E-008.1 (real-crash + concurrency windows) — CLOSED at this commit; full contract at `docs/issue-e0082-contract.md`.
+- Issue: **E-008.3** — Audit-remediation of E-008.2 (lease-ownership + verify precision) — CLOSED at `b7012cb`; full contract at `docs/issue-e0083-contract.md`.
+- Issue: **E-008.4** — Audit-remediation of E-008.3 (state-transition gaps: deprecated-version idempotency, `previous_active_version` transfer across takeover, same-`job_id` concurrency) — CLOSED at this commit; full contract at `docs/issue-e0084-contract.md`.
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
 
 > **AGENTS.md is a slim entry point** (build plan §1.7): current Milestone/Issue, fixed
@@ -357,6 +359,52 @@ modifications, no `config.py`/`domain/` changes.
   (full-pipeline concurrency regression, P1-2).
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (294) all green.
+
+## E-008.4 Issue Contract (M1 only) — CLOSED at this commit
+Audit-remediation of E-008.3 (verdict **Conditional Fail**). Baseline `b7012cb` is
+kept intact; E-008.4 is a narrow fix commit closing three state-transition gaps the
+E-008.3 audit left open. Scope is a strict subset of the E-008.3 allowed paths
+(`storage/`, `ingestion/`, `tests/...`, `migrations/`, `AGENTS.md`,
+`docs/issue-e0084-contract.md`); no upstream modifications, no `config.py`/`domain/`
+changes.
+
+### P1 fixes (all done)
+- **P1-1 — Deprecated-version idempotency.** `run()` now returns `ALREADY_INDEXED`
+  for an already-materialized published version whose `content_hash` matches, for
+  BOTH `ACTIVE` and `DEPRECATED` (superseded) statuses (build plan §10.4: same
+  `document_id`+`version`+content → skip, no duplicate Chunks/vectors). Previously
+  only `ACTIVE` short-circuited; a `DEPRECATED` same-content re-delivery took the
+  lease, rewrote the data plane, then failed `verify` and compensated — deleting the
+  superseded version's data plane. The `job_id` immutable-binding guard still
+  applies (a reused `job_id` bound to a different request fails closed). Refactored
+  into `_short_circuit_already_indexed()`.
+- **P1-2 — `previous_active_version` bound to the build lease.** The field moved
+  from `ingestion_jobs` (per-job) to `document_builds` (per-build-identity). It is
+  captured at the FIRST lease claim (current active version) and carried forward on
+  takeover/resume — never recomputed against the (already-switched) active version
+  (migration `006_e0084_lease_previous_version.sql`). A replacement job taking over
+  a post-commit-failed build now inherits the true replaced version and `publish`
+  deprecates its data plane correctly.
+- **P1-3 — Same-`job_id` concurrency serialized (execution-attempt guard).** A
+  build identity `(tenant, corpus, document, version)` may have at most ONE live
+  `run()` execution attempt per process (`_claim_build_guard`/`_release_build_guard`
+  in `job.py`). A second concurrent `run()` for the same build is a duplicate
+  delivery, not a recovery: it returns `BUILD_CONFLICT` before touching the lease or
+  data plane, so the in-flight execution keeps its fencing authority and the lease
+  generation is never advanced for a duplicate. A retry after the prior execution
+  has exited (crashed/finished) is a genuine recovery and proceeds. This separates
+  job identity (immutable binding) from execution attempt (lease holder). In-process
+  only; cross-process liveness needs a lease timeout/heartbeat (out of scope).
+
+### Migration
+- `migrations/006_e0084_lease_previous_version.sql` — NEW; `document_builds.previous_active_version`.
+
+### Acceptance tests
+- `tests/integration/test_e008_crash_points.py` — `test_deprecated_version_redelivery_is_idempotent`
+  (P1-1), `test_takeover_after_publish_failure_keeps_true_previous_version` (P1-2),
+  `test_same_job_id_concurrent_delivery_is_serialized` (P1-3).
+- `tests/baseline/` MUST remain green.
+- `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` all green.
 
 ## Standard Checks
 ```bash

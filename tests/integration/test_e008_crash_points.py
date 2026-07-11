@@ -366,3 +366,142 @@ def test_taken_over_build_cannot_corrupt_active_version() -> None:
     assert _retrieve_versions(retriever) == ["v1"]
     store.close()
     os.unlink(db_path)
+
+
+def test_deprecated_version_redelivery_is_idempotent() -> None:
+    # E-008.4 P1-1: a superseded (deprecated) version re-delivered with identical
+    # content must short-circuit to ALREADY_INDEXED. It must NOT take the lease,
+    # rewrite, or compensate (which would delete / resurrect the superseded
+    # version's data plane). Build plan §10.4: same document+version+content ->
+    # skip, no duplicate chunks/vectors.
+    manager, store, vector, parents, retriever, db_path = _build()
+    manager.ingest(_request(job_id="j1", version="v1", content=SAMPLE_MARKDOWN))
+    assert _retrieve_versions(retriever) == ["v1"]
+
+    # Supersede v1 with v2.
+    manager.ingest(_request(job_id="j2", version="v2", content=SAMPLE_MARKDOWN + "\n\n## v2\n"))
+    assert _retrieve_versions(retriever) == ["v2"]
+    assert store.get_document("t1", "eng", "doc1", "v1").status.value == "deprecated"
+    points_before = vector._client.count("eng").count
+
+    # Re-deliver v1 with a NEW job_id and identical content.
+    res = manager.ingest(
+        _request(job_id="j3", version="v1", content=SAMPLE_MARKDOWN)
+    )
+    assert res.status == IngestionStatus.ALREADY_INDEXED
+
+    # v1's data plane is untouched (still deprecated, never deleted/written).
+    v1_parents = [c for c in parents._store.values() if c.document_version == "v1"]
+    assert v1_parents
+    assert all(c.metadata.get("deprecated") for c in v1_parents)
+    assert vector._client.count("eng").count == points_before
+    # The active version is still v2; retrieval is unaffected.
+    assert store.get_active_document("t1", "eng", "doc1").version == "v2"
+    assert _retrieve_versions(retriever) == ["v2"]
+    store.close()
+    os.unlink(db_path)
+
+
+def test_takeover_after_publish_failure_keeps_true_previous_version() -> None:
+    # E-008.4 P1-2: a post-commit publish failure leaves the lease owned by the
+    # failing job (active already switched to v2). A DIFFERENT job_id taking over
+    # the same version must inherit the lease-bound previous_active_version (v1),
+    # NOT recompute it against the already-switched active version (which would
+    # make publish skip cleaning v1's data plane).
+    manager, store, vector, parents, retriever, db_path = _build()
+    manager.ingest(_request(job_id="j0", version="v1", content=SAMPLE_MARKDOWN))
+    assert _retrieve_versions(retriever) == ["v1"]
+
+    class PublishFailingJob(IngestionJob):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self._publish_attempts = 0
+
+        def _step_publish(self) -> None:
+            self._publish_attempts += 1
+            if self._publish_attempts == 1:
+                raise RuntimeError("simulated publish failure")
+            return super()._step_publish()
+
+    req_v2 = _request(job_id="j1", version="v2", content=SAMPLE_MARKDOWN + "\n\n## v2\n")
+    PublishFailingJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req_v2,
+    ).run()
+    # j1 committed v2 then publish failed; control plane active is v2.
+    assert store.get_active_document("t1", "eng", "doc1").version == "v2"
+    assert store.get_job_status("j1") == JobStatus.FAILED
+
+    # A DIFFERENT job_id recovers the same version.
+    res = manager.ingest(
+        _request(job_id="j2", version="v2", content=SAMPLE_MARKDOWN + "\n\n## v2\n")
+    )
+    assert res.status == IngestionStatus.INDEXED
+    assert store.get_job_status("j2") == JobStatus.SUCCEEDED
+    assert store.get_active_document("t1", "eng", "doc1").version == "v2"
+    assert _retrieve_versions(retriever) == ["v2"]
+
+    # The TRUE replaced version (v1) was cleaned on recovery.
+    v1_parents = [c for c in parents._store.values() if c.document_version == "v1"]
+    assert v1_parents
+    assert all(c.metadata.get("deprecated") for c in v1_parents)
+    # And j2 inherited the lease-bound previous_active_version (not recomputed).
+    assert store.get_job_previous_version("j2") == "v1"
+    store.close()
+    os.unlink(db_path)
+
+
+def test_same_job_id_concurrent_delivery_is_serialized() -> None:
+    # E-008.4 P1-3: two concurrent executions of the SAME job_id must be
+    # serialized, not treated as a same-owner resume that races on deterministic
+    # point IDs. The in-flight execution keeps its fencing authority; the second
+    # concurrent delivery is rejected with BUILD_CONFLICT and never writes the
+    # data plane (otherwise the loser would overwrite the winner's active points
+    # back to 'processing' and break retrieval).
+    manager, store, vector, parents, retriever, db_path = _build()
+    manager.ingest(_request(job_id="j0", version="v0", content=SAMPLE_MARKDOWN))
+    assert _retrieve_versions(retriever) == ["v0"]
+
+    results: dict[str, object] = {}
+
+    class ConcurrentDuplicateJob(IngestionJob):
+        def _step_write_qdrant(self) -> None:
+            # Before this execution writes its points, fire a concurrent delivery
+            # of the SAME job_id/version/content (deterministic IDs). Single
+            # thread, deterministic interleave of the exact bug window.
+            req_b = _request(job_id="j1", version="v1", content=SAMPLE_MARKDOWN + "\n\n## v1\n")
+            results["b"] = IngestionJob(
+                store=store,
+                vector_store=vector,
+                parent_store=parents,
+                chunker=ParentChildChunker(),
+                dense_encoder=FakeDenseEncoder(),
+                sparse_encoder=FakeSparseEncoder(),
+                request=req_b,
+            ).run()
+            return super()._step_write_qdrant()
+
+    req_a = _request(job_id="j1", version="v1", content=SAMPLE_MARKDOWN + "\n\n## v1\n")
+    res_a = ConcurrentDuplicateJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req_a,
+    ).run()
+
+    # Exactly one execution wins and writes; the duplicate is rejected.
+    assert results["b"].status == IngestionStatus.BUILD_CONFLICT
+    assert res_a.status == IngestionStatus.INDEXED
+    # The data plane carries exactly the winner's single write and is visible.
+    assert store.get_active_document("t1", "eng", "doc1").version == "v1"
+    assert _retrieve_versions(retriever) == ["v1"]
+    store.close()
+    os.unlink(db_path)
