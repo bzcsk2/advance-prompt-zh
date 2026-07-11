@@ -9,6 +9,7 @@
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
 - Issue: **E-008.1** — Audit-remediation of E-008 (7 MUST violations) — CLOSED at this commit; full contract at `docs/issue-e0081-contract.md`.
+- Issue: **E-008.2** — Audit-remediation of E-008.1 (real-crash + concurrency windows) — CLOSED at this commit; full contract at `docs/issue-e0082-contract.md`.
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
 
 > **AGENTS.md is a slim entry point** (build plan §1.7): current Milestone/Issue, fixed
@@ -243,6 +244,67 @@ intact; E-008.1 is a narrow fix commit. Scope is a strict subset of the E-008 al
 - `tests/integration/test_e008_crash_points.py` — older job loses race, job identity immutable.
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` all green.
+
+## E-008.2 Issue Contract (M1 only) — CLOSED at this commit
+Audit-remediation of E-008.1 (verdict **Conditional Fail**). Baseline `34bfbc4` kept
+intact; E-008.2 is a narrow fix commit that closes the real-crash and concurrency
+windows the E-008.1 audit left open. Scope is a strict subset of the E-008.1 allowed
+paths (`storage/`, `ingestion/`, `retrieval/`, `tests/...`, `migrations/`, `AGENTS.md`,
+`docs/issue-e0082-contract.md`); no upstream modifications, no `config.py`/`domain/`
+changes.
+
+### P1 fixes (all done)
+- **P1-1 — Resume after commit-crash (no silent ALREADY_INDEXED).** `run()` only
+  short-circuits to `ALREADY_INDEXED` when the build's lease owner is `SUCCEEDED`;
+  an in-flight/crashed build (job still `RUNNING` between `commit_active_version` and the
+  `commit` step marker) now RESUMES and finishes publish/finalize. `commit_active_version`
+  is idempotent for an already-active version, so a re-run commit with a now-stale
+  `base_revision` succeeds instead of raising `ActiveVersionConflict`.
+- **P1-2 — `previous_active_version` preserved on post-commit failure.** The
+  `set_job_previous_version(job_id, None)` branch in the compensation path is removed;
+  recovery's `publish` still needs it to deprecate the replaced version's data plane.
+  Crash-point test asserts the old Qdrant points / parents are cleaned on resume.
+- **P1-3 — Atomic build lease.** `migrations/004_e0082_build_lease.sql` adds a
+  `document_builds` lease (PK `tenant,corpus,document,version`, `owner_job_id`).
+  `acquire_job` claims the lease in one `BEGIN IMMEDIATE` transaction; a concurrent
+  in-flight build for the same artifact raises `BuildConflict` (no shared-data-plane race
+  where compensation deletes the winning build). A terminal owner's build is taken over.
+- **P1-4 — `job_id` immutable binding, no TOCTOU.** The identity check is folded into the
+  atomic `acquire_job` (single transaction) alongside the lease claim; `validate_job_identity`
+  remains a fast pre-check. Two threads opening separate connections converge on one lease
+  owner via `BEGIN IMMEDIATE` serialization.
+- **P1-5 — `verify` checks true data-plane identity.** `_step_verify` now reads each Parent
+  Store entry and each Qdrant point `with_payload=True`, comparing
+  tenant/corpus/document/version/parent/chunk identity (not just column presence).
+- **P1-6 — Migration atomicity.** `apply_migrations` applies each migration's DDL + the
+  `schema_migrations` marker inside one explicit `BEGIN IMMEDIATE … COMMIT` (with `ROLLBACK`
+  on error) instead of autocommit `executescript`, so a crash cannot leave a column added
+  but unrecorded.
+- **P1-7 — Active-version gate is mandatory.** `SecureRetriever.metadata_store` is now a
+  required argument (no `None` fail-open bypass). The E-007 PEP/PDP and end-to-end tests
+  inject a MetadataStore seeded with the active version.
+
+### P2 fixes (all done)
+- **P2-1 — `ALREADY_INDEXED` no longer marks a nonexistent `job_id`.** `run()` only calls
+  `mark_job_terminal` when a job row already exists.
+- **P2-2 — `publish` scopes parents to THIS build.** `_step_publish` iterates
+  `self._parents_list` (the chunker output for this version) instead of scanning the whole
+  Parent Store by `document_version`, so a concurrent job's parents are never disturbed.
+
+### Migration
+- `migrations/004_e0082_build_lease.sql` — NEW; `document_builds` lease table.
+
+### Acceptance tests
+- `tests/unit/test_metadata_store.py` — migration atomicity (fault injection), build lease
+  serialization (real dual-thread) + takeover after failure, monotonic revision.
+- `tests/unit/test_ingestion_job.py` — ALREADY_INDEXED resumes after commit-crash; verify
+  rejects parent identity mismatch; content idempotency; compensation.
+- `tests/integration/test_e008_crash_points.py` — publish-failure preserves `previous_active_version`
+  and cleans the old data plane on resume; older job loses race; job identity immutable.
+- `tests/integration/test_e007_end_to_end.py` + `test_qdrant_hybrid_retrieval.py` — updated to
+  inject the mandatory `metadata_store` (E-007 PEP/PDP equivalence preserved).
+- `tests/baseline/` MUST remain green.
+- `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (290) all green.
 
 ## Standard Checks
 ```bash

@@ -10,8 +10,11 @@ from agentic_rag_enterprise.domain.ingestion import (
     IngestionManifest,
     JobStatus,
 )
+import threading
+
 from agentic_rag_enterprise.storage.metadata_store import (
     ActiveVersionConflict,
+    BuildConflict,
     JobIdentityConflict,
     MetadataStore,
 )
@@ -348,5 +351,135 @@ def test_job_manifest_is_persisted() -> None:
     row = store._conn.execute("SELECT manifest FROM ingestion_jobs WHERE job_id='j1'").fetchone()
     assert row["manifest"]
     assert IngestionManifest.model_validate_json(row["manifest"]).job_id == "j1"
+    store.close()
+    os.unlink(path)
+
+
+def test_migration_atomicity_rolls_back_on_failure(tmp_path) -> None:
+    # P1-6: a crash between DDL and the schema_migrations marker must roll back
+    # the whole migration, leaving no partial schema and no marker (so the next
+    # boot re-applies cleanly instead of hitting a duplicate-column error).
+    import agentic_rag_enterprise.storage.metadata_store as ms
+
+    bad_dir = tmp_path / "migrations"
+    bad_dir.mkdir()
+    (bad_dir / "001_bad.sql").write_text(
+        "CREATE TABLE good_table (id INTEGER PRIMARY KEY);\n"
+        "THIS IS NOT VALID SQL;\n"
+    )
+    db = tmp_path / "md.db"
+    orig = ms.MIGRATIONS_DIR
+    ms.MIGRATIONS_DIR = bad_dir
+    try:
+        # The bad migration raises; its DDL must be rolled back.
+        try:
+            MetadataStore(str(db))
+            raise AssertionError("expected migration failure")
+        except Exception:
+            pass
+    finally:
+        ms.MIGRATIONS_DIR = orig
+
+    # Reopen with the real migrations: good_table must not exist, only the
+    # schema_migrations bookkeeping table was created (outside the transaction).
+    store = MetadataStore(str(db))
+    tables = {
+        r["name"]
+        for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "good_table" not in tables
+    assert "schema_migrations" in tables
+    store.close()
+
+
+def test_build_lease_serializes_concurrent_in_flight_builds() -> None:
+    # P1-3 / P1-4: a concurrent in-flight build for the same
+    # (tenant, corpus, document, version) is rejected with BuildConflict, so it
+    # cannot race on the shared (deterministic-ID) data plane. Two independent
+    # connections to the same DB file exercise the real BEGIN IMMEDIATE
+    # serialization at the engine level.
+    path = _tmp_db_path()
+    bootstrap = MetadataStore(path)
+    _seed_corpus(bootstrap)
+    bootstrap.upsert_document(_make_doc(status=DocumentStatus.PROCESSING))
+    bootstrap.close()
+
+    results: dict[str, str] = {}
+
+    def run(job_id: str) -> None:
+        store = MetadataStore(path)
+        try:
+            store.acquire_job(
+                job_id=job_id,
+                document_id="d1",
+                document_version="v1",
+                corpus_id="eng",
+                tenant_id="t1",
+                parser_version="1.0",
+                chunking_version="1.0",
+                embedding_version="1.0",
+                raw_hash="abc",
+                base_revision=0,
+            )
+            results[job_id] = "ok"
+        except BuildConflict:
+            results[job_id] = "conflict"
+        finally:
+            store.close()
+
+    t_a = threading.Thread(target=run, args=("a",))
+    t_b = threading.Thread(target=run, args=("b",))
+    t_a.start()
+    t_b.start()
+    t_a.join()
+    t_b.join()
+
+    # Exactly one build owns the lease; the other is rejected.
+    owners = [k for k, v in results.items() if v == "ok"]
+    conflicts = [k for k, v in results.items() if v == "conflict"]
+    assert len(owners) == 1
+    assert len(conflicts) == 1
+    verify = MetadataStore(path)
+    assert verify.get_build_owner("t1", "eng", "d1", "v1") == owners[0]
+    verify.close()
+    os.unlink(path)
+
+
+def test_build_lease_takeover_after_failed_owner() -> None:
+    # P1-3 / P1-4: when the lease owner's job has already terminated (failed),
+    # a re-delivered job takes over the lease and rebuilds (no conflict).
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(status=DocumentStatus.PROCESSING))
+    store.acquire_job(
+        job_id="first",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+    )
+    # First build failed.
+    store.mark_job_terminal("first", JobStatus.FAILED)
+    # A new delivery takes over the lease (reassignment, not conflict).
+    status = store.acquire_job(
+        job_id="second",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+    )
+    assert status == JobStatus.RUNNING
+    assert store.get_build_owner("t1", "eng", "d1", "v1") == "second"
     store.close()
     os.unlink(path)

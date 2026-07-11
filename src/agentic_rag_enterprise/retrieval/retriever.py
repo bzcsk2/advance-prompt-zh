@@ -50,12 +50,13 @@ class Retriever:
 class SecureRetriever:
     """Enterprise retrieval with corpus discoverability + parent 2nd auth.
 
-    When a ``metadata_store`` is supplied, an additional control-plane
-    active-version gate is applied (build plan §10.10 #5): a child hit is dropped
-    unless its ``document_version`` equals the Metadata DB's current active
-    version for that document. This ensures a freshly-committed active version is
-    the only one that can reach the model even if the old version's Qdrant points
-    have not yet been cleaned up on the data plane.
+    A ``metadata_store`` is mandatory: it supplies the control-plane
+    active-version gate (build plan §10.10 #5). A child hit is dropped unless its
+    ``document_version`` equals the Metadata DB's current active version for that
+    document, so a freshly-committed active version is the only one that can reach
+    the model even if the old version's Qdrant points have not yet been cleaned up
+    on the data plane. Making it required (not optional) removes the fail-open
+    bypass where retrieval could run with no gate at all (E-008.2 P1-7).
     """
 
     def __init__(
@@ -64,7 +65,7 @@ class SecureRetriever:
         parent_reader: ParentReader,
         *,
         default_top_k: int | None = None,
-        metadata_store: MetadataStore | None = None,
+        metadata_store: MetadataStore,
     ) -> None:
         self._hybrid = hybrid
         self._parent_reader = parent_reader
@@ -131,12 +132,11 @@ class SecureRetriever:
             # hits whose version is not the Metadata DB's current active version
             # for that document, so a stale-but-not-yet-cleaned version cannot
             # enter the parent/model path after the active version has switched.
-            if self._metadata_store is not None:
-                active_version = self._metadata_store.get_active_version(
-                    hit.tenant_id, hit.corpus_id, hit.document_id
-                )
-                if active_version is None or hit.document_version != active_version:
-                    continue
+            active_version = self._metadata_store.get_active_version(
+                hit.tenant_id, hit.corpus_id, hit.document_id
+            )
+            if active_version is None or hit.document_version != active_version:
+                continue
             try:
                 parent = self._parent_reader.load_parent_for_hit(hit, ctx)
             except ParentAuthorizationError:

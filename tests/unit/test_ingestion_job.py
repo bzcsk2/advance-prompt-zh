@@ -304,3 +304,59 @@ def test_compensation_cleans_control_plane_when_verify_fails() -> None:
     assert _count_qdrant_points(vector, "eng") == 0
     store.close()
     os.unlink(db_path)
+
+
+def test_already_indexed_resumes_after_commit_crash() -> None:
+    # P1-1: a real crash between commit_active_version succeeding and the
+    # "commit" step marker being written leaves the version ACTIVE but the job
+    # still RUNNING. A re-delivery must RESUME and finish publish/finalize
+    # (INDEXED), NOT short-circuit to ALREADY_INDEXED and silently skip the
+    # data-plane promotion.
+    manager, store, vector, parents, db_path = _manager()
+    req = _request(job_id="j1", version="v1", content="# T\n\nhello world")
+    first = manager.ingest(req)
+    assert first.status == IngestionStatus.INDEXED
+
+    # Simulate the crash: job back to RUNNING, commit step marker unwritten,
+    # while the document is already active in the control plane.
+    store.mark_job_terminal("j1", JobStatus.RUNNING)
+    store.clear_steps("j1")
+    store.mark_step("j1", "acquire", "done")  # acquire already happened
+    assert store.get_active_document("t1", "eng", "d1").version == "v1"
+
+    # Re-deliver: must resume and complete, not return ALREADY_INDEXED.
+    second = manager.ingest(req)
+    assert second.status == IngestionStatus.INDEXED
+    assert store.get_job_status("j1") == JobStatus.SUCCEEDED
+    assert _count_qdrant_points(vector, "eng") > 0
+    store.close()
+    os.unlink(db_path)
+
+
+def test_verify_rejects_parent_identity_mismatch() -> None:
+    # P1-5: _step_verify must detect a parent whose stored identity does not
+    # match the request, not just column presence.
+    import pytest
+
+    manager, store, vector, parents, db_path = _manager()
+    req = _request(job_id="j1", version="v1", content="# T\n\nhello world")
+    job = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req,
+    )
+    job.run(max_step="write_qdrant")
+
+    # Tamper a stored parent's tenant_id -> identity mismatch.
+    pid = next(iter(parents._store))
+    chunk = parents.get(pid)
+    parents.put(chunk.model_copy(update={"tenant_id": "other-tenant"}))
+
+    with pytest.raises(RuntimeError):
+        job._step_verify()
+    store.close()
+    os.unlink(db_path)

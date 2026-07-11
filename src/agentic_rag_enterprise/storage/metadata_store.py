@@ -87,6 +87,21 @@ class VersionContentConflict(Exception):
         super().__init__(reason)
 
 
+class BuildConflict(Exception):
+    """Raised when a build for a ``(tenant, corpus, document, version)`` is
+    already owned by a different in-flight job.
+
+    The lease guarantees exactly one in-flight build per artifact at a time, so a
+    concurrent delivery cannot race on the shared data plane (deterministic
+    content-addressed IDs) and delete the winning build's artifacts (E-008.2
+    P1-3 / P1-4).
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class MetadataStore:
     """SQLite-backed metadata store for documents, jobs, chunks and steps."""
 
@@ -113,18 +128,40 @@ class MetadataStore:
             version = path.stem
             if version in applied:
                 continue
-            # Append the migration marker to the DDL script so the schema change
-            # and its record commit together (executescript autocommits the whole
-            # script). A crash between DDL and marker thus cannot leave a column
-            # added but unrecorded, which would otherwise fail on the next boot
-            # with a duplicate-column error.
-            cur = self._conn.cursor()
-            script = (
-                path.read_text()
-                + "\nINSERT INTO schema_migrations(version, applied_at) "
-                + f"VALUES ('{version}', '{_now_iso()}');\n"
+            # Apply the DDL and the schema_migrations marker inside ONE explicit
+            # transaction so a crash mid-migration cannot leave a column added but
+            # unrecorded (which would otherwise fail on the next boot with a
+            # duplicate-column error). With isolation_level=None the connection is
+            # in autocommit, so we manage the transaction manually with
+            # BEGIN IMMEDIATE / COMMIT / ROLLBACK and split the script into
+            # individual statements (executescript would auto-COMMIT and break
+            # atomicity).
+            script = path.read_text().strip()
+            marker = (
+                f"INSERT INTO schema_migrations(version, applied_at) "
+                f"VALUES ('{version}', '{_now_iso()}');"
             )
-            cur.executescript(script)
+            # Drop full-line SQL comments (and blanks) so the per-statement
+            # execute() never receives a comment-only statement, then split on
+            # ";" into individual statements (our migration files keep ";" only
+            # as a statement separator, never inside string literals).
+            sql_lines = [
+                ln
+                for ln in script.splitlines()
+                if ln.strip() and not ln.strip().startswith("--")
+            ]
+            statements = [
+                s.strip() for s in ("\n".join(sql_lines) + "\n" + marker).split(";") if s.strip()
+            ]
+            cur = self._conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                for stmt in statements:
+                    cur.execute(stmt)
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
             applied.add(version)
 
     def close(self) -> None:
@@ -147,41 +184,159 @@ class MetadataStore:
         raw_hash: str,
         base_revision: int,
     ) -> JobStatus:
-        """Insert the job row if absent (CAS via PK). Returns the current status.
+        """Atomically claim the build lease and the job row.
+
+        Runs entirely inside one ``BEGIN IMMEDIATE`` transaction so the build
+        lease, the job-row insert, and the immutable-identity check are a single
+        atomic action (E-008.2 P1-3 / P1-4). This removes the TOCTOU between a
+        separate identity pre-check and the job-row insert:
+
+        * No lease for ``(tenant, corpus, document, version)`` -> claim it
+          (owner = this job).
+        * Lease owned by THIS job -> resume / retry.
+        * Lease owned by a DIFFERENT in-flight job (running/queued/cancelling)
+          -> :class:`BuildConflict` (the concurrent build owns the shared data
+          plane; do not race on deterministic IDs).
+        * Lease owned by a terminal job (succeeded/failed/cancelled) -> takeover:
+          reassign the lease to this job and rebuild (idempotent re-delivery).
 
         ``base_revision`` is the monotonic lifecycle revision captured at acquire
         time and persisted so the commit-phase CAS rejects this job if a newer
         revision lands first (build plan §10.10 #8, E-008.1 P1-3).
+
+        Returns the job status (RUNNING for a freshly-claimed build, or the
+        existing status for a resumed/taken-over one). Raises
+        :class:`JobIdentityConflict` if ``job_id`` is already bound to a different
+        immutable request, and :class:`BuildConflict` for a concurrent in-flight
+        build.
+        """
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            lease = cur.execute(
+                "SELECT owner_job_id, status FROM document_builds "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND document_version=?",
+                (tenant_id, corpus_id, document_id, document_version),
+            ).fetchone()
+            if lease is None:
+                cur.execute(
+                    "INSERT INTO document_builds "
+                    "(tenant_id, corpus_id, document_id, document_version, "
+                    " owner_job_id, status, base_revision, acquired_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
+                    (
+                        tenant_id,
+                        corpus_id,
+                        document_id,
+                        document_version,
+                        job_id,
+                        base_revision,
+                        _now_iso(),
+                    ),
+                )
+            else:
+                owner = lease["owner_job_id"]
+                if owner != job_id:
+                    owner_status = self.get_job_status(owner)
+                    if owner_status in (
+                        JobStatus.RUNNING,
+                        JobStatus.QUEUED,
+                        JobStatus.CANCELLING,
+                    ):
+                        raise BuildConflict(
+                            f"build for ({tenant_id},{corpus_id},{document_id},"
+                            f"{document_version}) owned by in-flight job {owner!r}"
+                        )
+                    # Terminal owner (succeeded/failed/cancelled): take over the
+                    # lease so a re-delivered job can rebuild idempotently.
+                    cur.execute(
+                        "UPDATE document_builds "
+                        "SET owner_job_id=?, status='running', base_revision=?, "
+                        "acquired_at=? "
+                        "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
+                        "AND document_version=?",
+                        (
+                            job_id,
+                            base_revision,
+                            _now_iso(),
+                            tenant_id,
+                            corpus_id,
+                            document_id,
+                            document_version,
+                        ),
+                    )
+
+            # Job row: insert if absent, else verify the immutable identity
+            # atomically (folded from validate_job_identity so there is no
+            # race window before the insert).
+            row = cur.execute(
+                "SELECT tenant_id, corpus_id, document_id, document_version, "
+                "raw_hash, status FROM ingestion_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    INSERT INTO ingestion_jobs (
+                        job_id, document_id, document_version, corpus_id, tenant_id,
+                        status, started_at, raw_hash, parent_count, child_count,
+                        parser_version, chunking_version, embedding_version, base_revision
+                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0, 0, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        document_id,
+                        document_version,
+                        corpus_id,
+                        tenant_id,
+                        _now_iso(),
+                        raw_hash,
+                        parser_version,
+                        chunking_version,
+                        embedding_version,
+                        base_revision,
+                    ),
+                )
+                status: JobStatus = JobStatus.RUNNING
+            else:
+                mismatched = (
+                    row["tenant_id"] != tenant_id
+                    or row["corpus_id"] != corpus_id
+                    or row["document_id"] != document_id
+                    or row["document_version"] != document_version
+                    or (row["raw_hash"] or "") != raw_hash
+                )
+                if mismatched:
+                    raise JobIdentityConflict(
+                        f"job_id={job_id!r} already bound to a different request "
+                        f"(tenant={row['tenant_id']!r} corpus={row['corpus_id']!r} "
+                        f"doc={row['document_id']!r} version={row['document_version']!r})"
+                    )
+                status = JobStatus(row["status"])
+            cur.execute("COMMIT")
+            # The "acquire" step marker lets a resumed run skip re-claiming the
+            # lease (the lease row itself persists as the real ownership record).
+            self.mark_step(job_id, "acquire", "done")
+            return status
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    def get_build_owner(
+        self, tenant_id: str, corpus_id: str, document_id: str, document_version: str
+    ) -> Optional[str]:
+        """Return the ``job_id`` that currently holds the build lease, or None.
+
+        Used by the ingestion job to decide whether an already-active version is
+        fully published (owner terminal+successful) or still mid-build / crashed
+        (must resume rather than short-circuit to ALREADY_INDEXED).
         """
         row = self._conn.execute(
-            "SELECT status FROM ingestion_jobs WHERE job_id = ?", (job_id,)
+            "SELECT owner_job_id FROM document_builds "
+            "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND document_version=?",
+            (tenant_id, corpus_id, document_id, document_version),
         ).fetchone()
-        if row is not None:
-            return JobStatus(row["status"])
-        self._conn.execute(
-            """
-            INSERT INTO ingestion_jobs (
-                job_id, document_id, document_version, corpus_id, tenant_id,
-                status, started_at, raw_hash, parent_count, child_count,
-                parser_version, chunking_version, embedding_version, base_revision
-            ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0, 0, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                document_id,
-                document_version,
-                corpus_id,
-                tenant_id,
-                _now_iso(),
-                raw_hash,
-                parser_version,
-                chunking_version,
-                embedding_version,
-                base_revision,
-            ),
-        )
-        self.mark_step(job_id, "acquire", "done")
-        return JobStatus.RUNNING
+        return row["owner_job_id"] if row else None
 
     def validate_job_identity(
         self,
@@ -195,7 +350,8 @@ class MetadataStore:
     ) -> None:
         """Fail closed if ``job_id`` is reused with a different immutable request.
 
-        Must run before any document row is mutated (E-008.1 P1-6).
+        Kept as a fast pre-check; the authoritative atomic check is inside
+        :meth:`acquire_job` (E-008.2 P1-4).
         """
         row = self._conn.execute(
             "SELECT tenant_id, corpus_id, document_id, document_version, raw_hash "
@@ -248,6 +404,19 @@ class MetadataStore:
             "SELECT status FROM ingestion_jobs WHERE job_id = ?", (job_id,)
         ).fetchone()
         return JobStatus(row["status"]) if row else None
+
+    def get_job_identity(self, job_id: str) -> Optional[dict]:
+        """Return the immutable identity bound to ``job_id``, or None if no row.
+
+        Used by the ingestion job to fail closed on a reused ``job_id`` even on
+        the idempotent ALREADY_INDEXED path (E-008.2 P1-4).
+        """
+        row = self._conn.execute(
+            "SELECT tenant_id, corpus_id, document_id, document_version, raw_hash "
+            "FROM ingestion_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def mark_job_terminal(
         self,
@@ -432,12 +601,6 @@ class MetadataStore:
                 (tenant_id, corpus_id, document_id),
             ).fetchone()
             current_rev = int(rev_row["m"]) if rev_row and rev_row["m"] is not None else 0
-            if current_rev != expected_revision:
-                raise ActiveVersionConflict(
-                    f"stale expected_revision={expected_revision}, current={current_rev}"
-                )
-            new_rev = current_rev + 1
-            now = _now_iso()
             # Find the currently active version (if any) to replace.
             active_row = cur.execute(
                 "SELECT version FROM documents "
@@ -445,6 +608,21 @@ class MetadataStore:
                 (tenant_id, corpus_id, document_id),
             ).fetchone()
             previous_version = active_row["version"] if active_row else None
+            # Idempotent resume: if new_version is already the active version
+            # (e.g. a crash after the previous commit left it active but the
+            # commit step marker unwritten), treat the switch as already done and
+            # return WITHOUT the stale-revision CAS check, so a resumed job that
+            # re-runs commit with its persisted (now-stale) base_revision does not
+            # fail closed (E-008.2 P1-1).
+            if previous_version == new_version:
+                cur.execute("COMMIT")
+                return current_rev, previous_version
+            new_rev = current_rev + 1
+            now = _now_iso()
+            if current_rev != expected_revision:
+                raise ActiveVersionConflict(
+                    f"stale expected_revision={expected_revision}, current={current_rev}"
+                )
             # The previously-active version MUST leave the "active" state so
             # retrieval (status=active & deprecated=false, plus the control-plane
             # active-version gate) never serves a stale version.

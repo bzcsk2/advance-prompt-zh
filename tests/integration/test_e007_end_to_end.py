@@ -22,6 +22,7 @@ from tests.fixtures import (
     FakeSparseEncoder,
     SAMPLE_MARKDOWN,
     acl_payload,
+    active_metadata_store,
     make_security_context,
 )
 
@@ -113,7 +114,11 @@ def _ingest(corpus_id: str, tenant_id: str, acl: dict) -> tuple[VectorStore, Par
 def test_end_to_end_returns_authorized_parents() -> None:
     acl = acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
     store, pstore, children = _ingest("eng", "t1", acl)
-    retriever = SecureRetriever(_HybridSearchAdapter(store), ParentReader(pstore))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(store),
+        ParentReader(pstore),
+        metadata_store=active_metadata_store("t1", "eng", "doc1", "v1"),
+    )
 
     result = retriever.retrieve(
         make_security_context(),
@@ -133,7 +138,11 @@ def test_end_to_end_returns_authorized_parents() -> None:
 def test_tenant_isolation_end_to_end() -> None:
     acl = acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
     store, pstore, _ = _ingest("eng", "t1", acl)
-    retriever = SecureRetriever(_HybridSearchAdapter(store), ParentReader(pstore))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(store),
+        ParentReader(pstore),
+        metadata_store=active_metadata_store("t1", "eng", "doc1", "v1"),
+    )
 
     # A user from a different tenant gets no hits (filter-less retrieval blocked).
     result = retriever.retrieve(
@@ -149,7 +158,11 @@ def test_tenant_isolation_end_to_end() -> None:
 def test_corpus_discoverability_end_to_end() -> None:
     acl = acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
     store, pstore, _ = _ingest("eng", "t1", acl)
-    retriever = SecureRetriever(_HybridSearchAdapter(store), ParentReader(pstore))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(store),
+        ParentReader(pstore),
+        metadata_store=active_metadata_store("t1", "eng", "doc1", "v1"),
+    )
 
     ctx = make_security_context(allowed_corpus_ids=["other_corpus"])
     result = retriever.retrieve(
@@ -165,7 +178,11 @@ def test_corpus_discoverability_end_to_end() -> None:
 def test_disabled_corpus_blocks() -> None:
     acl = acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
     store, pstore, _ = _ingest("eng", "t1", acl)
-    retriever = SecureRetriever(_HybridSearchAdapter(store), ParentReader(pstore))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(store),
+        ParentReader(pstore),
+        metadata_store=active_metadata_store("t1", "eng", "doc1", "v1"),
+    )
 
     result = retriever.retrieve(
         make_security_context(),

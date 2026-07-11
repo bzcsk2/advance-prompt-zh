@@ -168,3 +168,73 @@ The planner selects corpora based on the question.
 
 Access is enforced at retrieval time with a policy decision point.
 """
+
+
+def active_metadata_store(
+    tenant_id: str,
+    corpus_id: str,
+    document_id: str,
+    version: str,
+    *,
+    content_hash: str = "seed",
+) -> "MetadataStore":  # noqa: F821 - imported lazily to avoid test-only deps
+    """Build a hermetic MetadataStore with one ACTIVE document version.
+
+    Used by E-007 retrieval tests now that the control-plane active-version gate
+    is mandatory (E-008.2 P1-7): retrieval drops child hits whose version is not
+    the Metadata DB's active version, so the gate must know the seeded version is
+    active. The seeded version matches the points/parents the tests ingest.
+    """
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+
+    from agentic_rag_enterprise.domain.document import SourceDocument
+    from agentic_rag_enterprise.domain.ingestion import DocumentStatus
+    from agentic_rag_enterprise.storage.metadata_store import MetadataStore
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)
+    store = MetadataStore(path)
+    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    store._conn.execute(  # noqa: SLF001 - test fixture reaches into raw conn
+        """
+        INSERT INTO corpus_registry (
+            corpus_id, tenant_id, name, description, created_at, updated_at
+        ) VALUES (?, ?, 'corpus', '', ?, ?)
+        """,
+        (corpus_id, tenant_id, now.isoformat(), now.isoformat()),
+    )
+    doc = SourceDocument(
+        document_id=document_id,
+        tenant_id=tenant_id,
+        corpus_id=corpus_id,
+        source_uri=f"inline://{document_id}",
+        source_connector="file",
+        title=document_id,
+        source_filename=f"{document_id}.md",
+        mime_type="text/markdown",
+        version=version,
+        content_hash=content_hash,
+        status=DocumentStatus.ACTIVE,
+        authority_level=50,
+        deprecated=False,
+        acl_policy_id="default",
+        security_level="public",
+        acl_scope="tenant",
+        allowed_user_ids=["u1"],
+        allowed_group_ids=["g1"],
+        denied_user_ids=[],
+        denied_group_ids=[],
+        parser_name="markdown",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_model="fake",
+        embedding_version="1.0",
+        discovered_at=now,
+        indexed_at=now,
+        last_synced_at=now,
+    )
+    store.upsert_document(doc)
+    return store

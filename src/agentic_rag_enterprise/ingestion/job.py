@@ -30,6 +30,7 @@ from agentic_rag_enterprise.ingestion.chunker import ChildChunk, ParentChildChun
 from agentic_rag_enterprise.security.policy import ResourceAcl
 from agentic_rag_enterprise.storage.metadata_store import (
     ActiveVersionConflict,
+    JobIdentityConflict,
     MetadataStore,
     VersionContentConflict,
 )
@@ -164,8 +165,9 @@ class IngestionJob:
         # Hash the content up front; it drives identity and idempotency.
         self._raw_hash = _sha256(self._req.content)
 
-        # P1-6: a job_id is an immutable binding. Reject reuse with a different
-        # request BEFORE any document row is mutated.
+        # P1-4 (fast pre-check): a job_id is an immutable binding. Reject reuse
+        # with a different request up front; the authoritative atomic check lives
+        # in acquire_job (single transaction) and guards concurrent deliveries.
         self._store.validate_job_identity(
             job_id=self._req.job_id,
             tenant_id=self._req.tenant_id,
@@ -179,6 +181,8 @@ class IngestionJob:
         # job_id. Same artifact already known -> ALREADY_INDEXED (no rework,
         # no overwrite of the active row, no data-plane rewrite). Same version
         # with different content -> VersionContentConflict (never overwrite).
+        # A job_id is an immutable binding; that check is folded into the atomic
+        # acquire_job (E-008.2 P1-4, no TOCTOU).
         existing = self._store.get_document(
             self._req.tenant_id,
             self._req.corpus_id,
@@ -192,20 +196,46 @@ class IngestionJob:
                     f"different content_hash; refusing to overwrite"
                 )
             if existing.status == DocumentStatus.ACTIVE:
-                # A published version is done. Re-run ONLY when this exact job
-                # previously FAILED after committing (active in the control plane
-                # but unpublished on the data plane); otherwise it is idempotent
-                # ALREADY_INDEXED regardless of which job delivers it (build plan
-                # §10.10, E-008.1 P1-2/P1-5).
-                if self._store.get_job_status(self._req.job_id) != JobStatus.FAILED:
-                    self._store.mark_job_terminal(self._req.job_id, JobStatus.SUCCEEDED)
+                # P1-1: a published version is only ALREADY_INDEXED when the build
+                # that produced it has fully completed (owner job SUCCEEDED). If
+                # the owning build is still in-flight or crashed between commit
+                # and publish, we must RESUME and finish publish/finalize rather
+                # than short-circuit (otherwise a committed-but-unpublished active
+                # version would never reach the data plane).
+                owner = self._store.get_build_owner(
+                    self._req.tenant_id,
+                    self._req.corpus_id,
+                    self._req.document_id,
+                    self._req.document_version,
+                )
+                owner_status = self._store.get_job_status(owner) if owner else None
+                if owner_status == JobStatus.SUCCEEDED:
+                    # Fully published. Still guard the job_id immutable binding
+                    # (a reused job_id with a different request must fail closed).
+                    identity = self._store.get_job_identity(self._req.job_id)
+                    if identity is not None and (
+                        identity["tenant_id"] != self._req.tenant_id
+                        or identity["corpus_id"] != self._req.corpus_id
+                        or identity["document_id"] != self._req.document_id
+                        or identity["document_version"] != self._req.document_version
+                        or (identity["raw_hash"] or "") != self._raw_hash
+                    ):
+                        raise JobIdentityConflict(
+                            f"job_id={self._req.job_id!r} already bound to a "
+                            f"different request"
+                        )
+                    # P2-1: only mark terminal if this job actually owns a row.
+                    if self._store.get_job_status(self._req.job_id) is not None:
+                        self._store.mark_job_terminal(
+                            self._req.job_id, JobStatus.SUCCEEDED
+                        )
                     return IngestionResult(
                         status=IngestionStatus.ALREADY_INDEXED,
                         job_id=self._req.job_id,
                         document_version=self._req.document_version,
                     )
-            # processing/failed same-content re-delivery (or active-but-unpublished
-            # resume): fall through and run rather than clobbering active state.
+            # processing/active-but-not-fully-published same-content re-delivery:
+            # fall through and run (resume) rather than clobbering active state.
 
         try:
             for step in steps:
@@ -239,9 +269,14 @@ class IngestionJob:
             if not self._store.is_step_done(self._req.job_id, "commit"):
                 self._compensate()
             else:
-                # Committed but later step failed: the new version is already
-                # visible; do NOT roll it back (build plan §10.10 #6).
-                self._store.set_job_previous_version(self._req.job_id, None)
+                # Committed but a later step (publish/finalize) failed: the new
+                # version is already visible in the control plane, so do NOT roll
+                # it back (build plan §10.10 #6). Crucially we must PRESERVE
+                # previous_active_version: recovery's publish step still needs it
+                # to deprecate the version this commit replaced on the data plane.
+                # Clearing it (as before) left the old Qdrant points / parents
+                # orphaned and un-cleaned after recovery (E-008.2 P1-2).
+                pass
             self._store.mark_job_terminal(
                 self._req.job_id,
                 JobStatus.FAILED,
@@ -404,43 +439,71 @@ class IngestionJob:
 
         Build plan §10.10 #4: the data plane must be fully written AND verified
         before commit. Confirms expected Parent IDs and Qdrant Point IDs exist,
-        identity (tenant/corpus/document/version/parent) is consistent, counts
-        match the chunker output, and the new version is still uncommitted.
+        identity (tenant/corpus/document/version/parent/chunk) is truly consistent
+        (not just column presence), counts match the chunker output, and the new
+        version is still committable.
         """
         self._ensure_chunked()
         collection = self._req.corpus_id
 
-        # All expected parents present in the Parent Store.
+        # All expected parents present in the Parent Store WITH consistent
+        # identity (tenant/corpus/document/version/parent_id).
         for parent in self._parents_list:
-            if parent.parent_id not in self._parents:
+            stored = self._parents.get(parent.parent_id)
+            if stored is None:
                 raise RuntimeError(
                     f"verify failed: parent {parent.parent_id} missing from Parent Store"
                 )
+            if (
+                stored.tenant_id != self._req.tenant_id
+                or stored.corpus_id != self._req.corpus_id
+                or stored.document_id != self._req.document_id
+                or stored.document_version != self._req.document_version
+                or stored.parent_id != parent.parent_id
+            ):
+                raise RuntimeError(
+                    f"verify failed: identity mismatch on parent {parent.parent_id}"
+                )
 
-        # All expected Qdrant points exist (status-agnostic existence check).
+        # All expected Qdrant points exist WITH consistent identity (read the
+        # payload back, not just column presence).
         point_ids = [child_point_id(c.child_id) for c in self._children_list]
         if point_ids:
             found = self._vector._client.retrieve(
-                collection_name=collection, ids=point_ids, with_payload=False
+                collection_name=collection, ids=point_ids, with_payload=True
             )
-            found_ids = {str(p.id) for p in found}
-            missing = [pid for pid in point_ids if pid not in found_ids]
+            found_by_id = {str(p.id): p for p in found}
+            missing = [pid for pid in point_ids if pid not in found_by_id]
             if missing:
                 raise RuntimeError(f"verify failed: {len(missing)} Qdrant point(s) missing")
+            for pid in point_ids:
+                p = found_by_id[pid]
+                payload = p.payload or {}
+                if (
+                    payload.get("tenant_id") != self._req.tenant_id
+                    or payload.get("corpus_id") != self._req.corpus_id
+                    or payload.get("document_id") != self._req.document_id
+                    or payload.get("document_version") != self._req.document_version
+                    or not payload.get("parent_id")
+                    or not payload.get("chunk_id")
+                ):
+                    raise RuntimeError(
+                        f"verify failed: identity mismatch on Qdrant point {pid}"
+                    )
 
         # Identity + count consistency against persisted chunk records.
-        stored = self._store.list_chunk_records(
+        records = self._store.list_chunk_records(
             self._req.tenant_id,
             self._req.corpus_id,
             self._req.document_id,
             self._req.document_version,
         )
-        if len(stored) != len(self._parents_list) + len(self._children_list):
+        if len(records) != len(self._parents_list) + len(self._children_list):
             raise RuntimeError(
-                f"verify failed: chunk record count {len(stored)} != "
+                f"verify failed: chunk record count {len(records)} != "
                 f"{len(self._parents_list) + len(self._children_list)}"
             )
-        for rec in stored:
+        for rec in records:
             if (
                 rec.tenant_id != self._req.tenant_id
                 or rec.corpus_id != self._req.corpus_id
@@ -449,17 +512,15 @@ class IngestionJob:
             ):
                 raise RuntimeError(f"verify failed: identity mismatch on chunk {rec.chunk_id}")
 
-        # New version must still be uncommitted (processing), not already active.
+        # New version must still be committable (processing / failed / active-on-
+        # resume). The CAS in commit_active_version is the authoritative race
+        # guard; this just rejects impossible statuses.
         current = self._store.get_document(
             self._req.tenant_id,
             self._req.corpus_id,
             self._req.document_id,
             self._req.document_version,
         )
-        # The new version must exist and be in a committable state. A resumed
-        # commit may find its own version already active (committed by the prior
-        # attempt); that is allowed here because the CAS in commit_active_version
-        # is the authoritative race guard, not this pre-check.
         if current is None:
             raise RuntimeError("verify failed: new version missing before commit")
         if current.status not in (
@@ -487,14 +548,17 @@ class IngestionJob:
         self._vector.upsert(self._req.corpus_id, new_points)
 
         # Promote THIS version's parents from "processing" to "active" so the
-        # second-auth pass in ParentReader admits them. Never touches other
-        # versions' parents.
-        for pid, chunk in list(self._parents._store.items()):
-            if chunk.document_version == self._req.document_version:
-                md = dict(chunk.metadata)
-                md["status"] = "active"
-                md["deprecated"] = False
-                self._parents.put(chunk.model_copy(update={"metadata": md}))
+        # second-auth pass in ParentReader admits them. Only the parents THIS job
+        # produced (scoped by the chunker output, not a corpus-wide version scan)
+        # are touched, so a concurrent job's parents are never disturbed (P2-2).
+        for parent in self._parents_list:
+            chunk = self._parents.get(parent.parent_id)
+            if chunk is None:
+                continue
+            md = dict(chunk.metadata)
+            md["status"] = "active"
+            md["deprecated"] = False
+            self._parents.put(chunk.model_copy(update={"metadata": md}))
 
         # P1-7: deprecate ONLY the version this commit actually replaced (read
         # from the persisted job record, not a scan of all non-active rows), so

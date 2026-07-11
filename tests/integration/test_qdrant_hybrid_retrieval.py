@@ -26,6 +26,7 @@ from tests.fixtures import (
     FakeDenseEncoder,
     FakeSparseEncoder,
     acl_payload,
+    active_metadata_store,
     make_child_point,
     make_security_context,
 )
@@ -244,7 +245,11 @@ def test_empty_allowed_security_levels_fails_closed() -> None:
     # Empty levels => PEP raises EmptyAuthorizationScopeError; SecureRetriever
     # catches it and returns empty results (fail closed). The PDP also denies
     # everything, so PDP/PEP equivalence is preserved.
-    retriever = SecureRetriever(_HybridSearchAdapter(_build_store()), ParentReader(_NoopStore()))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(_build_store()),
+        ParentReader(_NoopStore()),
+        metadata_store=active_metadata_store("t1", CORPUS_ID, "d1", "v1"),
+    )
     result = retriever.retrieve(
         _ctx(allowed_security_levels=[]),
         "resource",
@@ -296,6 +301,7 @@ def test_empty_levels_cannot_match_reserved_security_level() -> None:
             )
         ),
         ParentReader(_NoopStore()),
+        metadata_store=active_metadata_store("t1", CORPUS_ID, "d1", "v1"),
     )
     result = retriever.retrieve(
         _ctx(allowed_security_levels=[]),
@@ -310,7 +316,11 @@ def test_empty_levels_cannot_match_reserved_security_level() -> None:
 
 def test_corpus_discoverability_gate_blocks() -> None:
     ctx = _ctx(allowed_corpus_ids=["other_corpus"])
-    retriever = SecureRetriever(_HybridSearchAdapter(_build_store()), ParentReader(_NoopStore()))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(_build_store()),
+        ParentReader(_NoopStore()),
+        metadata_store=active_metadata_store("t1", CORPUS_ID, "d1", "v1"),
+    )
     result = retriever.retrieve(
         ctx,
         "resource",

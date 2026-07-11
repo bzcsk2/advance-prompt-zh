@@ -215,6 +215,10 @@ def test_crash_after_commit_publish_recovers_without_rollback() -> None:
     # parent published) and are denied. Result: nothing retrievable.
     assert _retrieve_versions(retriever) == []
     assert store.get_job_status("j2") == JobStatus.FAILED
+    # P1-2: the version this commit replaced must be PRESERVED after the
+    # post-commit failure (not cleared), so recovery can still deprecate the old
+    # data plane.
+    assert store.get_job_previous_version("j2") == "v1"
 
     # Resume (plain job): publish succeeds, new version becomes visible, old is
     # made invisible. The already-active new version is NOT rolled back.
@@ -222,6 +226,10 @@ def test_crash_after_commit_publish_recovers_without_rollback() -> None:
     assert store.get_job_status("j2") == JobStatus.SUCCEEDED
     assert store.get_active_document("t1", "eng", "doc1").version == "v2"
     assert _retrieve_versions(retriever) == ["v2"]
+    # The replaced v1 data plane was actually cleaned up on recovery.
+    v1_parents = [c for c in parents._store.values() if c.document_version == "v1"]
+    assert v1_parents
+    assert all(c.metadata.get("deprecated") for c in v1_parents)
     store.close()
     os.unlink(db_path)
 
