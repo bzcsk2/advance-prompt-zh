@@ -4,8 +4,8 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M0** — Repository Reconciliation & Baseline
-- Issue: **E-M0C** — Milestone 0 Closure: exit gate compliance
+- Milestone: **M1** — Secure single-corpus data vertical slice
+- Issue: **E-005** — Define domain models, lifecycle state machine and migrations
 
 ## Fixed Paths
 ```bash
@@ -13,8 +13,8 @@ UPSTREAM_REPO=/vol4/Agent/agentic-rag-for-dummies
 TARGET_REPO=/vol4/Agent/agentic-rag-enterprise
 ```
 
-## Fixed Commits (M0 baseline)
-- Target: `6e80b31614d127c4f004e60edcf4d3935653bd2a` (main)
+## Fixed Commits (M1 baseline)
+- Target: `3748b33ffa37a0f977d9ba448e6d760a639b5eba` (main)
 - Upstream: `8b3e5ff0619f7ede593d728e4a8b459fbbec9b08` (main, tag v2.3)
 
 ## Permanent Rules (all milestones)
@@ -24,31 +24,13 @@ TARGET_REPO=/vol4/Agent/agentic-rag-enterprise
 4. Do not create empty code directories.
 5. Keep existing working tree changes; do not reset, checkout, or overwrite.
 
-## E-M0C Allowed Changes (closure only)
-- All previously created M0 deliverables may be staged and committed.
-- `src/agentic_rag_enterprise/graph/runtime.py` — fix str|None type mismatch
-- `pyproject.toml` — add types-PyYAML, freeze Python 3.13, update ruff target
-- `.python-version` — create
-- `docs/baseline-validation.md` — update Python freeze record
-- `uv.lock` — regenerate
-- No modifications to upstream.
-- No push, no PR creation.
-- One commit only: `chore: close milestone 0 baseline`
-
-## Staging Allowlist (git add)
-```
-.python-version
-AGENTS.md
-UPSTREAM.md
-pyproject.toml
-uv.lock
-docs/agentic-rag-enterprise-build-plan.md
-docs/baseline-validation.md
-docs/upstream-capability-map.md
-src/agentic_rag_enterprise/providers.py
-src/agentic_rag_enterprise/graph/runtime.py
-tests/baseline/
-```
+## E-005 Allowed Changes (M1 only)
+- `src/agentic_rag_enterprise/domain/` — create or modify domain models
+- `migrations/` — create or modify migration scaffolding
+- `tests/test_domain_models.py` — create or modify
+- `AGENTS.md` — update
+- Do not modify existing modules under `src/agentic_rag_enterprise/{agents,graph,retrieval,api,evals,observability,ingestion,security,config,schemas,providers}`.
+- No upstream modifications. No push, no PR creation.
 
 ## Standard Checks
 ```bash
