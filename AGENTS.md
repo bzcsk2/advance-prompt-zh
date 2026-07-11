@@ -5,7 +5,7 @@
 
 ## Current Milestone & Issue
 - Milestone: **M1** — Secure single-corpus data vertical slice
-- Issue: **E-005** — Define domain models, lifecycle state machine and migrations
+- Issue: **E-006** — Add SecurityContext, policy truth table and authorization tests
 
 ## Fixed Paths
 ```bash
@@ -24,12 +24,21 @@ TARGET_REPO=/vol4/Agent/agentic-rag-enterprise
 4. Do not create empty code directories.
 5. Keep existing working tree changes; do not reset, checkout, or overwrite.
 
-## E-005 Allowed Changes (M1 only)
+## E-005 Allowed Changes (M1 only) — completed
 - `src/agentic_rag_enterprise/domain/` — create or modify domain models
 - `migrations/` — create or modify migration scaffolding
 - `tests/test_domain_models.py` — create or modify
 - `AGENTS.md` — update
 - Do not modify existing modules under `src/agentic_rag_enterprise/{agents,graph,retrieval,api,evals,observability,ingestion,security,config,schemas,providers}`.
+- No upstream modifications. No push, no PR creation.
+
+## E-006 Allowed Changes (M1 only)
+- `src/agentic_rag_enterprise/security/` — create or modify policy truth table, PEP filter, authorization
+- `src/agentic_rag_enterprise/domain/security.py` — may be read; SecurityContext already matches spec §7.5
+- `tests/security/` — create authorization tests (truth table, corpus discoverability, PEP filter)
+- `AGENTS.md` — update
+- Keep `security/policy.py:AccessPolicy.can_access(user_id, corpus)` shim so the M0 baseline
+  characterization tests in `tests/baseline/test_retrieval_baseline.py` stay green.
 - No upstream modifications. No push, no PR creation.
 
 ## Standard Checks
