@@ -5,7 +5,7 @@
 
 ## Current Milestone & Issue
 - Milestone: **M1** — Secure single-corpus data vertical slice
-- Issue: **E-006** — Add SecurityContext, policy truth table and authorization tests
+- Issue: **E-006.1** — Close authorization review findings (deprecated flag, real cross-tenant, Qdrant PDP/PEP equivalence)
 
 ## Fixed Paths
 ```bash
@@ -40,6 +40,25 @@ TARGET_REPO=/vol4/Agent/agentic-rag-enterprise
 - Keep `security/policy.py:AccessPolicy.can_access(user_id, corpus)` shim so the M0 baseline
   characterization tests in `tests/baseline/test_retrieval_baseline.py` stay green.
 - No upstream modifications. No push, no PR creation.
+
+## E-006.1 Allowed Changes (M1 only)
+- `src/agentic_rag_enterprise/security/filter.py` — add `deprecated == false` to `build_access_filter`
+  and to `resource_passes_filter`; this makes PEP structurally match the active, non-deprecated
+  invariant that migrations/001_initial_schema.sql enforces for rows.
+- `tests/security/test_authorization.py` — replace the fake same-tenant "cross-tenant" rows with
+  real cross-tenant cases (ctx tenant != acl tenant), add `deprecated` unit test, bump `must` count.
+- `tests/integration/test_qdrant_authorization.py` — new; real in-memory Qdrant collection proving
+  PDP (`evaluate_access`) == Qdrant Filter (`build_access_filter`) over the ACL matrix.
+- `AGENTS.md` — update issue + record E-007 constraint.
+- No upstream modifications. No push, no PR creation.
+
+### E-007 constraint (recorded for the next issue)
+When porting parent-child chunking + hybrid retrieval from upstream:
+- Port **algorithms only**, never upstream trust boundaries.
+- MUST use `evaluate_access` / `build_access_filter`; MUST NOT use `AccessPolicy.can_access`.
+- No filename-derived parent IDs; no filter-less retrieval.
+- `SecurityContext` is a required parameter on every retrieval path.
+- Parent documents require a second authorization pass (`resource_passes_filter`).
 
 ## Standard Checks
 ```bash

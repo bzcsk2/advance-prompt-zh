@@ -47,7 +47,25 @@ _TRUTH_TABLE = [
     # ctx overrides, acl overrides, expected
     ({}, {"acl_scope": "tenant"}, "allow"),
     ({}, {"acl_scope": "tenant", "security_level": "confidential"}, "deny"),
-    ({"tenant_id": "t2"}, {"tenant_id": "t2"}, "deny"),
+    # Real cross-tenant: tenant boundary is a hard stop, regardless of scope.
+    ({"tenant_id": "t2"}, {"tenant_id": "t1", "acl_scope": "tenant"}, "deny"),
+    (
+        {"tenant_id": "t2"},
+        {"tenant_id": "t1", "acl_scope": "tenant", "security_level": "public"},
+        "deny",
+    ),
+    # Cross-tenant with an explicit allow cannot bypass the tenant boundary.
+    (
+        {"tenant_id": "t2"},
+        {"tenant_id": "t1", "acl_scope": "restricted", "allowed_user_ids": ["u1"]},
+        "deny",
+    ),
+    # Cross-tenant admin gets no implicit bypass either.
+    (
+        {"tenant_id": "t2", "is_admin": True},
+        {"tenant_id": "t1", "acl_scope": "tenant"},
+        "deny",
+    ),
     ({}, {"acl_scope": "restricted"}, "deny"),
     ({}, {"acl_scope": "restricted", "allowed_user_ids": ["u1"]}, "allow"),
     ({}, {"acl_scope": "restricted", "allowed_group_ids": ["g1"]}, "deny"),
@@ -137,7 +155,7 @@ def test_build_access_filter_structure() -> None:
 
     assert flt.must is not None
     assert flt.must_not is not None
-    assert len(flt.must) == 5
+    assert len(flt.must) == 6
     assert len(flt.must_not) == 2
 
     field_conditions = [c for c in flt.must if isinstance(c, FieldCondition)]
@@ -145,10 +163,11 @@ def test_build_access_filter_structure() -> None:
     assert "tenant_id" in keys
     assert "corpus_id" in keys
     assert "status" in keys
+    assert "deprecated" in keys
     assert "security_level" in keys
 
-    # scope OR-filter is the 5th must condition
-    scope_filter = flt.must[4]
+    # scope OR-filter is the 6th must condition
+    scope_filter = flt.must[5]
     assert isinstance(scope_filter, Filter)
     assert len(scope_filter.should) == 3
 
@@ -183,3 +202,9 @@ def test_resource_passes_filter_requires_active() -> None:
     ctx = _ctx()
     acl = _acl(acl_scope="tenant")
     assert resource_passes_filter(ctx, acl, status="deleted") is False
+
+
+def test_resource_passes_filter_rejects_deprecated() -> None:
+    ctx = _ctx()
+    acl = _acl(acl_scope="tenant")
+    assert resource_passes_filter(ctx, acl, deprecated=True) is False

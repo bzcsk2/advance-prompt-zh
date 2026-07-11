@@ -28,6 +28,7 @@ def build_access_filter(ctx: SecurityContext, corpus_id: str) -> Filter:
         FieldCondition(key="tenant_id", match=MatchValue(value=ctx.tenant_id)),
         FieldCondition(key="corpus_id", match=MatchValue(value=corpus_id)),
         FieldCondition(key="status", match=MatchValue(value="active")),
+        FieldCondition(key="deprecated", match=MatchValue(value=False)),
         FieldCondition(
             key="security_level",
             match=MatchAny(any=list(ctx.allowed_security_levels)),
@@ -61,13 +62,19 @@ def build_access_filter(ctx: SecurityContext, corpus_id: str) -> Filter:
     return Filter(must=must, must_not=must_not)
 
 
-def resource_passes_filter(ctx: SecurityContext, acl: ResourceAcl, status: str = "active") -> bool:
+def resource_passes_filter(
+    ctx: SecurityContext,
+    acl: ResourceAcl,
+    status: str = "active",
+    deprecated: bool = False,
+) -> bool:
     """Cheap, Qdrant-free projection of :func:`build_access_filter`.
 
     Useful for pre-flight checks (e.g. parent-store second-pass
-    authorization) where the resource is already loaded.
+    authorization) where the resource is already loaded. A deprecated or
+    non-active resource never passes, mirroring the Qdrant ``must`` filter.
     """
 
-    if status != "active":
+    if status != "active" or deprecated:
         return False
     return evaluate_access(ctx, acl) is AuthorizationDecision.ALLOW
