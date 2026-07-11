@@ -6,8 +6,14 @@
 ## Current Milestone & Issue
 - Milestone: **M1** — Secure single-corpus data vertical slice
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
-- Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — IN PROGRESS.
+- Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
+- Next issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1, not yet started).
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
+
+> **AGENTS.md is a slim entry point** (build plan §1.7): current Milestone/Issue, fixed
+> paths, and standard commands only. Detailed Issue Contracts are versioned docs under
+> `docs/` (linked below), not copied here. From E-008 onward, do not inline full contract
+> prose into AGENTS.md.
 
 ## Fixed Paths
 ```bash
@@ -55,7 +61,7 @@ TARGET_REPO=/vol4/Agent/agentic-rag-enterprise
 - `AGENTS.md` — update issue + record E-007 constraint.
 - No upstream modifications. No push, no PR creation.
 
-## E-007 Issue Contract (M1 only) — IN PROGRESS
+## E-007 Issue Contract (M1 only) — CLOSED at `ccb52dc`
 Port parent-child chunking + hybrid retrieval from upstream (`agentic-rag-for-dummies`, tag v2.3,
 read-only). Port **algorithms only**; never upstream trust boundaries.
 
@@ -95,7 +101,7 @@ read-only). Port **algorithms only**; never upstream trust boundaries.
    `evaluate_access` (PDP) are authoritative. Empty `allowed_security_levels` fails closed by
    raising `EmptyAuthorizationScopeError` (the PEP mirrors the PDP, which denies on empty levels);
    empty `groups` simply omits the group `should`/`must_not` conditions (also matching the PDP,
-   where an empty `set(ctx.groups)` matches nothing and matches every deny-list). There is **no**
+   where an empty `set(ctx.groups)` matches no group allow/deny entry). There is **no**
    sentinel-value design — equivalence is preserved structurally.
 3. **Parent second authorization** — `ParentReader` is the ONLY authorized parent accessor; it
    re-verifies identity (tenant/corpus/document/version), lifecycle (active, not deprecated),
@@ -112,7 +118,7 @@ read-only). Port **algorithms only**; never upstream trust boundaries.
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise` clean.
 
-## E-007.1 Issue Contract (M1 only) — IN PROGRESS
+## E-007.1 Issue Contract (M1 only) — CLOSED at `b0dbf6f`
 Security-audit remediation of E-007 (audit verdict: **Conditional Fail**). Baseline `ccb52dc` is
 kept intact; E-007.1 is a narrow fix commit. Scope is a strict subset of the E-007 allowed paths
 (`security/`, `retrieval/`, `ingestion/`, `storage/`, `tests/...`, `AGENTS.md`,

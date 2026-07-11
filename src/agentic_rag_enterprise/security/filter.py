@@ -18,12 +18,13 @@ from agentic_rag_enterprise.security.policy import (
 
 
 class EmptyAuthorizationScopeError(Exception):
-    """Raised when the caller's authorization scope is empty.
+    """Raised when the caller's authorization scope cannot authorize anything.
 
-    An empty ``allowed_security_levels`` (or, by extension, empty groups) means
-    the PDP would deny every resource. We make this explicit and fail closed
-    rather than constructing a filter that could be gap-filled by a crafted
-    resource payload.
+    An empty ``allowed_security_levels`` means the PDP would deny every
+    resource, so we fail closed by raising here instead of constructing a filter
+    a crafted resource payload could slip past. (Empty ``groups`` is NOT a
+    deny-all: a tenant-scoped resource or an explicit user allow can still
+    match, so an empty group set simply omits the group allow/deny branches.)
     """
 
 

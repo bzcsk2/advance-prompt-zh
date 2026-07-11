@@ -19,6 +19,16 @@ def test_only_secure_retriever_is_exported() -> None:
     assert not hasattr(retrieval_pkg, "HybridRetriever")
 
 
+def test_public_entry_points_are_importable() -> None:
+    # The package-level export must be a real, importable binding (not just a
+    # string in __all__).
+    from agentic_rag_enterprise.retrieval import Retriever, SecureRetriever
+
+    assert Retriever is not None
+    assert SecureRetriever is not None
+    assert "_HybridSearchAdapter" not in dir(retrieval_pkg)
+
+
 def test_hybrid_adapter_not_importable_from_package() -> None:
     with pytest.raises(ImportError):
         from agentic_rag_enterprise.retrieval import HybridRetriever  # noqa: F401

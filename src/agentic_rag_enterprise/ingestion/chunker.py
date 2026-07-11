@@ -62,7 +62,7 @@ class ChildChunk(BaseModel):
     child_id: str
     parent_id: str
     document_id: str
-    document_version: str = ""
+    document_version: str
     tenant_id: str
     corpus_id: str
     text: str

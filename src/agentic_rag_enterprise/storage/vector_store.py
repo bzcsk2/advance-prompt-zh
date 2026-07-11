@@ -138,6 +138,11 @@ def child_chunk_to_point(
     carries full provenance + ACL so the retrieval path can re-establish
     identity and authorization at read time.
     """
+    if acl.tenant_id != child.tenant_id:
+        raise ValueError(
+            f"ACL tenant {acl.tenant_id!r} does not match child tenant {child.tenant_id!r}"
+        )
+
     dense = dense_encoder(child.text)
     sparse = sparse_encoder(child.text)
     payload = {

@@ -7,4 +7,6 @@ corpus-discoverability gate and parent second-authorization by calling it
 directly.
 """
 
+from agentic_rag_enterprise.retrieval.retriever import Retriever, SecureRetriever
+
 __all__ = ["Retriever", "SecureRetriever"]
