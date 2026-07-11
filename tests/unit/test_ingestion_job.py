@@ -306,29 +306,190 @@ def test_compensation_cleans_control_plane_when_verify_fails() -> None:
     os.unlink(db_path)
 
 
-def test_already_indexed_resumes_after_commit_crash() -> None:
-    # P1-1: a real crash between commit_active_version succeeding and the
-    # "commit" step marker being written leaves the version ACTIVE but the job
-    # still RUNNING. A re-delivery must RESUME and finish publish/finalize
-    # (INDEXED), NOT short-circuit to ALREADY_INDEXED and silently skip the
-    # data-plane promotion.
+def test_precise_commit_crash_resumes_publish_and_finalize() -> None:
+    # P2 (precise crash hook): a real crash AFTER commit_active_version
+    # succeeds but BEFORE the outer "commit" step marker is written must leave
+    # the version ACTIVE in the control plane while the data plane is still
+    # 'processing'. A re-delivery must RESUME and finish publish/finalize
+    # (INDEXED) and clean the previously-replaced version's data plane, NOT
+    # short-circuit to ALREADY_INDEXED and NOT compensate the committed version.
+    manager, store, vector, parents, db_path = _manager()
+    manager.ingest(_request(job_id="j0", version="v1", content="# T\n\nfirst version"))
+
+    class CommitCrashJob(IngestionJob):
+        def _step_commit(self) -> None:
+            # Run the real commit (switches the active version), then crash
+            # before the outer mark_step("commit") is written.
+            super()._step_commit()
+            raise RuntimeError("simulated crash after commit")
+
+    req2 = _request(job_id="j2", version="v2", content="# T\n\nsecond version")
+    crashed = CommitCrashJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req2,
+    ).run()
+
+    # Crashed before the commit marker: version committed (active) but the job
+    # is FAILED and the data plane is still 'processing' (unpublished).
+    assert crashed.status == IngestionStatus.FAILED
+    assert store.get_job_status("j2") == JobStatus.FAILED
+    assert store.get_active_document("t1", "eng", "d1").version == "v2"
+    # The replaced v1 is deprecated in the control plane but its data plane is
+    # not yet cleaned (publish never ran).
+    v1_parents_before = [c for c in parents._store.values() if c.document_version == "v1"]
+    assert v1_parents_before
+
+    # Resume: must finish publish + finalize and clean the old data plane.
+    resumed = manager.ingest(req2)
+    assert resumed.status == IngestionStatus.INDEXED
+    assert store.get_job_status("j2") == JobStatus.SUCCEEDED
+    assert _count_qdrant_points(vector, "eng") > 0
+    v1_parents_after = [c for c in parents._store.values() if c.document_version == "v1"]
+    assert v1_parents_after
+    assert all(c.metadata.get("deprecated") for c in v1_parents_after)
+    store.close()
+    os.unlink(db_path)
+
+
+def test_build_conflict_loser_never_compensates() -> None:
+    # P1-1: a BuildConflict loser must NOT mutate the shared data plane and must
+    # NOT compensate (delete) the winning build's deterministic-ID artifacts.
     manager, store, vector, parents, db_path = _manager()
     req = _request(job_id="j1", version="v1", content="# T\n\nhello world")
-    first = manager.ingest(req)
-    assert first.status == IngestionStatus.INDEXED
 
-    # Simulate the crash: job back to RUNNING, commit step marker unwritten,
-    # while the document is already active in the control plane.
-    store.mark_job_terminal("j1", JobStatus.RUNNING)
-    store.clear_steps("j1")
-    store.mark_step("j1", "acquire", "done")  # acquire already happened
-    assert store.get_active_document("t1", "eng", "d1").version == "v1"
+    # Winner claims the lease and writes its data plane (not yet committed).
+    winner = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req,
+    )
+    winner.run(max_step="write_qdrant")
+    points_before = _count_qdrant_points(vector, "eng")
+    assert points_before > 0
+    assert store.get_job_status("j1") == JobStatus.RUNNING
 
-    # Re-deliver: must resume and complete, not return ALREADY_INDEXED.
-    second = manager.ingest(req)
-    assert second.status == IngestionStatus.INDEXED
-    assert store.get_job_status("j1") == JobStatus.SUCCEEDED
-    assert _count_qdrant_points(vector, "eng") > 0
+    # Concurrent loser (same artifact, different job_id) is rejected with
+    # BuildConflict and must not delete the winner's data.
+    loser = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=_request(job_id="j2", version="v1", content="# T\n\nhello world"),
+    )
+    res = loser.run()
+    assert res.status == IngestionStatus.BUILD_CONFLICT
+    assert res.error_code == "build_conflict"
+    # Winner's data plane is intact; winner still owns the lease.
+    assert _count_qdrant_points(vector, "eng") == points_before
+    assert store.get_build_owner("t1", "eng", "d1", "v1") == "j1"
+    assert store.get_job_status("j1") == JobStatus.RUNNING
+    store.close()
+    os.unlink(db_path)
+
+
+def test_build_lease_fencing_blocks_taken_over_owner() -> None:
+    # P1-2: once a failed build's lease is taken over by a concurrent delivery,
+    # the original (stale) owner is fenced out — re-running it raises
+    # BuildConflict and never compensates the new owner's data plane.
+    manager, store, vector, parents, db_path = _manager()
+    content = "# T\n\nhello world"
+    req1 = _request(job_id="j1", version="v1", content=content)
+
+    # j1 claims the lease and writes its data plane.
+    IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req1,
+    ).run(max_step="write_qdrant")
+    points_after_j1 = _count_qdrant_points(vector, "eng")
+    assert points_after_j1 > 0
+
+    # j1's build fails (crash) -> terminal; lease still references j1.
+    store.mark_job_terminal("j1", JobStatus.FAILED)
+
+    # A concurrent delivery j2 takes over the lease and is IN-FLIGHT (running).
+    IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=_request(job_id="j2", version="v1", content=content),
+    ).run(max_step="write_qdrant")
+    assert store.get_build_owner("t1", "eng", "d1", "v1") == "j2"
+    assert store.get_job_status("j2") == JobStatus.RUNNING
+
+    # The original owner j1, now taken over by an in-flight j2, must be fenced
+    # out (BuildConflict), never compensated, and never corrupt j2's data.
+    res1b = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req1,
+    ).run()
+    assert res1b.status == IngestionStatus.BUILD_CONFLICT
+    assert res1b.error_code == "build_conflict"
+    # j2's data plane is intact (not deleted by j1's compensation).
+    assert _count_qdrant_points(vector, "eng") == points_after_j1
+    store.close()
+    os.unlink(db_path)
+
+
+def test_verify_rejects_qdrant_payload_mismatch() -> None:
+    # P1-3: _step_verify must detect an EXACT Qdrant payload mismatch
+    # (e.g. a tampered parent_id), not merely a non-empty field.
+    import pytest
+
+    from agentic_rag_enterprise.storage.vector_store import child_chunk_to_point
+
+    manager, store, vector, parents, db_path = _manager()
+    req = _request(job_id="j1", version="v1", content="# T\n\nhello world")
+    job = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req,
+    )
+    job.run(max_step="write_qdrant")
+
+    # Tamper a Qdrant point's parent_id in the data plane.
+    child = job._children_list[0]
+    tampered_point = child_chunk_to_point(
+        child,
+        req.acl,
+        status="processing",
+        deprecated=False,
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+    )
+    tampered_point.payload["parent_id"] = "wrong-parent"
+    vector.upsert("eng", [tampered_point])
+
+    with pytest.raises(RuntimeError):
+        job._step_verify()
     store.close()
     os.unlink(db_path)
 

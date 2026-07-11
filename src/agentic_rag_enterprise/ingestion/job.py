@@ -30,6 +30,7 @@ from agentic_rag_enterprise.ingestion.chunker import ChildChunk, ParentChildChun
 from agentic_rag_enterprise.security.policy import ResourceAcl
 from agentic_rag_enterprise.storage.metadata_store import (
     ActiveVersionConflict,
+    BuildConflict,
     JobIdentityConflict,
     MetadataStore,
     VersionContentConflict,
@@ -57,6 +58,7 @@ class IngestionStatus(str, Enum):
     ALREADY_INDEXED = "already_indexed"
     IN_PROGRESS = "in_progress"
     FAILED = "failed"
+    BUILD_CONFLICT = "build_conflict"
 
 
 @dataclass
@@ -143,6 +145,13 @@ class IngestionJob:
         self._source_doc: Optional[SourceDocument] = None
         self._raw_hash: str = ""
         self._parsed_hash: str = ""
+        # Build-lease fencing token captured at acquire time; downstream
+        # mutations verify it still matches the live lease (E-008.3 P1-2).
+        self._lease_generation: int = 0
+        # Set True only after commit_active_version has actually switched the
+        # active version; used to decide compensation on a post-commit crash
+        # (E-008.3 P2 precise commit-crash hook).
+        self._commit_performed: bool = False
 
     # ------------------------------------------------------------------ #
     # Public entry point
@@ -237,8 +246,19 @@ class IngestionJob:
             # processing/active-but-not-fully-published same-content re-delivery:
             # fall through and run (resume) rather than clobbering active state.
 
+        # FIRST mutation: claim/renew the build lease atomically. This creates the
+        # processing document row, the job row, and captures the previous active
+        # version in ONE transaction, BEFORE any Parent/Qdrant/Chunk write. A
+        # BuildConflict here (concurrent in-flight owner or a taken-over lease)
+        # is caught separately below and NEVER compensates the winner's data
+        # (E-008.3 P1-1 claim-before-mutate). Acquire is always run (even if its
+        # step marker is already done) so a resuming job re-asserts ownership and
+        # refreshes its fencing token every run() (E-008.3 P1-2).
         try:
+            self._step_acquire()
             for step in steps:
+                if step == "acquire":
+                    continue
                 if self._store.is_step_done(self._req.job_id, step):
                     continue
                 getattr(self, f"_step_{step}")()
@@ -257,6 +277,16 @@ class IngestionJob:
                 parent_count=len(self._parents_list),
                 child_count=len(self._children_list),
             )
+        except BuildConflict as exc:
+            # A concurrent in-flight owner or a taken-over lease. Fail closed and
+            # return a typed result; NEVER compensate another build's data plane.
+            return IngestionResult(
+                status=IngestionStatus.BUILD_CONFLICT,
+                job_id=self._req.job_id,
+                document_version=self._req.document_version,
+                error_code="build_conflict",
+                error_message=str(exc),
+            )
         except Exception as exc:  # noqa: BLE001 — fail closed + compensate
             # P1-5: every pre-commit failure path (including ActiveVersionConflict)
             # routes through the same idempotent compensation and leaves a failed
@@ -266,17 +296,14 @@ class IngestionJob:
                 if isinstance(exc, ActiveVersionConflict)
                 else "ingestion_error"
             )
-            if not self._store.is_step_done(self._req.job_id, "commit"):
+            if not self._commit_performed:
+                # Only compensate when the active version was NOT yet switched.
+                # After commit_active_version succeeds (even if a later step
+                # crashes before the "commit" marker is written), the version is
+                # already visible in the control plane, so we must NOT roll it
+                # back and must PRESERVE previous_active_version for recovery's
+                # publish step (E-008.2 P1-2, E-008.3 P2 precise commit-crash).
                 self._compensate()
-            else:
-                # Committed but a later step (publish/finalize) failed: the new
-                # version is already visible in the control plane, so do NOT roll
-                # it back (build plan §10.10 #6). Crucially we must PRESERVE
-                # previous_active_version: recovery's publish step still needs it
-                # to deprecate the version this commit replaced on the data plane.
-                # Clearing it (as before) left the old Qdrant points / parents
-                # orphaned and un-cleaned after recovery (E-008.2 P1-2).
-                pass
             self._store.mark_job_terminal(
                 self._req.job_id,
                 JobStatus.FAILED,
@@ -295,17 +322,18 @@ class IngestionJob:
     # Steps
     # ------------------------------------------------------------------ #
     def _step_acquire(self) -> None:
-        # Create the document control-plane row FIRST so the ingestion_jobs FK
-        # (document_id, tenant_id, corpus_id, document_version) is satisfied.
-        self._source_doc = self._build_source_document(status=DocumentStatus.PROCESSING)
-        self._store.upsert_document(self._source_doc)
         # P1-3: capture and persist the monotonic lifecycle revision at acquire
         # time. The commit phase CASes against THIS value, so a newer revision
         # landing first makes this (older) job lose the race.
         base_revision = self._store.get_current_revision(
             self._req.tenant_id, self._req.corpus_id, self._req.document_id
         )
-        self._store.acquire_job(
+        # Claim/renew the build lease atomically (lease + processing document row
+        # + job row + previous-active-version capture + acquire marker), BEFORE
+        # any Parent/Qdrant/Chunk write (E-008.3 P1-1 claim-before-mutate). The
+        # returned generation is our fencing token for downstream mutations.
+        self._source_doc = self._build_source_document(status=DocumentStatus.PROCESSING)
+        _status, generation = self._store.acquire_job(
             job_id=self._req.job_id,
             document_id=self._req.document_id,
             document_version=self._req.document_version,
@@ -316,20 +344,9 @@ class IngestionJob:
             embedding_version=self._req.embedding_version,
             raw_hash=self._raw_hash,
             base_revision=base_revision,
+            document=self._source_doc,
         )
-        # P1-7: capture the version this job is intended to replace. This is
-        # sampled at acquire time and persisted, so a resumed job (after commit
-        # but before publish) still deprecates the ORIGINAL previous version and
-        # never the version it already committed. acquire_job is an
-        # INSERT OR REPLACE, so restore any previously captured value.
-        existing_previous = self._store.get_job_previous_version(self._req.job_id)
-        if existing_previous is None:
-            previous = self._store.get_active_version(
-                self._req.tenant_id, self._req.corpus_id, self._req.document_id
-            )
-        else:
-            previous = existing_previous
-        self._store.set_job_previous_version(self._req.job_id, previous)
+        self._lease_generation = generation
 
     def _step_parse(self) -> None:
         # Content already hashed in acquire; parsed_hash is refined after chunking.
@@ -417,7 +434,37 @@ class IngestionJob:
                 )
             )
 
+    def _assert_owns_build(self) -> None:
+        """Fencing check: this job must still own the build lease.
+
+        Compares the live lease owner and ``lease_generation`` against what we
+        captured at acquire time. A taken-over (stale) owner is rejected with
+        :class:`BuildConflict` before it can mutate the shared data plane
+        (E-008.3 P1-2).
+        """
+        owner = self._store.get_build_owner(
+            self._req.tenant_id,
+            self._req.corpus_id,
+            self._req.document_id,
+            self._req.document_version,
+        )
+        generation = self._store.get_lease_generation(
+            self._req.tenant_id,
+            self._req.corpus_id,
+            self._req.document_id,
+            self._req.document_version,
+        )
+        if owner != self._req.job_id or generation != self._lease_generation:
+            raise BuildConflict(
+                f"build lease lost for ({self._req.tenant_id},{self._req.corpus_id},"
+                f"{self._req.document_id},{self._req.document_version}): owner="
+                f"{owner!r} (expected {self._req.job_id!r}), generation={generation} "
+                f"(expected {self._lease_generation})"
+            )
+
     def _step_commit(self) -> None:
+        # Fencing: only the live lease owner may switch the active version.
+        self._assert_owns_build()
         # P1-3: commit against the revision captured at acquire time, not the
         # latest value read just before commit (which would let an older job
         # overwrite a newer committed state).
@@ -429,6 +476,10 @@ class IngestionJob:
             new_version=self._req.document_version,
             expected_revision=expected_rev,
         )
+        # The version was actually switched; record this so a crash in a later
+        # step (publish/finalize) does NOT compensate the now-visible active
+        # version (E-008.3 P2 precise commit-crash hook).
+        self._commit_performed = True
         # The version this job replaces is captured at acquire time (stable
         # across resume); commit_active_version's returned previous is only the
         # current active version and may be the job's own version on resume, so
@@ -466,26 +517,39 @@ class IngestionJob:
                 )
 
         # All expected Qdrant points exist WITH consistent identity (read the
-        # payload back, not just column presence).
+        # payload back, not just column presence). Each point is compared
+        # EXACTLY against the chunker output for this version: a tampered
+        # parent_id / chunk_id / tenant / status / deprecated must be rejected
+        # (E-008.3 P1-3, not merely "non-empty").
         point_ids = [child_point_id(c.child_id) for c in self._children_list]
         if point_ids:
             found = self._vector._client.retrieve(
                 collection_name=collection, ids=point_ids, with_payload=True
             )
             found_by_id = {str(p.id): p for p in found}
+            expected_by_point_id = {
+                child_point_id(c.child_id): c for c in self._children_list
+            }
             missing = [pid for pid in point_ids if pid not in found_by_id]
             if missing:
                 raise RuntimeError(f"verify failed: {len(missing)} Qdrant point(s) missing")
             for pid in point_ids:
                 p = found_by_id[pid]
                 payload = p.payload or {}
+                child = expected_by_point_id.get(pid)
+                if child is None:
+                    raise RuntimeError(
+                        f"verify failed: unexpected Qdrant point {pid}"
+                    )
                 if (
                     payload.get("tenant_id") != self._req.tenant_id
                     or payload.get("corpus_id") != self._req.corpus_id
                     or payload.get("document_id") != self._req.document_id
                     or payload.get("document_version") != self._req.document_version
-                    or not payload.get("parent_id")
-                    or not payload.get("chunk_id")
+                    or payload.get("parent_id") != child.parent_id
+                    or payload.get("chunk_id") != child.child_id
+                    or payload.get("status") != "processing"
+                    or payload.get("deprecated") is not False
                 ):
                     raise RuntimeError(
                         f"verify failed: identity mismatch on Qdrant point {pid}"
@@ -531,6 +595,8 @@ class IngestionJob:
             raise RuntimeError(f"verify failed: unexpected status {current.status}")
 
     def _step_publish(self) -> None:
+        # Fencing: only the live lease owner may promote/deprecate the data plane.
+        self._assert_owns_build()
         self._ensure_chunked()
         acl = self._req.acl
         # New version becomes visible: flip its Qdrant points to active.
@@ -635,6 +701,15 @@ class IngestionJob:
     # chunk records and marks the processing document row failed.
     # ------------------------------------------------------------------ #
     def _compensate(self) -> None:
+        # Never delete another build's data plane: if we lost the lease (taken
+        # over by a concurrent delivery), skip silently. This is the E-008.3 P1-1
+        # safety net so a fenced-out owner can never compensate the winner's
+        # artifacts (the primary guard is that BuildConflict is caught in run()
+        # before compensation is ever attempted).
+        try:
+            self._assert_owns_build()
+        except BuildConflict:
+            return
         self._ensure_chunked()
         point_ids = [child_point_id(c.child_id) for c in self._children_list]
         if point_ids:

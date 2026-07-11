@@ -306,6 +306,58 @@ changes.
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (290) all green.
 
+## E-008.3 Issue Contract (M1 only) — CLOSED at this commit
+Audit-remediation of E-008.2 (verdict **Conditional Fail**). Baseline `fd53496` is
+kept intact; E-008.3 is a narrow fix commit closing the lease-ownership and
+verify-precision windows the E-008.2 audit left open. Scope is a strict subset of
+the E-008.2 allowed paths (`storage/`, `ingestion/`, `retrieval/`, `tests/...`,
+`migrations/`, `AGENTS.md`, `docs/issue-e0083-contract.md`); no upstream
+modifications, no `config.py`/`domain/` changes.
+
+### P1 fixes (all done)
+- **P1-1 — Claim-before-mutate + `BuildConflict` never compensates.** `acquire_job`
+  now atomically claims the lease, upserts the processing document row, inserts
+  the job row, and captures `previous_active_version` in ONE `BEGIN IMMEDIATE`
+  transaction — the FIRST mutation a job makes, before any Parent/Qdrant/Chunk
+  write. `run()` catches `BuildConflict` separately and returns a typed
+  `BUILD_CONFLICT` result WITHOUT compensation, so a loser never deletes the
+  winner's deterministic-ID data plane. `_compensate()` additionally re-checks
+  lease ownership and silently skips if the lease was taken over.
+- **P1-2 — Lease fencing + terminal-state synchronization.** `document_builds`
+  gains a `lease_generation` fencing token (migration `005_e0083_lease_generation.sql`).
+  Each claim/takeover/resume advances it; the job captures its generation at
+  acquire and `_assert_owns_build()` rejects a stale taken-over owner with
+  `BuildConflict` before any commit/publish/compensate mutation. Same-owner
+  resume atomically resets Job + lease to `running`; `mark_job_terminal` updates
+  Job AND lease status in one transaction so a failed build is correctly
+  diagnosed as terminal (takeable) vs in-flight.
+- **P1-3 — Exact Qdrant payload verification.** `_step_verify` now compares each
+  Qdrant point EXACTLY against the chunker output for the version: `tenant_id`,
+  `corpus_id`, `document_id`, `document_version`, `parent_id`, `chunk_id`,
+  `status == "processing"`, `deprecated is False` (not merely non-empty fields).
+
+### P2 fix (test quality, done)
+- **P2 — Precise commit-crash hook.** `test_precise_commit_crash_resumes_publish_and_finalize`
+  crashes AFTER `commit_active_version` succeeds but BEFORE the outer `commit`
+  step marker is written, then reconstructs and asserts publish+finalize recover
+  and clean the replaced version's data plane. A new `_commit_performed` flag
+  (not just the step marker) gates compensation so a post-commit crash is never
+  rolled back.
+
+### Migration
+- `migrations/005_e0083_lease_generation.sql` — NEW; `document_builds.lease_generation`.
+
+### Acceptance tests
+- `tests/unit/test_ingestion_job.py` — `test_precise_commit_crash_resumes_publish_and_finalize`
+  (P2), `test_build_conflict_loser_never_compensates` (P1-1),
+  `test_build_lease_fencing_blocks_taken_over_owner` (P1-2),
+  `test_verify_rejects_qdrant_payload_mismatch` (P1-3), `test_verify_rejects_parent_identity_mismatch`.
+- `tests/unit/test_metadata_store.py` — takeover advances `lease_generation`; monotonic revision.
+- `tests/integration/test_e008_crash_points.py` — `test_taken_over_build_cannot_corrupt_active_version`
+  (full-pipeline concurrency regression, P1-2).
+- `tests/baseline/` MUST remain green.
+- `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (294) all green.
+
 ## Standard Checks
 ```bash
 # Before starting a task

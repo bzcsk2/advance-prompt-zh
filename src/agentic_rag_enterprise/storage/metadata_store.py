@@ -89,12 +89,14 @@ class VersionContentConflict(Exception):
 
 class BuildConflict(Exception):
     """Raised when a build for a ``(tenant, corpus, document, version)`` is
-    already owned by a different in-flight job.
+    already owned by a different in-flight job, or when a build's lease has been
+    taken over (fencing token advanced) by a concurrent delivery.
 
     The lease guarantees exactly one in-flight build per artifact at a time, so a
     concurrent delivery cannot race on the shared data plane (deterministic
-    content-addressed IDs) and delete the winning build's artifacts (E-008.2
-    P1-3 / P1-4).
+    content-addressed IDs) and delete the winning build's artifacts. A stale
+    owner whose lease generation has advanced is also rejected before it can
+    mutate shared state (E-008.2 P1-3 / P1-4, E-008.3 P1-2 fencing).
     """
 
     def __init__(self, reason: str) -> None:
@@ -183,29 +185,35 @@ class MetadataStore:
         embedding_version: str,
         raw_hash: str,
         base_revision: int,
-    ) -> JobStatus:
-        """Atomically claim the build lease and the job row.
+        document: Optional[SourceDocument] = None,
+    ) -> tuple[JobStatus, int]:
+        """Atomically claim/renew the build lease and the job row.
 
         Runs entirely inside one ``BEGIN IMMEDIATE`` transaction so the build
-        lease, the job-row insert, and the immutable-identity check are a single
-        atomic action (E-008.2 P1-3 / P1-4). This removes the TOCTOU between a
-        separate identity pre-check and the job-row insert:
+        lease, the processing document row, the job-row insert, the
+        immutable-identity check, and the previous-active-version capture are a
+        single atomic action (E-008.2 P1-3 / P1-4, E-008.3 P1-1 claim-before-
+        mutate). This is the FIRST mutation a job makes, before any
+        Parent/Qdrant/Chunk write, so a ``BuildConflict`` loser never touches
+        shared data (and therefore never compensates the winner's artifacts):
 
         * No lease for ``(tenant, corpus, document, version)`` -> claim it
-          (owner = this job).
-        * Lease owned by THIS job -> resume / retry.
+          (owner = this job, ``lease_generation = 1``).
+        * Lease owned by THIS job -> resume / retry: reset the job and lease to
+          ``running`` and advance ``lease_generation`` (fencing token) so a
+          stale taken-over owner is rejected downstream (E-008.3 P1-2).
         * Lease owned by a DIFFERENT in-flight job (running/queued/cancelling)
           -> :class:`BuildConflict` (the concurrent build owns the shared data
           plane; do not race on deterministic IDs).
         * Lease owned by a terminal job (succeeded/failed/cancelled) -> takeover:
-          reassign the lease to this job and rebuild (idempotent re-delivery).
+          reassign the lease to this job, advance ``lease_generation``, and
+          rebuild (idempotent re-delivery).
 
         ``base_revision`` is the monotonic lifecycle revision captured at acquire
         time and persisted so the commit-phase CAS rejects this job if a newer
         revision lands first (build plan §10.10 #8, E-008.1 P1-3).
 
-        Returns the job status (RUNNING for a freshly-claimed build, or the
-        existing status for a resumed/taken-over one). Raises
+        Returns ``(job_status, lease_generation)``. Raises
         :class:`JobIdentityConflict` if ``job_id`` is already bound to a different
         immutable request, and :class:`BuildConflict` for a concurrent in-flight
         build.
@@ -214,16 +222,17 @@ class MetadataStore:
         cur.execute("BEGIN IMMEDIATE")
         try:
             lease = cur.execute(
-                "SELECT owner_job_id, status FROM document_builds "
+                "SELECT owner_job_id, status, lease_generation FROM document_builds "
                 "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND document_version=?",
                 (tenant_id, corpus_id, document_id, document_version),
             ).fetchone()
             if lease is None:
+                generation = 1
                 cur.execute(
                     "INSERT INTO document_builds "
                     "(tenant_id, corpus_id, document_id, document_version, "
-                    " owner_job_id, status, base_revision, acquired_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
+                    " owner_job_id, status, base_revision, acquired_at, lease_generation) "
+                    "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)",
                     (
                         tenant_id,
                         corpus_id,
@@ -232,10 +241,12 @@ class MetadataStore:
                         job_id,
                         base_revision,
                         _now_iso(),
+                        generation,
                     ),
                 )
             else:
                 owner = lease["owner_job_id"]
+                generation = int(lease["lease_generation"]) + 1
                 if owner != job_id:
                     owner_status = self.get_job_status(owner)
                     if owner_status in (
@@ -252,13 +263,34 @@ class MetadataStore:
                     cur.execute(
                         "UPDATE document_builds "
                         "SET owner_job_id=?, status='running', base_revision=?, "
-                        "acquired_at=? "
+                        "acquired_at=?, lease_generation=? "
                         "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
                         "AND document_version=?",
                         (
                             job_id,
                             base_revision,
                             _now_iso(),
+                            generation,
+                            tenant_id,
+                            corpus_id,
+                            document_id,
+                            document_version,
+                        ),
+                    )
+                else:
+                    # Same owner resume / retry: reset job + lease to running and
+                    # advance the fencing token so a taken-over stale owner is
+                    # rejected before mutating shared state (E-008.3 P1-2).
+                    cur.execute(
+                        "UPDATE document_builds "
+                        "SET status='running', base_revision=?, acquired_at=?, "
+                        "lease_generation=? "
+                        "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
+                        "AND document_version=?",
+                        (
+                            base_revision,
+                            _now_iso(),
+                            generation,
                             tenant_id,
                             corpus_id,
                             document_id,
@@ -266,9 +298,17 @@ class MetadataStore:
                         ),
                     )
 
+            # Processing document row (optional): insert, or refresh metadata for
+            # an existing uncommitted row. Never downgrade an already-active /
+            # deprecated row (a resume after a commit-crash must not clobber the
+            # committed lifecycle state managed by commit/publish).
+            if document is not None:
+                self._upsert_document_build(cur, document)
+
             # Job row: insert if absent, else verify the immutable identity
             # atomically (folded from validate_job_identity so there is no
-            # race window before the insert).
+            # race window before the insert). A terminal/failed job that is
+            # re-acquired by the SAME owner resets to running (P1-2).
             row = cur.execute(
                 "SELECT tenant_id, corpus_id, document_id, document_version, "
                 "raw_hash, status FROM ingestion_jobs WHERE job_id = ?",
@@ -313,14 +353,90 @@ class MetadataStore:
                         f"doc={row['document_id']!r} version={row['document_version']!r})"
                     )
                 status = JobStatus(row["status"])
+                if status != JobStatus.RUNNING:
+                    # Resuming a terminal/failed job: reset to running so a
+                    # retrying owner is not seen as takeable (P1-2).
+                    cur.execute(
+                        "UPDATE ingestion_jobs SET status='running', finished_at=NULL, "
+                        "error_code=NULL, error_message=NULL WHERE job_id=?",
+                        (job_id,),
+                    )
+                    status = JobStatus.RUNNING
+
+            # Capture the version this job replaces at acquire time (stable
+            # across resume); the commit-phase CAS may return a different value
+            # on resume, so it must not overwrite the persisted acquire value.
+            prev_row = cur.execute(
+                "SELECT previous_active_version FROM ingestion_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if prev_row["previous_active_version"] is None:
+                active = cur.execute(
+                    "SELECT version FROM documents "
+                    "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active'",
+                    (tenant_id, corpus_id, document_id),
+                ).fetchone()
+                previous_version = active["version"] if active else None
+                cur.execute(
+                    "UPDATE ingestion_jobs SET previous_active_version = ? WHERE job_id = ?",
+                    (previous_version, job_id),
+                )
+
             cur.execute("COMMIT")
             # The "acquire" step marker lets a resumed run skip re-claiming the
             # lease (the lease row itself persists as the real ownership record).
             self.mark_step(job_id, "acquire", "done")
-            return status
+            return status, generation
         except Exception:
             cur.execute("ROLLBACK")
             raise
+
+    def get_lease_generation(
+        self, tenant_id: str, corpus_id: str, document_id: str, document_version: str
+    ) -> int:
+        """Return the current ``lease_generation`` for the build, or 0 if none.
+
+        Used by the ingestion job as a fencing token: a stale owner (taken over
+        by a concurrent delivery) holds a generation lower than the live lease,
+        so its downstream mutations are rejected with :class:`BuildConflict`
+        (E-008.3 P1-2).
+        """
+        row = self._conn.execute(
+            "SELECT lease_generation FROM document_builds "
+            "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND document_version=?",
+            (tenant_id, corpus_id, document_id, document_version),
+        ).fetchone()
+        return int(row["lease_generation"]) if row else 0
+
+    def _upsert_document_build(self, cur, doc: SourceDocument) -> None:
+        """Insert the processing document row, or refresh metadata for an
+        existing uncommitted row. Never downgrade an already-active / deprecated
+        row: a resume after a commit-crash must not clobber the committed
+        lifecycle state (which only commit/publish may change).
+        """
+        cols = self._document_columns(doc)
+        existing = cur.execute(
+            "SELECT status FROM documents WHERE tenant_id=? AND corpus_id=? "
+            "AND document_id=? AND version=?",
+            (doc.tenant_id, doc.corpus_id, doc.document_id, doc.version),
+        ).fetchone()
+        if existing is None:
+            names = ", ".join(cols)
+            placeholders = ", ".join(f":{c}" for c in cols)
+            cur.execute(
+                f"INSERT INTO documents ({names}) VALUES ({placeholders})", cols
+            )
+        elif existing["status"] in ("processing", "failed"):
+            assigns = ", ".join(
+                f"{c} = :{c}" for c in cols if c != "lifecycle_revision"
+            )
+            cur.execute(
+                f"UPDATE documents SET {assigns} "
+                "WHERE tenant_id=:tenant_id AND corpus_id=:corpus_id "
+                "AND document_id=:document_id AND version=:version",
+                cols,
+            )
+        # else: active / deprecated -> preserve (managed by commit/publish)
 
     def get_build_owner(
         self, tenant_id: str, corpus_id: str, document_id: str, document_version: str
@@ -428,23 +544,40 @@ class MetadataStore:
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
     ) -> None:
-        self._conn.execute(
-            """
-            UPDATE ingestion_jobs
-               SET status = ?, finished_at = ?, parent_count = ?, child_count = ?,
-                   error_code = ?, error_message = ?
-             WHERE job_id = ?
-            """,
-            (
-                status.value,
-                _now_iso(),
-                parent_count,
-                child_count,
-                error_code,
-                error_message,
-                job_id,
-            ),
-        )
+        # Update the job row AND the build lease in one transaction so the lease
+        # state can never lag the job state (E-008.3 P1-2): a failed job must
+        # show 'failed' on its lease (and a succeeded job 'done') so a
+        # re-delivered job is correctly diagnosed as terminal vs in-flight.
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            cur.execute(
+                """
+                UPDATE ingestion_jobs
+                   SET status = ?, finished_at = ?, parent_count = ?, child_count = ?,
+                        error_code = ?, error_message = ?
+                  WHERE job_id = ?
+                """,
+                (
+                    status.value,
+                    _now_iso(),
+                    parent_count,
+                    child_count,
+                    error_code,
+                    error_message,
+                    job_id,
+                ),
+            )
+            if status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
+                lease_status = "done" if status == JobStatus.SUCCEEDED else "failed"
+                cur.execute(
+                    "UPDATE document_builds SET status = ? WHERE owner_job_id = ?",
+                    (lease_status, job_id),
+                )
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     # ------------------------------------------------------------------ #
     # Step markers (build plan §10.10 #3: reentrant, idempotent)

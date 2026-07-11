@@ -311,3 +311,58 @@ def test_job_id_identity_is_immutable() -> None:
     assert store.get_active_document("t1", "eng", "doc1").version == "v1"
     store.close()
     os.unlink(db_path)
+
+
+def test_taken_over_build_cannot_corrupt_active_version() -> None:
+    # E-008.3 P1-2 full-pipeline regression: when a failed build's lease is
+    # taken over by a concurrent delivery that completes successfully, the stale
+    # original owner is fenced out (BuildConflict) and can neither compensate
+    # the winner's data plane nor corrupt the version visible to retrieval.
+    manager, store, vector, parents, retriever, db_path = _build()
+    req1 = _request(job_id="j1", version="v1", content=SAMPLE_MARKDOWN)
+
+    # j1 claims the lease and writes its data plane, then crashes (failed).
+    IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req1,
+    ).run(max_step="write_qdrant")
+    store.mark_job_terminal("j1", JobStatus.FAILED)
+
+    # j2 takes over the lease and is IN-FLIGHT (running) with its data written.
+    IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=_request(job_id="j2", version="v1", content=SAMPLE_MARKDOWN),
+    ).run(max_step="write_qdrant")
+    assert store.get_build_owner("t1", "eng", "doc1", "v1") == "j2"
+    assert store.get_job_status("j2") == JobStatus.RUNNING
+
+    # Stale owner j1 retries while j2 is in-flight: must be fenced out.
+    res1b = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req1,
+    ).run()
+    assert res1b.status == IngestionStatus.BUILD_CONFLICT
+    assert res1b.error_code == "build_conflict"
+
+    # j2 completes; the active version is correct and uncorrupted.
+    res2 = manager.ingest(_request(job_id="j2", version="v1", content=SAMPLE_MARKDOWN))
+    assert res2.status == IngestionStatus.INDEXED
+    assert store.get_build_owner("t1", "eng", "doc1", "v1") == "j2"
+    assert _retrieve_versions(retriever) == ["v1"]
+    store.close()
+    os.unlink(db_path)

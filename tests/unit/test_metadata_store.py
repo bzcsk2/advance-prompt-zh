@@ -467,7 +467,7 @@ def test_build_lease_takeover_after_failed_owner() -> None:
     # First build failed.
     store.mark_job_terminal("first", JobStatus.FAILED)
     # A new delivery takes over the lease (reassignment, not conflict).
-    status = store.acquire_job(
+    status, _generation = store.acquire_job(
         job_id="second",
         document_id="d1",
         document_version="v1",
@@ -481,5 +481,8 @@ def test_build_lease_takeover_after_failed_owner() -> None:
     )
     assert status == JobStatus.RUNNING
     assert store.get_build_owner("t1", "eng", "d1", "v1") == "second"
+    # Takeover advanced the fencing token so the original (failed) owner's
+    # generation no longer matches the live lease (E-008.3 P1-2).
+    assert store.get_lease_generation("t1", "eng", "d1", "v1") >= 2
     store.close()
     os.unlink(path)
