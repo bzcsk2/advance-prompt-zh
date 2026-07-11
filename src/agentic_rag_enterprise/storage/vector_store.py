@@ -20,6 +20,7 @@ from qdrant_client.models import (
     Filter,
     Fusion,
     FusionQuery,
+    PointIdsList,
     PointStruct,
     Prefetch,
     SparseVector,
@@ -32,6 +33,17 @@ from agentic_rag_enterprise.security.policy import ResourceAcl
 
 # Stable namespace for deriving Qdrant point ids (UUIDs) from business chunk ids.
 _CHUNK_NAMESPACE = uuid5(NAMESPACE_URL, "agentic-rag-enterprise:child-chunk")
+
+
+def child_point_id(child_id: str) -> str:
+    """Stable Qdrant point id (UUID) derived from a business child chunk id.
+
+    The Qdrant point id is always a valid ``u64``/``Uuid`` regardless of the
+    business id's representation, and is stable across re-upserts (so
+    idempotent publish/marking is safe).
+    """
+    return str(uuid5(_CHUNK_NAMESPACE, child_id))
+
 
 DEFAULT_SPARSE_NAME = "sparse"
 
@@ -74,6 +86,16 @@ class VectorStore:
     def upsert(self, name: str, points: list[PointStruct]) -> None:
         if points:
             self._client.upsert(collection_name=name, points=points)
+
+    def delete(self, name: str, point_ids: list[str]) -> None:
+        """Remove points from a collection (ingestion compensation / cleanup)."""
+        if point_ids:
+            # Qdrant accepts str point ids at runtime; mypy's list invariance is
+            # stricter than the actual API here.
+            self._client.delete(
+                collection_name=name,
+                points_selector=PointIdsList(points=point_ids),  # type: ignore[arg-type]
+            )
 
     def search(
         self,
@@ -177,4 +199,5 @@ __all__ = [
     "SparseEncoder",
     "SparseVector",
     "child_chunk_to_point",
+    "child_point_id",
 ]

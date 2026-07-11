@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
 
+    metadata_db_path: str = "metadata.db"
+
     max_iterations: int = 3
     max_tool_calls: int = 12
     max_retrieval_top_k: int = 8

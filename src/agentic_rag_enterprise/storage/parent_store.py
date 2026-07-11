@@ -27,5 +27,24 @@ class ParentStore:
         """Raw, untrusted lookup. No authorization is performed here."""
         return self._store.get(parent_id)
 
+    def delete(self, parent_id: str) -> None:
+        """Remove a parent (used by ingestion compensation). Unauthorized."""
+        self._store.pop(parent_id, None)
+
+    def deprecate(self, parent_id: str) -> None:
+        """Mark a stored parent inactive so retrieval's second-auth excludes it.
+
+        The Parent Store is raw/untrusted; ``ParentReader`` fails closed unless
+        ``status == "active"`` and ``deprecated is False``, so flipping either is
+        sufficient to make the parent invisible (build plan §10.4 / §10.10 #5).
+        """
+        chunk = self._store.get(parent_id)
+        if chunk is None:
+            return
+        metadata = dict(chunk.metadata)
+        metadata["status"] = "inactive"
+        metadata["deprecated"] = True
+        self._store[parent_id] = chunk.model_copy(update={"metadata": metadata})
+
     def __contains__(self, parent_id: str) -> bool:
         return parent_id in self._store

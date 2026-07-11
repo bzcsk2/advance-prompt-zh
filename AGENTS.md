@@ -7,7 +7,7 @@
 - Milestone: **M1** — Secure single-corpus data vertical slice
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
-- Next issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1, not yet started).
+- Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — IN PROGRESS; contract: `docs/issue-e008-contract.md`.
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
 
 > **AGENTS.md is a slim entry point** (build plan §1.7): current Milestone/Issue, fixed
@@ -173,6 +173,29 @@ kept intact; E-007.1 is a narrow fix commit. Scope is a strict subset of the E-0
 8. Only `ParentAuthorizationError` is swallowed on the parent pass; other errors propagate (P2-2).
 9. `RetrievalResult.denied_parent_count` is an int counter (P2-3).
 10. `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (incl. `tests/baseline/`) all green.
+
+## E-008 Issue Contract (M1 only) — IN PROGRESS
+Idempotent ingestion Job + active-version protocol. Full contract (goals, non-goals,
+allowed/forbidden paths, §10.10 cross-store rules, crash-point plan) is versioned at
+`docs/issue-e008-contract.md` — not duplicated here.
+
+### Allowed paths (M1 only)
+- `src/agentic_rag_enterprise/storage/metadata_store.py` — NEW; Metadata DB (control-plane
+  source of truth) over `sqlite3`; migration runner.
+- `src/agentic_rag_enterprise/storage/parent_store.py` — extend (`deprecate`).
+- `src/agentic_rag_enterprise/ingestion/job.py` — NEW; `DocumentManager`/`IngestionJob`
+  (parse→chunk→parent store→qdrant→commit→publish) reusing E-007 ported components.
+- `migrations/002_add_lifecycle_revision.sql` — NEW; `documents.lifecycle_revision`.
+- `config.py` — add `metadata_db_path` (injected).
+- `domain/ingestion.py`, `domain/document.py`, `domain/chunk.py` — reuse (no change).
+- `security/`, `retrieval/` — reuse only (no behavior change).
+- `tests/{unit,integration,security,fixtures}/` — NEW tests; `AGENTS.md`, `docs/issue-e008-contract.md`.
+
+### Forbidden
+- No upstream modifications; no target import of upstream paths.
+- No second ingestion runtime; extend the E-007 ported chain.
+- No Planner / Evidence Store / multi-corpus / reranker (later milestones).
+- No logical delete / ACL-tightening (E-010); lifecycle + `lifecycle_revision` mechanism only.
 
 ## Standard Checks
 ```bash
