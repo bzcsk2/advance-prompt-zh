@@ -3,7 +3,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from agentic_rag_enterprise.domain.ingestion import DocumentStatus
 
 
 class SourceDocument(BaseModel):
@@ -22,14 +24,7 @@ class SourceDocument(BaseModel):
     version: str
     content_hash: str
 
-    status: Literal[
-        "discovered",
-        "processing",
-        "active",
-        "failed",
-        "deprecated",
-        "deleted",
-    ]
+    status: DocumentStatus
 
     effective_from: datetime | None = None
     effective_to: datetime | None = None
@@ -56,3 +51,24 @@ class SourceDocument(BaseModel):
     indexed_at: datetime | None = None
     deleted_at: datetime | None = None
     last_synced_at: datetime
+
+    @field_validator("authority_level")
+    @classmethod
+    def _authority_bounds(cls, v: int) -> int:
+        if v < 0 or v > 100:
+            raise ValueError("authority_level must be between 0 and 100")
+        return v
+
+    @field_validator("effective_to")
+    @classmethod
+    def _effective_ordering(cls, v: datetime | None, info) -> datetime | None:
+        if v is not None and info.data.get("effective_from") is not None:
+            if v < info.data["effective_from"]:
+                raise ValueError("effective_to must not be earlier than effective_from")
+        return v
+
+    def model_post_init(self, /, __context) -> None:
+        if self.status == DocumentStatus.ACTIVE and self.indexed_at is None:
+            raise ValueError("active document must have indexed_at set")
+        if self.status == DocumentStatus.DELETED and self.deleted_at is None:
+            raise ValueError("deleted document must have deleted_at set")

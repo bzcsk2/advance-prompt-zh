@@ -43,9 +43,22 @@ DOCUMENT_LIFECYCLE: dict[DocumentStatus, list[DocumentStatus]] = {
     DocumentStatus.DELETED: [],
 }
 
+JOB_LIFECYCLE: dict[JobStatus, list[JobStatus]] = {
+    JobStatus.QUEUED: [JobStatus.RUNNING, JobStatus.CANCELLED],
+    JobStatus.RUNNING: [JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLING],
+    JobStatus.SUCCEEDED: [],
+    JobStatus.FAILED: [],
+    JobStatus.CANCELLING: [JobStatus.CANCELLED],
+    JobStatus.CANCELLED: [],
+}
+
 
 def valid_transition(from_status: DocumentStatus, to_status: DocumentStatus) -> bool:
     return to_status in DOCUMENT_LIFECYCLE.get(from_status, [])
+
+
+def valid_job_transition(from_status: JobStatus, to_status: JobStatus) -> bool:
+    return to_status in JOB_LIFECYCLE.get(from_status, [])
 
 
 class IngestionManifest(BaseModel):
@@ -53,8 +66,9 @@ class IngestionManifest(BaseModel):
     document_id: str
     document_version: str
     corpus_id: str
+    tenant_id: str
 
-    status: str
+    status: JobStatus
     started_at: datetime
     finished_at: datetime | None = None
 

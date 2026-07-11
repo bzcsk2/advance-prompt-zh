@@ -2,10 +2,12 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Evidence(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     evidence_id: str
 
     tenant_id: str
@@ -20,7 +22,7 @@ class Evidence(BaseModel):
     child_chunk_id: str | None = None
 
     page_number: int | None = None
-    section_path: list[str] = Field(default_factory=list)
+    section_path: tuple[str, ...] = Field(default_factory=tuple)
     start_offset: int | None = None
     end_offset: int | None = None
 
@@ -42,3 +44,10 @@ class Evidence(BaseModel):
 
     retrieval_iteration: int
     plan_step_id: str | None = None
+
+    @field_validator("authority_level")
+    @classmethod
+    def _authority_bounds(cls, v: int) -> int:
+        if v < 0 or v > 100:
+            raise ValueError("authority_level must be between 0 and 100")
+        return v
