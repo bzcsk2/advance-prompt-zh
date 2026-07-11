@@ -53,10 +53,10 @@
 | Upstream symbols | `DocumentChunker` (full class), `__merge_small_parents()`, `__split_large_parents()`, `__clean_small_chunks()`, `__create_child_chunks()` |
 | Target file | `src/agentic_rag_enterprise/ingestion/chunker.py` |
 | Target symbols | `ParentChildChunker.chunk_markdown()` (returns `list[ParentChunk]`, `list[ChildChunk]`), `SimpleChunker.chunk()` (retained adapter) |
-| Status | `implemented` (E-007) — full heading-aware algorithm ported with enterprise differences |
+| Status | `implemented` (E-007) — full heading-aware algorithm ported with enterprise differences; rebalance + version-ID finalized in E-007.1 |
 | Strategy | `port` |
-| Test plan | `tests/unit/test_parent_child_chunker.py` (heading-aware, merge/split, integrity, stable content-addressed IDs, tenant-scoped IDs, provenance) |
-| Notes | Algorithm ported: `MarkdownHeaderTextSplitter` (H1/H2/H3) + `RecursiveCharacterTextSplitter` children + merge-small / split-large / rebalance. **Enterprise differences**: parent/child IDs are content-addressed (`sha256` of tenant\|corpus\|document\|section_path\|text), never filename-derived (`{stem}_p{i}` is forbidden); every chunk carries provenance (`document_id`, `tenant_id`, `corpus_id`, `section_path`, `document_version`). Trailing small-parent fold is conditional on `< MIN_PARENT_SIZE` so distinct large sections keep separate section paths. |
+| Test plan | `tests/unit/test_parent_child_chunker.py` (heading-aware, merge/split, integrity, stable content-addressed IDs, tenant-scoped IDs, provenance, orphan rebalance, version-scoped distinct IDs) |
+| Notes | Algorithm ported: `MarkdownHeaderTextSplitter` (H1/H2/H3) + `RecursiveCharacterTextSplitter` children + merge-small / split-large / rebalance. **Enterprise differences**: parent/child IDs are content-addressed (`sha256` of tenant\|corpus\|document\|**document_version**\|section_path\|text), never filename-derived (`{stem}_p{i}` is forbidden); every chunk carries provenance (`document_id`, `tenant_id`, `corpus_id`, `section_path`, `document_version`). `document_version` is **required** (no default) and folded into the id so distinct versions get distinct ids (no cross-version overwrite). `_rebalance_pair` (ported from upstream) redistributes adjacent small/large segments around the midpoint and is applied in a second `_clean_small_chunks` pass so orphan small parents are not emitted; the separator is accounted for (`+2`) to stay within `max_parent_size`. Content-addressed IDs are 32 hex chars (raised from 16 in E-007.1). |
 
 ### 3. Child Chunk Precise Retrieval + Parent Chunk Context Reading
 
@@ -65,11 +65,11 @@
 | Upstream file | `project/rag_agent/tools.py:12`, `project/rag_agent/tools.py:51` |
 | Upstream symbols | `ToolFactory._search_child_chunks()`, `ToolFactory._retrieve_parent_chunks()` |
 | Target file | `src/agentic_rag_enterprise/retrieval/{retriever.py,hybrid.py,parent_reader.py,models.py}` |
-| Target symbols | `SecureRetriever.retrieve()`, `HybridRetriever.search()`, `ParentReader.load_parent_for_hit()`, `Retriever.retrieve()` (retained mock adapter) |
+| Target symbols | `SecureRetriever.retrieve()`, `_HybridSearchAdapter.search()` (internal, not exported), `ParentReader.load_parent_for_hit()`, `Retriever.retrieve()` (retained mock adapter) |
 | Status | `implemented` (E-007) — secure retrieval path with corpus gate + parent 2nd-auth |
 | Strategy | `compatible-reimplementation` |
-| Test plan | `tests/integration/test_e007_end_to_end.py`, `tests/security/test_parent_reader.py` |
-| Notes | Enterprise envelope wraps the upstream retrieval contract: `SecureRetriever.retrieve()` runs a **corpus-discoverability gate** (`can_discover_corpus` / `allowed_corpus_ids`, fail-closed) BEFORE `build_access_filter`; `HybridRetriever` does dense+sparse RRF over Qdrant; `ParentReader` is the ONLY authorized parent accessor and performs a fail-closed second authorization pass (identity/version/lifecycle/ACL). No `AccessPolicy.can_access`; PEP/PDP are `build_access_filter` / `evaluate_access` / `resource_passes_filter`. |
+| Test plan | `tests/integration/test_e007_end_to_end.py`, `tests/security/test_parent_reader.py`, `tests/unit/test_retrieval_boundary.py` |
+| Notes | Enterprise envelope wraps the upstream retrieval contract: `SecureRetriever.retrieve()` runs a **corpus-discoverability gate** (`can_discover_corpus` / `allowed_corpus_ids`, fail-closed) BEFORE `build_access_filter`; the hybrid search adapter (renamed from `HybridRetriever` to private `_HybridSearchAdapter` in E-007.1, no longer exported) does dense+sparse RRF over Qdrant; `ParentReader` is the ONLY authorized parent accessor and performs a fail-closed second authorization pass (identity/version/lifecycle/ACL). No `AccessPolicy.can_access`; PEP/PDP are `build_access_filter` / `evaluate_access` / `resource_passes_filter`. **E-007.1 hardening**: empty `allowed_security_levels` raises `EmptyAuthorizationScopeError` (PDP/PEP equivalence preserved, no sentinel); `ParentReader` rejects missing/mis-typed parent auth metadata; only `ParentAuthorizationError` is swallowed on the parent pass (other faults propagate); `RetrievalResult.denied_parent_count` is an int. |
 
 ### 4. Qdrant Dense + Sparse Hybrid Retrieval
 
@@ -371,11 +371,11 @@
 |---|---|
 | Upstream file | `project/rag_agent/tools.py:12` |
 | Target file | `src/agentic_rag_enterprise/retrieval/hybrid.py` |
-| Target symbol | `HybridRetriever.search()` (and `SecureRetriever.retrieve()` entry point) |
+| Target symbol | `_HybridSearchAdapter.search()` (private, internal-only; and `SecureRetriever.retrieve()` entry point) |
 | Status | `implemented` (E-007) — secured hybrid child search |
 | Strategy | `compatible-reimplementation` |
 | Test plan | `tests/integration/test_qdrant_hybrid_retrieval.py` |
-| Notes | Dense+sparse RRF over Qdrant with mandatory `build_access_filter`; corpus-discoverability gate runs first. Returns `RetrievalHit` with ACL/provenance fields for the second-auth pass. |
+| Notes | Dense+sparse RRF over Qdrant with mandatory `build_access_filter`; corpus-discoverability gate runs first. Returns `RetrievalHit` with ACL/provenance fields for the second-auth pass. Renamed from `HybridRetriever` to private `_HybridSearchAdapter` in E-007.1 and removed from `retrieval/__init__.py` exports so application/tool code cannot bypass the corpus gate or parent 2nd-auth. |
 
 ### `retrieve_parent_chunks`
 

@@ -5,7 +5,8 @@
 
 ## Current Milestone & Issue
 - Milestone: **M1** — Secure single-corpus data vertical slice
-- Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope)
+- Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
+- Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — IN PROGRESS.
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
 
 ## Fixed Paths
@@ -91,8 +92,11 @@ read-only). Port **algorithms only**; never upstream trust boundaries.
    `allowed_corpus_ids`) BEFORE `build_access_filter`, because the filter does not read
    `allowed_corpus_ids`. Fail-closed (`CorpusNotDiscoverableError`).
 2. **PEP/PDP are the filter functions** — `build_access_filter` (Qdrant `Filter`) and
-   `evaluate_access` (PDP) are authoritative; empty ACL lists (`groups`, `allowed_security_levels`)
-   fail-closed via a sentinel that matches nothing.
+   `evaluate_access` (PDP) are authoritative. Empty `allowed_security_levels` fails closed by
+   raising `EmptyAuthorizationScopeError` (the PEP mirrors the PDP, which denies on empty levels);
+   empty `groups` simply omits the group `should`/`must_not` conditions (also matching the PDP,
+   where an empty `set(ctx.groups)` matches nothing and matches every deny-list). There is **no**
+   sentinel-value design — equivalence is preserved structurally.
 3. **Parent second authorization** — `ParentReader` is the ONLY authorized parent accessor; it
    re-verifies identity (tenant/corpus/document/version), lifecycle (active, not deprecated),
    ACL-metadata consistency, and `resource_passes_filter`. Fail-closed (`ParentAuthorizationError`).
@@ -107,6 +111,62 @@ read-only). Port **algorithms only**; never upstream trust boundaries.
 - `tests/integration/test_e007_end_to_end.py`
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise` clean.
+
+## E-007.1 Issue Contract (M1 only) — IN PROGRESS
+Security-audit remediation of E-007 (audit verdict: **Conditional Fail**). Baseline `ccb52dc` is
+kept intact; E-007.1 is a narrow fix commit. Scope is a strict subset of the E-007 allowed paths
+(`security/`, `retrieval/`, `ingestion/`, `storage/`, `tests/...`, `AGENTS.md`,
+`docs/upstream-capability-map.md`, `pyproject.toml`). No upstream modifications.
+
+### P1 fixes (mandatory, all done)
+- **P1-1 — PDP/PEP equivalence on empty scopes.** Removed the `_fail_closed` sentinel from
+  `security/filter.py`. `build_access_filter` now raises `EmptyAuthorizationScopeError` when
+  `allowed_security_levels` is empty (mirrors `evaluate_access`, which denies); empty `groups`
+  simply omits the group conditions. Added `tests/integration/test_qdrant_hybrid_retrieval.py`
+  cases for reserved-level / reserved-payload injection on empty groups/levels.
+- **P1-2 — ParentReader permissive defaults → fail-closed.** `_validate_parent_auth_metadata`
+  now rejects a parent whose auth metadata is missing or mis-typed (`status` str, `deprecated`
+  bool, `acl_scope` ∈ {tenant,restricted}, ACL lists are `list[str]`). `load_parent_for_hit`
+  reads those fields directly (no permissive `.get` defaults). New parametrized cases in
+  `tests/security/test_parent_reader.py` (6 missing + 6 malformed → `ParentAuthorizationError`).
+- **P1-3 — Rebalance completeness + separator off-by-two.** Ported upstream `_rebalance_pair`
+  into `ingestion/chunker.py`; `_clean_small_chunks` now accounts for the `"\n\n"` separator
+  (`+2`) and runs a second pass that rebalances any remaining small segment with a neighbor. A
+  parent exceeding `max_parent_size` after rebalancing raises `ValueError`. New chunker tests
+  cover orphan rebalance and the max-with-separator bound.
+- **P1-4 — `document_version` in the ID.** `chunk_markdown` now requires `document_version`
+  (no default); `_make_parent_id` folds it into the content-addressed blob, so distinct versions
+  get distinct parent/child ids (no cross-version overwrite). New tests assert required-ness and
+  version-scoped distinct ids.
+- **P1-5 — real ChildChunk → PointStruct mapper in E2E.** Added production
+  `child_chunk_to_point(child, acl, *, status, deprecated, dense_encoder, sparse_encoder)` to
+  `storage/vector_store.py` (stable `uuid5` point id, full provenance + ACL payload). The E2E test
+  `_ingest` now runs the **real** chain: `chunk_markdown(..., document_version="v1")` →
+  `child_chunk_to_point` → Qdrant; parents are the chunker's own `ParentChunk` (id/version kept)
+  with ACL metadata supplemented only.
+
+### P2 fixes (all included per decision)
+- **P2-1 — internalize HybridRetriever.** Renamed to `_HybridSearchAdapter` (private); removed
+  from `retrieval/__init__.py` exports. New architecture test
+  `tests/unit/test_retrieval_boundary.py` enforces non-export.
+- **P2-2 — precise exception capture.** `retriever.py` no longer wraps the parent pass in a bare
+  `except Exception:`; only `ParentAuthorizationError` is caught (denials), so storage/programming
+  faults propagate.
+- **P2-3 — `denied_parent_ids` → `denied_parent_count`.** `RetrievalResult.denied_parent_ids`
+  renamed to `denied_parent_count: int`; `retriever.py` increments a counter.
+- **P2-4 — longer IDs.** `_PARENT_ID_LEN` raised 16 → 32; chunker tests updated.
+
+### E-007.1 acceptance criteria
+1. Empty `allowed_security_levels` raises `EmptyAuthorizationScopeError` (not silently broad).
+2. Empty `groups` cannot match a reserved/crafted security level or payload via the filter.
+3. `ParentReader` rejects missing/malformed auth metadata (P1-2 cases).
+4. `_rebalance_pair` is present and orphan small parents are rebalanced, not emitted (P1-3).
+5. `document_version` is required and part of content-addressed ids (P1-4).
+6. E2E uses the real `child_chunk_to_point` mapper end-to-end (P1-5).
+7. `_HybridSearchAdapter` is not exported / not importable from `retrieval` (P2-1).
+8. Only `ParentAuthorizationError` is swallowed on the parent pass; other errors propagate (P2-2).
+9. `RetrievalResult.denied_parent_count` is an int counter (P2-3).
+10. `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (incl. `tests/baseline/`) all green.
 
 ## Standard Checks
 ```bash

@@ -70,7 +70,7 @@ class RetrievalResult(BaseModel):
     """Typed output of the secure retrieval path."""
 
     hits: list[tuple[RetrievalHit, AuthorizedParent]] = Field(default_factory=list)
-    denied_parent_ids: list[str] = Field(default_factory=list)
+    denied_parent_count: int = 0
 
 
 class ParentAuthorizationError(Exception):

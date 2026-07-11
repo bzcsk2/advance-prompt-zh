@@ -49,6 +49,46 @@ def _record_acl_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return True
 
 
+# The parent store is raw/untrusted. These fields MUST be present and well-typed
+# for a parent to be second-authorized; absence or a wrong type is treated as a
+# denial (fail closed), never back-filled with a permissive default.
+_REQUIRED_PARENT_AUTH_FIELDS = {
+    "status",
+    "deprecated",
+    "security_level",
+    "acl_scope",
+    "allowed_user_ids",
+    "allowed_group_ids",
+    "denied_user_ids",
+    "denied_group_ids",
+}
+
+
+def _validate_parent_auth_metadata(md: dict[str, Any], parent_id: str) -> None:
+    """Fail closed if the untrusted parent metadata lacks/mis-types auth data."""
+    missing = _REQUIRED_PARENT_AUTH_FIELDS - md.keys()
+    if missing:
+        raise ParentAuthorizationError(
+            f"required authorization metadata missing: {sorted(missing)}",
+            parent_id,
+        )
+    if not isinstance(md["status"], str):
+        raise ParentAuthorizationError("parent status must be a string", parent_id)
+    if not isinstance(md["deprecated"], bool):
+        raise ParentAuthorizationError("parent deprecated must be a boolean", parent_id)
+    if md["acl_scope"] not in ("tenant", "restricted"):
+        raise ParentAuthorizationError("parent acl_scope must be tenant|restricted", parent_id)
+    for key in (
+        "allowed_user_ids",
+        "allowed_group_ids",
+        "denied_user_ids",
+        "denied_group_ids",
+    ):
+        value = md[key]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ParentAuthorizationError(f"parent {key} must be a list of strings", parent_id)
+
+
 class ParentReader:
     """Loads and second-authorizes parents for authorized child hits."""
 
@@ -78,8 +118,11 @@ class ParentReader:
             raise ParentAuthorizationError("document version mismatch", hit.parent_id)
 
         md = parent.metadata
-        status = str(md.get("status", "active"))
-        deprecated = bool(md.get("deprecated", False))
+        # The parent store is untrusted: require the full authorization metadata
+        # set and validate its types before trusting any field (fail closed).
+        _validate_parent_auth_metadata(md, hit.parent_id)
+        status = str(md["status"])
+        deprecated = bool(md["deprecated"])
 
         # Lifecycle gate.
         if status != "active" or deprecated:
@@ -92,12 +135,12 @@ class ParentReader:
         # child's authorized ACL. A divergence is treated as a mismatch and
         # fails closed.
         parent_acl_record: dict[str, Any] = {
-            "security_level": md.get("security_level", "public"),
-            "acl_scope": md.get("acl_scope", "restricted"),
-            "allowed_user_ids": md.get("allowed_user_ids", []),
-            "allowed_group_ids": md.get("allowed_group_ids", []),
-            "denied_user_ids": md.get("denied_user_ids", []),
-            "denied_group_ids": md.get("denied_group_ids", []),
+            "security_level": md["security_level"],
+            "acl_scope": md["acl_scope"],
+            "allowed_user_ids": md["allowed_user_ids"],
+            "allowed_group_ids": md["allowed_group_ids"],
+            "denied_user_ids": md["denied_user_ids"],
+            "denied_group_ids": md["denied_group_ids"],
         }
         hit_acl_record: dict[str, Any] = {
             "security_level": hit.security_level,

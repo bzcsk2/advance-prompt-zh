@@ -7,6 +7,8 @@ lifecycle (active, non-deprecated), ACL consistency, and the
 present in the store are rejected (no guessing).
 """
 
+import pytest
+
 from agentic_rag_enterprise.retrieval.models import ParentAuthorizationError, RetrievalHit
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.storage.parent_store import ParentStore
@@ -176,7 +178,73 @@ def test_resource_passes_filter_deny_fails_closed() -> None:
         )
     )
     reader = ParentReader(store)
-    import pytest
 
     with pytest.raises(ParentAuthorizationError):
         reader.load_parent_for_hit(_hit(acl_scope="restricted"), make_security_context())
+
+
+def _valid_parent_metadata() -> dict:
+    """A fully-populated, valid authorization metadata block."""
+    parent = make_parent_chunk(
+        PARENT_ID,
+        "x",
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="d1",
+        document_version="v1",
+        acl=ACL,
+    )
+    return dict(parent.metadata)
+
+
+def _store_with_metadata(meta: dict) -> ParentStore:
+    parent = make_parent_chunk(
+        PARENT_ID,
+        "x",
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="d1",
+        document_version="v1",
+        acl=ACL,
+    )
+    store = ParentStore()
+    store.put(parent.model_copy(update={"metadata": meta}))
+    return store
+
+
+@pytest.mark.parametrize(
+    "drop_key",
+    [
+        "status",
+        "deprecated",
+        "security_level",
+        "acl_scope",
+        "allowed_user_ids",
+        "denied_user_ids",
+    ],
+)
+def test_missing_required_field_rejected(drop_key: str) -> None:
+    meta = _valid_parent_metadata()
+    del meta[drop_key]
+    reader = ParentReader(_store_with_metadata(meta))
+    with pytest.raises(ParentAuthorizationError):
+        reader.load_parent_for_hit(_hit(), make_security_context())
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("deprecated", "false"),  # string, not bool
+        ("status", 1),  # not a string
+        ("acl_scope", "public"),  # not tenant|restricted
+        ("allowed_user_ids", "u1"),  # not a list
+        ("allowed_group_ids", [1, 2]),  # list with non-str elements
+        ("denied_user_ids", {"u1"}),  # set, not list[str]
+    ],
+)
+def test_malformed_field_type_rejected(key: str, value: object) -> None:
+    meta = _valid_parent_metadata()
+    meta[key] = value
+    reader = ParentReader(_store_with_metadata(meta))
+    with pytest.raises(ParentAuthorizationError):
+        reader.load_parent_for_hit(_hit(), make_security_context())

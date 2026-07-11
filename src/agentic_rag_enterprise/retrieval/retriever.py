@@ -9,13 +9,15 @@ runs authorized hybrid child retrieval and a second parent-authorization pass.
 from agentic_rag_enterprise.config import settings
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.security import SecurityContext
-from agentic_rag_enterprise.retrieval.hybrid import HybridRetriever
+from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.models import (
     CorpusNotDiscoverableError,
+    ParentAuthorizationError,
     RetrievalResult,
 )
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.schemas import Evidence
+from agentic_rag_enterprise.security.filter import EmptyAuthorizationScopeError
 from agentic_rag_enterprise.security.policy import can_discover_corpus
 from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEncoder
 
@@ -49,7 +51,7 @@ class SecureRetriever:
 
     def __init__(
         self,
-        hybrid: HybridRetriever,
+        hybrid: _HybridSearchAdapter,
         parent_reader: ParentReader,
         *,
         default_top_k: int | None = None,
@@ -95,20 +97,33 @@ class SecureRetriever:
         try:
             self.validate_corpus(ctx, corpus)
         except CorpusNotDiscoverableError:
-            return RetrievalResult(hits=[], denied_parent_ids=[])
+            return RetrievalResult(hits=[], denied_parent_count=0)
 
-        child_hits = self._hybrid.search(
-            ctx, corpus, query, top_k, dense_encoder=dense_encoder, sparse_encoder=sparse_encoder
-        )
+        # An empty authorization scope (e.g. no allowed_security_levels) makes
+        # the PDP deny everything; the PEP raises instead of broadening access.
+        try:
+            child_hits = self._hybrid.search(
+                ctx,
+                corpus,
+                query,
+                top_k,
+                dense_encoder=dense_encoder,
+                sparse_encoder=sparse_encoder,
+            )
+        except EmptyAuthorizationScopeError:
+            return RetrievalResult(hits=[], denied_parent_count=0)
 
         hits: list[tuple] = []
-        denied: list[str] = []
+        denied_count = 0
         for hit in child_hits:
             try:
                 parent = self._parent_reader.load_parent_for_hit(hit, ctx)
-            except Exception:
-                denied.append(hit.parent_id)
+            except ParentAuthorizationError:
+                # A parent that fails the second-auth pass is simply not
+                # returned. Storage faults / programming errors are NOT masked
+                # as authorization denials and propagate for explicit handling.
+                denied_count += 1
                 continue
             hits.append((hit, parent))
 
-        return RetrievalResult(hits=hits, denied_parent_ids=denied)
+        return RetrievalResult(hits=hits, denied_parent_count=denied_count)

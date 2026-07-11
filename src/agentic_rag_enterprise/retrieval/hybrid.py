@@ -1,11 +1,13 @@
-"""Hybrid (dense + sparse) child-chunk retrieval.
+"""Hybrid (dense + sparse) child-chunk retrieval — INTERNAL adapter.
 
 This module builds the Qdrant ACL filter from the caller's
-:class:`SecurityContext` and runs a hybrid search. It does **not** validate
-corpus discoverability — that gate lives in
-:class:`agentic_rag_enterprise.retrieval.retriever.SecureRetriever`. It also
-never reads a model-supplied parent id; only child hits from the authorized
-filter are returned.
+:class:`SecurityContext` and runs a hybrid search. It is an internal adapter
+used only by
+:class:`agentic_rag_enterprise.retrieval.retriever.SecureRetriever`; it is not
+exported from the ``retrieval`` package and must not be called directly by
+application/tool code. It does **not** validate corpus discoverability (that
+gate lives in ``SecureRetriever``) and never reads a model-supplied parent id;
+only child hits from the authorized filter are returned.
 """
 
 from typing import Any
@@ -32,8 +34,12 @@ def _as_list(value: Any) -> list[str]:
     return [str(value)]
 
 
-class HybridRetriever:
-    """Runs authorized hybrid search and returns typed child hits."""
+class _HybridSearchAdapter:
+    """Runs authorized hybrid search and returns typed child hits.
+
+    Internal-only: the secure retrieval entry point is
+    :class:`~agentic_rag_enterprise.retrieval.retriever.SecureRetriever`.
+    """
 
     def __init__(
         self,

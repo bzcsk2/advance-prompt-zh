@@ -17,14 +17,14 @@ from agentic_rag_enterprise.security.policy import (
 )
 
 
-def _fail_closed(key: str) -> FieldCondition:
-    """A condition that can never match.
+class EmptyAuthorizationScopeError(Exception):
+    """Raised when the caller's authorization scope is empty.
 
-    Qdrant treats an empty ``MatchAny(any=[])`` as matching everything, which
-    would *broaden* access. For an empty allow-list we instead use a sentinel
-    value that is guaranteed absent, so the filter fails closed.
+    An empty ``allowed_security_levels`` (or, by extension, empty groups) means
+    the PDP would deny every resource. We make this explicit and fail closed
+    rather than constructing a filter that could be gap-filled by a crafted
+    resource payload.
     """
-    return FieldCondition(key=key, match=MatchValue(value="\x00__no_match__\x00"))
 
 
 def build_access_filter(ctx: SecurityContext, corpus_id: str) -> Filter:
@@ -33,24 +33,39 @@ def build_access_filter(ctx: SecurityContext, corpus_id: str) -> Filter:
     Encodes: tenant match, active status, allowed security levels, and the
     tenant/restricted scope allow/deny logic, with deny precedence.
 
-    Empty allow-lists fail closed: an empty ``allowed_security_levels`` adds an
-    unsatisfiable ``must`` condition (zero results), and an empty ``groups``
-    makes the group-allow branch unsatisfiable while tenant/user branches
-    still apply.
+    Fail-closed semantics (kept identical to :func:`evaluate_access`):
+
+    * ``allowed_security_levels`` empty -> the PDP would deny everything, so we
+      raise :class:`EmptyAuthorizationScopeError` instead of producing a filter
+      that a crafted resource could slip past.
+    * ``groups`` empty -> there is simply no group branch (no allow, no deny),
+      matching the PDP where ``set(ctx.groups)`` is empty.
     """
     levels = list(ctx.allowed_security_levels)
+    if not levels:
+        raise EmptyAuthorizationScopeError(
+            "allowed_security_levels is empty; denying all retrieval"
+        )
     groups = list(ctx.groups)
 
-    security_level_cond: Condition = (
-        FieldCondition(key="security_level", match=MatchAny(any=levels))
-        if levels
-        else _fail_closed("security_level")
+    security_level_cond: Condition = FieldCondition(
+        key="security_level", match=MatchAny(any=levels)
     )
-    group_cond: Condition = (
-        FieldCondition(key="allowed_group_ids", match=MatchAny(any=groups))
-        if groups
-        else _fail_closed("allowed_group_ids")
-    )
+
+    scope_conditions: list[Condition] = [
+        FieldCondition(key="acl_scope", match=MatchValue(value="tenant")),
+        FieldCondition(
+            key="allowed_user_ids",
+            match=MatchAny(any=[ctx.user_id]),
+        ),
+    ]
+    if groups:
+        scope_conditions.append(
+            FieldCondition(
+                key="allowed_group_ids",
+                match=MatchAny(any=groups),
+            )
+        )
 
     must: list[Condition] = [
         FieldCondition(key="tenant_id", match=MatchValue(value=ctx.tenant_id)),
@@ -58,16 +73,7 @@ def build_access_filter(ctx: SecurityContext, corpus_id: str) -> Filter:
         FieldCondition(key="status", match=MatchValue(value="active")),
         FieldCondition(key="deprecated", match=MatchValue(value=False)),
         security_level_cond,
-        Filter(
-            should=[
-                FieldCondition(key="acl_scope", match=MatchValue(value="tenant")),
-                FieldCondition(
-                    key="allowed_user_ids",
-                    match=MatchAny(any=[ctx.user_id]),
-                ),
-                group_cond,
-            ],
-        ),
+        Filter(should=scope_conditions),
     ]
 
     must_not: list[Condition] = [
@@ -75,11 +81,14 @@ def build_access_filter(ctx: SecurityContext, corpus_id: str) -> Filter:
             key="denied_user_ids",
             match=MatchAny(any=[ctx.user_id]),
         ),
-        FieldCondition(
-            key="denied_group_ids",
-            match=MatchAny(any=list(ctx.groups)),
-        ),
     ]
+    if groups:
+        must_not.append(
+            FieldCondition(
+                key="denied_group_ids",
+                match=MatchAny(any=groups),
+            )
+        )
 
     return Filter(must=must, must_not=must_not)
 

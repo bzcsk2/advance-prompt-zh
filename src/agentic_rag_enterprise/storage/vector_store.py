@@ -12,6 +12,7 @@ this module.
 """
 
 from typing import Protocol, runtime_checkable
+from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -25,6 +26,12 @@ from qdrant_client.models import (
     SparseVectorParams,
     VectorParams,
 )
+
+from agentic_rag_enterprise.ingestion.chunker import ChildChunk
+from agentic_rag_enterprise.security.policy import ResourceAcl
+
+# Stable namespace for deriving Qdrant point ids (UUIDs) from business chunk ids.
+_CHUNK_NAMESPACE = uuid5(NAMESPACE_URL, "agentic-rag-enterprise:child-chunk")
 
 DEFAULT_SPARSE_NAME = "sparse"
 
@@ -114,5 +121,55 @@ class VectorStore:
         self._client.close()
 
 
+def child_chunk_to_point(
+    child: ChildChunk,
+    acl: ResourceAcl,
+    *,
+    status: str,
+    deprecated: bool,
+    dense_encoder: DenseEncoder,
+    sparse_encoder: SparseEncoder,
+) -> PointStruct:
+    """Production mapping from a chunked :class:`ChildChunk` to a Qdrant point.
+
+    The business id is ``child.child_id`` (content-addressed). The Qdrant point
+    id is a *stable UUID* derived from it, so it is always a valid Qdrant id
+    (``u64``/``Uuid``) regardless of the business id's representation. The payload
+    carries full provenance + ACL so the retrieval path can re-establish
+    identity and authorization at read time.
+    """
+    dense = dense_encoder(child.text)
+    sparse = sparse_encoder(child.text)
+    payload = {
+        "tenant_id": child.tenant_id,
+        "corpus_id": child.corpus_id,
+        "document_id": child.document_id,
+        "document_version": child.document_version,
+        "parent_id": child.parent_id,
+        "chunk_id": child.child_id,
+        "text": child.text,
+        "section_path": child.section_path,
+        "status": status,
+        "deprecated": deprecated,
+        "security_level": acl.security_level,
+        "acl_scope": acl.acl_scope,
+        "allowed_user_ids": acl.allowed_user_ids,
+        "allowed_group_ids": acl.allowed_group_ids,
+        "denied_user_ids": acl.denied_user_ids,
+        "denied_group_ids": acl.denied_group_ids,
+    }
+    return PointStruct(
+        id=str(uuid5(_CHUNK_NAMESPACE, child.child_id)),
+        vector={"": dense, "sparse": sparse},
+        payload=payload,
+    )
+
+
 # Re-export for callers that build sparse vectors without importing qdrant directly.
-__all__ = ["VectorStore", "DenseEncoder", "SparseEncoder", "SparseVector"]
+__all__ = [
+    "VectorStore",
+    "DenseEncoder",
+    "SparseEncoder",
+    "SparseVector",
+    "child_chunk_to_point",
+]

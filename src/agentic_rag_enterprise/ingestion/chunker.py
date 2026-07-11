@@ -29,7 +29,9 @@ DEFAULT_MIN_PARENT_SIZE = 2000
 DEFAULT_MAX_PARENT_SIZE = 4000
 DEFAULT_CHILD_CHUNK_SIZE = 500
 DEFAULT_CHILD_CHUNK_OVERLAP = 100
-_PARENT_ID_LEN = 16
+# 128-bit content-addressed ids (parent/child keys). Longer than upstream's
+# filename-derived ids and resistant to collision/guessing.
+_PARENT_ID_LEN = 32
 
 
 class Chunk(BaseModel):
@@ -113,10 +115,14 @@ class ParentChildChunker:
         tenant_id: str,
         corpus_id: str,
         document_id: str,
-        document_version: str = "",
+        document_version: str,
         metadata: dict[str, object] | None = None,
     ) -> tuple[list[ParentChunk], list[ChildChunk]]:
         """Split ``text`` into parent + child chunks with stable ids.
+
+        ``document_version`` is required and is part of the content-addressed
+        parent/child id, so two versions of the same section get distinct ids
+        (the parent store can hold both without one overwriting the other).
 
         Returns ``(parents, children)`` in deterministic document order.
         """
@@ -126,6 +132,9 @@ class ParentChildChunker:
         segs = self._merge_small_parents(segs)
         segs = self._split_large_parents(segs)
         segs = self._clean_small_chunks(segs)
+
+        if any(len(s.text) > self.max_parent_size for s in segs):
+            raise ValueError("parent chunk exceeds max_parent_size after rebalancing")
 
         return self._create_child_chunks(
             segs, tenant_id, corpus_id, document_id, document_version, metadata or {}
@@ -173,6 +182,47 @@ class ParentChildChunker:
                 out.append(seg)
         return out
 
+    def _rebalance_pair(self, first: _Seg, second: _Seg) -> tuple[_Seg, _Seg]:
+        """Redistribute two adjacent segments around the midpoint.
+
+        Ports the upstream ``_rebalance_pair``: joins on a separator, then splits
+        at the nearest structural boundary (paragraph/line/space) so both sides
+        stay <= ``max_parent_size`` and, when there is enough combined text,
+        >= ``min_parent_size``. Returns the (possibly unchanged) pair.
+        """
+        separator = "\n\n"
+        combined = first.text.rstrip() + separator + second.text.lstrip()
+        lower = max(1, len(combined) - self.max_parent_size)
+        upper = min(self.max_parent_size, len(combined) - 1)
+        if len(combined) >= 2 * self.min_parent_size:
+            lower = max(lower, self.min_parent_size)
+            upper = min(upper, len(combined) - self.min_parent_size)
+        preferred = min(max(len(combined) // 2, lower), upper)
+
+        split_at = preferred
+        for sep in ("\n\n", "\n", " "):
+            before = combined.rfind(sep, lower, preferred + 1)
+            after = combined.find(sep, preferred, upper + 1)
+            if before >= lower:
+                split_at = before
+                break
+            if after != -1:
+                split_at = after
+                break
+
+        left_text = combined[:split_at].rstrip()
+        right_text = combined[split_at:].lstrip()
+        if len(combined) >= 2 * self.min_parent_size and (
+            len(left_text) < self.min_parent_size or len(right_text) < self.min_parent_size
+        ):
+            split_at = preferred
+            left_text, right_text = combined[:split_at], combined[split_at:]
+        if not left_text or not right_text:
+            return first, second
+
+        metadata = self._merge_metadata(dict(first.metadata), second.metadata)
+        return _Seg(left_text, dict(metadata)), _Seg(right_text, dict(metadata))
+
     def _clean_small_chunks(self, segs: list[_Seg]) -> list[_Seg]:
         segs = list(segs)
         out: list[_Seg] = []
@@ -181,21 +231,32 @@ class ParentChildChunker:
             if len(seg.text) >= self.min_parent_size or n == 1:
                 out.append(seg)
                 continue
-            # Fold into the previous parent if it fits within max size.
+            # Fold into the previous parent if it fits within max size (account
+            # for the "\n\n" separator we will insert).
             if out:
                 prev = out[-1]
-                if len(prev.text) + len(seg.text) <= self.max_parent_size:
+                if len(prev.text) + 2 + len(seg.text) <= self.max_parent_size:
                     prev.text = prev.text + "\n\n" + seg.text
                     prev.metadata = self._merge_metadata(prev.metadata, seg.metadata)
                     continue
             # Otherwise prepend to the next parent if it fits.
             if i + 1 < n:
                 nxt = segs[i + 1]
-                if len(nxt.text) + len(seg.text) <= self.max_parent_size:
+                if len(nxt.text) + 2 + len(seg.text) <= self.max_parent_size:
                     nxt.text = seg.text + "\n\n" + nxt.text
                     nxt.metadata = self._merge_metadata(seg.metadata, nxt.metadata)
                     continue
             out.append(seg)
+
+        # Second pass: any segment still below MIN gets rebalanced with a
+        # neighbor so orphan small parents are not emitted (upstream behavior).
+        for i, seg in enumerate(out):
+            if len(seg.text) >= self.min_parent_size or len(out) == 1:
+                continue
+            if i < len(out) - 1:
+                out[i], out[i + 1] = self._rebalance_pair(out[i], out[i + 1])
+            else:
+                out[i - 1], out[i] = self._rebalance_pair(out[i - 1], out[i])
         return out
 
     def _create_child_chunks(
@@ -212,7 +273,7 @@ class ParentChildChunker:
         for seg in segs:
             section_path = self._section_path(seg.metadata)
             parent_id = self._make_parent_id(
-                tenant_id, corpus_id, document_id, section_path, seg.text
+                tenant_id, corpus_id, document_id, document_version, section_path, seg.text
             )
             parents.append(
                 ParentChunk(
@@ -258,10 +319,14 @@ class ParentChildChunker:
         tenant_id: str,
         corpus_id: str,
         document_id: str,
+        document_version: str,
         section_path: list[str],
         text: str,
     ) -> str:
-        blob = f"{tenant_id}|{corpus_id}|{document_id}|{' > '.join(section_path)}|{text}"
+        blob = (
+            f"{tenant_id}|{corpus_id}|{document_id}|{document_version}|"
+            f"{' > '.join(section_path)}|{text}"
+        )
         return sha256(blob.encode("utf-8")).hexdigest()[:_PARENT_ID_LEN]
 
     @staticmethod

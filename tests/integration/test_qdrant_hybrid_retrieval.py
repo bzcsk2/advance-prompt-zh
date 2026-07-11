@@ -1,7 +1,7 @@
 """Integration test: Qdrant hybrid retrieval must equal the PDP truth table.
 
 Reuses the E-006.1 ACL matrix but routes it through the E-007
-:class:`HybridRetriever` + :class:`VectorStore` (real in-memory Qdrant,
+:class:`_HybridSearchAdapter` + :class:`VectorStore` (real in-memory Qdrant,
 dense+sparse RRF fusion, mandatory ``build_access_filter``). Also covers the
 mandatory **corpus discoverability** gate and the empty-``groups`` /
 empty-``allowed_security_levels`` fail-closed cases.
@@ -13,7 +13,7 @@ from qdrant_client import QdrantClient
 
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.security import SecurityContext
-from agentic_rag_enterprise.retrieval.hybrid import HybridRetriever
+from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
 from agentic_rag_enterprise.security.policy import (
@@ -100,12 +100,12 @@ _RESOURCES = [
 ]
 
 
-def _build_store() -> VectorStore:
+def _build_store(resources: list | None = None) -> VectorStore:
     client = QdrantClient(location=":memory:")
     store = VectorStore(client)
     store.create_collection(CORPUS_ID, dense_size=DENSE_SIZE)
     points = []
-    for pid, overrides in _RESOURCES:
+    for pid, overrides in resources or _RESOURCES:
         base = {
             "tenant_id": TENANT_ID,
             "corpus_id": CORPUS_ID,
@@ -179,9 +179,9 @@ def _expected(ctx: SecurityContext) -> set[int]:
     return allowed
 
 
-def _actual_pids(ctx: SecurityContext) -> set[int]:
-    store = _build_store()
-    retriever = HybridRetriever(store)
+def _actual_pids(ctx: SecurityContext, store: VectorStore | None = None) -> set[int]:
+    store = store or _build_store()
+    retriever = _HybridSearchAdapter(store)
     hits = retriever.search(
         ctx,
         _corpus(),
@@ -241,20 +241,76 @@ def test_empty_groups_still_returns_tenant_scope() -> None:
 
 
 def test_empty_allowed_security_levels_fails_closed() -> None:
-    hits = HybridRetriever(_build_store()).search(
+    # Empty levels => PEP raises EmptyAuthorizationScopeError; SecureRetriever
+    # catches it and returns empty results (fail closed). The PDP also denies
+    # everything, so PDP/PEP equivalence is preserved.
+    retriever = SecureRetriever(_HybridSearchAdapter(_build_store()), ParentReader(_NoopStore()))
+    result = retriever.retrieve(
         _ctx(allowed_security_levels=[]),
-        _corpus(),
         "resource",
+        _corpus(),
         100,
         dense_encoder=FakeDenseEncoder(),
         sparse_encoder=FakeSparseEncoder(),
     )
-    assert hits == []  # must not strip the security-level condition
+    assert result.hits == []
+
+
+def test_empty_groups_cannot_match_reserved_payload() -> None:
+    # A resource whose only allow path is a reserved sentinel group id must
+    # still be denied when the caller has no groups (PEP omits the group
+    # branch entirely, matching the PDP's empty-group semantics).
+    reserved = "\x00__no_match__\x00"
+    store = _build_store(
+        [
+            (
+                1,
+                {
+                    "acl_scope": "restricted",
+                    "security_level": "public",
+                    "allowed_group_ids": [reserved],
+                },
+            )
+        ]
+    )
+    ids = _actual_pids(_ctx(groups=[]), store)
+    assert 1 not in ids  # sentinel group id never broadens access
+
+
+def test_empty_levels_cannot_match_reserved_security_level() -> None:
+    # With empty allowed levels the PEP raises; a crafted resource carrying the
+    # reserved security level must not become readable.
+    reserved = "\x00__no_match__\x00"
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(
+            _build_store(
+                [
+                    (
+                        1,
+                        {
+                            "acl_scope": "tenant",
+                            "security_level": reserved,
+                        },
+                    )
+                ]
+            )
+        ),
+        ParentReader(_NoopStore()),
+    )
+    result = retriever.retrieve(
+        _ctx(allowed_security_levels=[]),
+        "resource",
+        _corpus(),
+        100,
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+    )
+    assert result.hits == []
 
 
 def test_corpus_discoverability_gate_blocks() -> None:
     ctx = _ctx(allowed_corpus_ids=["other_corpus"])
-    retriever = SecureRetriever(HybridRetriever(_build_store()), ParentReader(_NoopStore()))
+    retriever = SecureRetriever(_HybridSearchAdapter(_build_store()), ParentReader(_NoopStore()))
     result = retriever.retrieve(
         ctx,
         "resource",
