@@ -143,8 +143,9 @@ def test_step_reentrancy_resumes_after_crash() -> None:
     # New version not yet visible (no qdrant points / not committed).
     assert store.get_active_document("t1", "eng", "d1") is None
 
-    # Resume: completes the remaining steps.
-    final = manager.ingest(req)
+    # Resume: completes the remaining steps (explicit recovery of a crashed
+    # attempt on the still-RUNNING lease).
+    final = manager.ingest(req, recover=True)
     assert final.status == IngestionStatus.INDEXED
     assert store.get_active_document("t1", "eng", "d1").version == "v1"
     assert _count_qdrant_points(vector, "eng") > 0
@@ -264,7 +265,7 @@ def test_old_job_cannot_override_newer_committed_version() -> None:
         dense_encoder=FakeDenseEncoder(),
         sparse_encoder=FakeSparseEncoder(),
         request=_request(job_id="jA", version="v2", content="# T\n\nv2 content"),
-    ).run()
+    ).run(recover=True)
     assert res_a.status == IngestionStatus.FAILED
     assert res_a.error_code == "active_version_conflict"
     assert store.get_active_document("t1", "eng", "d1").version == "v3"

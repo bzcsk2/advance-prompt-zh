@@ -142,8 +142,8 @@ def test_crash_after_parent_write_recovers() -> None:
     assert store.get_active_document("t1", "eng", "doc1") is None
     assert _retrieve_versions(retriever) == []
 
-    # Resume to completion.
-    manager.ingest(req)
+    # Resume to completion (explicit recovery of the crashed attempt).
+    manager.ingest(req, recover=True)
     assert store.get_active_document("t1", "eng", "doc1").version == "v1"
     assert "v1" in _retrieve_versions(retriever)
     store.close()
@@ -171,8 +171,8 @@ def test_crash_after_qdrant_write_keeps_old_active() -> None:
     assert store.get_active_document("t1", "eng", "doc1").version == "v1"
     assert _retrieve_versions(retriever) == ["v1"]
 
-    # Resume.
-    manager.ingest(req2)
+    # Resume (explicit recovery of the crashed attempt).
+    manager.ingest(req2, recover=True)
     assert store.get_active_document("t1", "eng", "doc1").version == "v2"
     assert _retrieve_versions(retriever) == ["v2"]
     store.close()
@@ -288,7 +288,7 @@ def test_older_job_loses_active_version_race() -> None:
         dense_encoder=FakeDenseEncoder(),
         sparse_encoder=FakeSparseEncoder(),
         request=_request(job_id="jA", version="v2", content=SAMPLE_MARKDOWN + "\n\n## A\n"),
-    ).run()
+    ).run(recover=True)
     assert res_a.status == IngestionStatus.FAILED
     assert res_a.error_code == "active_version_conflict"
     assert store.get_active_document("t1", "eng", "doc1").version == "v3"
@@ -359,8 +359,9 @@ def test_taken_over_build_cannot_corrupt_active_version() -> None:
     assert res1b.status == IngestionStatus.BUILD_CONFLICT
     assert res1b.error_code == "build_conflict"
 
-    # j2 completes; the active version is correct and uncorrupted.
-    res2 = manager.ingest(_request(job_id="j2", version="v1", content=SAMPLE_MARKDOWN))
+    # j2 completes (explicit recovery of its own crashed attempt on the
+    # still-RUNNING lease); the active version is correct and uncorrupted.
+    res2 = manager.ingest(_request(job_id="j2", version="v1", content=SAMPLE_MARKDOWN), recover=True)
     assert res2.status == IngestionStatus.INDEXED
     assert store.get_build_owner("t1", "eng", "doc1", "v1") == "j2"
     assert _retrieve_versions(retriever) == ["v1"]

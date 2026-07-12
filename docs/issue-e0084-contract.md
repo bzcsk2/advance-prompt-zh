@@ -66,25 +66,49 @@ beyond the three P1 state-transition gaps below.
 - `publish` reads the persisted `previous_active_version`; a replacement job
   taking over a post-commit-failed build now inherits the true replaced version
   (`v1`) and deprecates its data plane correctly.
+- **Upgrade backfill:** migration `006` ends with a one-time `UPDATE
+  document_builds SET previous_active_version = (SELECT
+  ingestion_jobs.previous_active_version ...) WHERE previous_active_version IS NULL`,
+  so an E-008.3 database upgraded in place copies the per-job replaced version
+  onto the (already-claimed) lease it owns. Without it, a post-commit-failed
+  build taken over after upgrade would recompute the replaced version against the
+  already-switched active version and fail to clean the true prior data plane.
 
-### P1-3 — Same-`job_id` concurrency serialized (execution attempt)
-- A build identity `(tenant, corpus, document, version)` may have at most ONE
-  live `run()` execution attempt **per process**
-  (`_claim_build_guard` / `_release_build_guard` in `job.py`).
-- A second concurrent `run()` for the same build is a duplicate delivery, not a
-  recovery: it returns `BUILD_CONFLICT` **before** touching the lease or data
-  plane, so the in-flight execution keeps its fencing authority and the lease
-  generation is never advanced for a duplicate.
-- A retry after the prior execution has exited (crashed/finished) is a genuine
-  recovery and proceeds. This separates job identity (immutable binding) from
-  execution attempt (lease holder). In-process only; cross-process liveness
-  requires a lease timeout/heartbeat (out of scope for this fix).
+### P1-3 — Execution attempt is DB-backed (cross-process serialization)
+- `document_builds` gains `attempt_id TEXT` + `claimed_at TEXT`
+  (migration `007_e0084_build_attempt.sql`). Each `run()` mints a fresh
+  `attempt_id` (uuid) and `acquire_job` persists it on every
+  claim/takeover/resume.
+- A same-`job_id` re-acquire while the lease is **still `running`** with a
+  **different `attempt_id`** is a duplicate delivery (e.g. a second process
+  that re-delivered the same `job_id`), NOT a recovery: `acquire_job` raises
+  `BuildConflict` and does **not** advance the fencing generation, so the
+  in-flight attempt keeps its authority over the deterministic data plane. This
+  closes the cross-process race the E-008.3 review left open.
+- **Explicit recovery** is required for a same-`job_id` re-acquire on a live
+  lease: `run(recover=True)` / `DocumentManager.ingest(recover=True)` passes
+  `recover=True` to `acquire_job`, which advances the generation and resumes.
+  Implicit (non-recover) re-acquire of a RUNNING same-`job_id` lease is
+  rejected — the contract no longer auto-interprets any same-`job_id` re-call
+  as a recovery. A **terminal** (failed/succeeded/cancelled) same-`job_id`
+  lease is a safe recovery and resumes without `recover=True`.
+- The in-process guard (`_claim_build_guard` / `_release_build_guard`) is
+  retained as an extra layer for genuine same-process concurrency; the DB-level
+  `attempt_id` is the authoritative execution-attempt owner. Cross-process
+  **liveness** (detecting a crashed attempt that never released the lease) still
+  requires a lease timeout/heartbeat and is explicitly out of scope.
 
 ## Acceptance tests
+- `tests/unit/test_metadata_store.py`:
+  - `test_build_attempt_rejects_duplicate_execution_for_same_job_id` (P1-3
+    DB-level attempt: duplicate RUNNING same-`job_id` rejected; `recover=True`
+    advances).
+  - `test_migration_006_backfills_previous_version_on_upgrade` (P1-2 upgrade
+    backfill + post-upgrade takeover inherits the true replaced version).
 - `tests/integration/test_e008_crash_points.py`:
   - `test_deprecated_version_redelivery_is_idempotent` (P1-1)
   - `test_takeover_after_publish_failure_keeps_true_previous_version` (P1-2)
-  - `test_same_job_id_concurrent_delivery_is_serialized` (P1-3)
+  - `test_same_job_id_concurrent_delivery_is_serialized` (P1-3 in-process)
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` all green.
 
@@ -96,6 +120,6 @@ beyond the three P1 state-transition gaps below.
   `metadata_store` active-version gate (P1-7), commit idempotent resume (P1-1),
   `publish` scopes parents to `self._parents_list` (P2-2), `ALREADY_INDEXED`
   job-row guard (P2-1).
-- The P1-3 in-process guard deliberately does **not** alter cross-process
-  behavior; a lease timeout/heartbeat is the production-grade completion of this
-  gap and is explicitly out of scope here.
+- The P1-3 DB-level `attempt_id` now closes cross-process duplicate delivery;
+  a lease timeout/heartbeat remains the production-grade completion of liveness
+  detection and is explicitly out of scope for this fix.

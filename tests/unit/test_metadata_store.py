@@ -1,6 +1,7 @@
 """Unit tests for MetadataStore (ingestion control-plane source of truth)."""
 
 import os
+import sqlite3
 import tempfile
 from datetime import datetime, timezone
 
@@ -10,8 +11,10 @@ from agentic_rag_enterprise.domain.ingestion import (
     IngestionManifest,
     JobStatus,
 )
+import pytest
 import threading
 
+from agentic_rag_enterprise.storage import metadata_store as ms
 from agentic_rag_enterprise.storage.metadata_store import (
     ActiveVersionConflict,
     BuildConflict,
@@ -484,5 +487,145 @@ def test_build_lease_takeover_after_failed_owner() -> None:
     # Takeover advanced the fencing token so the original (failed) owner's
     # generation no longer matches the live lease (E-008.3 P1-2).
     assert store.get_lease_generation("t1", "eng", "d1", "v1") >= 2
+    store.close()
+    os.unlink(path)
+
+
+def test_build_attempt_rejects_duplicate_execution_for_same_job_id() -> None:
+    # E-008.4 P1-3 (DB-level execution attempt): a second live execution
+    # attempt for the SAME job_id on a RUNNING lease (e.g. a second process
+    # that re-delivered the same job_id) is a duplicate delivery, NOT a
+    # recovery: it is rejected with BuildConflict and does NOT advance the
+    # fencing generation, so the in-flight attempt keeps its authority over the
+    # deterministic data plane. An explicit recovery (recover=True) is allowed
+    # to advance the generation.
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(status=DocumentStatus.PROCESSING))
+    # First (live) attempt claims the lease.
+    store.acquire_job(
+        job_id="j1",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+        attempt_id="attempt-aaa",
+    )
+    # Second live attempt for the SAME job_id but a DIFFERENT attempt_id
+    # (cross-process re-delivery) on the still-RUNNING lease -> duplicate
+    # -> BuildConflict, generation unchanged.
+    dup = MetadataStore(path)
+    with pytest.raises(BuildConflict):
+        dup.acquire_job(
+            job_id="j1",
+            document_id="d1",
+            document_version="v1",
+            corpus_id="eng",
+            tenant_id="t1",
+            parser_version="1.0",
+            chunking_version="1.0",
+            embedding_version="1.0",
+            raw_hash="abc",
+            base_revision=0,
+            attempt_id="attempt-bbb",
+        )
+    assert store.get_lease_generation("t1", "eng", "d1", "v1") == 1
+    dup.close()
+
+    # Explicit recovery of the (crashed) attempt advances the generation.
+    rec = MetadataStore(path)
+    status, generation = rec.acquire_job(
+        job_id="j1",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+        attempt_id="attempt-ccc",
+        recover=True,
+    )
+    assert status == JobStatus.RUNNING
+    assert generation == 2
+    rec.close()
+    store.close()
+    os.unlink(path)
+
+
+def test_migration_006_backfills_previous_version_on_upgrade() -> None:
+    # E-008.4 P1-2 (upgrade path): an E-008.3 DB upgraded in place must
+    # backfill document_builds.previous_active_version from the per-job value so
+    # a post-commit-failed build taken over AFTER upgrade still inherits the true
+    # replaced version instead of recomputing against the switched-active one.
+    path = _tmp_db_path()
+    store = MetadataStore(path)  # full schema (incl. 006)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v0", status=DocumentStatus.ACTIVE))
+    # jA acquires the v1 build; captures the truly-replaced version 'v0'.
+    store.acquire_job(
+        job_id="jA",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+        document=_make_doc(version="v1", status=DocumentStatus.PROCESSING),
+    )
+    store.mark_job_terminal("jA", JobStatus.SUCCEEDED)
+    # Simulate an E-008.3 DB BEFORE migration 006: the lease row's
+    # previous_active_version was absent (NULL on upgrade).
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE document_builds SET previous_active_version = NULL "
+        "WHERE owner_job_id='jA'"
+    )
+    store._conn.commit()
+
+    # Apply ONLY the 006 backfill against the upgraded DB.
+    m006 = ms.MIGRATIONS_DIR / "006_e0084_lease_previous_version.sql"
+    script = m006.read_text().strip()
+    sql_lines = [
+        ln for ln in script.splitlines()
+        if ln.strip() and not ln.strip().startswith("--")
+    ]
+    statements = [s.strip() for s in ("\n".join(sql_lines)).split(";") if s.strip()]
+    backfill = next(s for s in statements if s.upper().startswith("UPDATE"))
+    raw = sqlite3.connect(path, isolation_level=None)
+    raw.execute(backfill)
+    row = raw.execute(
+        "SELECT previous_active_version FROM document_builds WHERE owner_job_id='jA'"
+    ).fetchone()
+    assert row[0] == "v0"
+
+    # A takeover AFTER upgrade inherits the true replaced version (not recomputed).
+    take = MetadataStore(path)
+    take.acquire_job(
+        job_id="jB",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+        document=_make_doc(version="v1", status=DocumentStatus.PROCESSING),
+    )
+    assert take.get_job_previous_version("jB") == "v0"
+    take.close()
+    raw.close()
     store.close()
     os.unlink(path)

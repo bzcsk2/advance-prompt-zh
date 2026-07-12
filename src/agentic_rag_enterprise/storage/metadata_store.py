@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -186,6 +187,8 @@ class MetadataStore:
         raw_hash: str,
         base_revision: int,
         document: Optional[SourceDocument] = None,
+        attempt_id: Optional[str] = None,
+        recover: bool = False,
     ) -> tuple[JobStatus, int]:
         """Atomically claim/renew the build lease and the job row.
 
@@ -221,8 +224,11 @@ class MetadataStore:
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
+            if attempt_id is None:
+                attempt_id = uuid.uuid4().hex
             lease = cur.execute(
-                "SELECT owner_job_id, status, lease_generation, previous_active_version "
+                "SELECT owner_job_id, status, lease_generation, previous_active_version, "
+                "attempt_id "
                 "FROM document_builds "
                 "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND document_version=?",
                 (tenant_id, corpus_id, document_id, document_version),
@@ -244,8 +250,8 @@ class MetadataStore:
                     "INSERT INTO document_builds "
                     "(tenant_id, corpus_id, document_id, document_version, "
                     " owner_job_id, status, base_revision, acquired_at, lease_generation, "
-                    " previous_active_version) "
-                    "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
+                    " previous_active_version, attempt_id, claimed_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
                     (
                         tenant_id,
                         corpus_id,
@@ -256,6 +262,8 @@ class MetadataStore:
                         _now_iso(),
                         generation,
                         previous_version,
+                        attempt_id,
+                        _now_iso(),
                     ),
                 )
             else:
@@ -281,7 +289,8 @@ class MetadataStore:
                     cur.execute(
                         "UPDATE document_builds "
                         "SET owner_job_id=?, status='running', base_revision=?, "
-                        "acquired_at=?, lease_generation=?, previous_active_version=? "
+                        "acquired_at=?, lease_generation=?, previous_active_version=?, "
+                        "attempt_id=?, claimed_at=? "
                         "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
                         "AND document_version=?",
                         (
@@ -290,6 +299,8 @@ class MetadataStore:
                             _now_iso(),
                             generation,
                             previous_version,
+                            attempt_id,
+                            _now_iso(),
                             tenant_id,
                             corpus_id,
                             document_id,
@@ -297,14 +308,38 @@ class MetadataStore:
                         ),
                     )
                 else:
-                    # Same owner resume / retry: reset job + lease to running and
-                    # advance the fencing token so a taken-over stale owner is
-                    # rejected before mutating shared state (E-008.3 P1-2). The
-                    # lease-bound previous_active_version is carried forward.
+                    # Same owner (job_id) re-acquiring. Two distinct execution
+                    # attempts are now distinguishable at the DB level via
+                    # attempt_id (E-008.4 P1-3, cross-process). A live RUNNING
+                    # lease claimed by a DIFFERENT attempt is a duplicate delivery
+                    # (e.g. a second process), NOT a recovery: reject it with
+                    # BuildConflict and do NOT advance the fencing generation, so
+                    # the in-flight attempt keeps its authority over the
+                    # deterministic data plane. Explicit recovery (recover=True,
+                    # e.g. resuming a crashed attempt) or a dead (terminal) lease
+                    # is allowed to advance.
+                    lease_status = JobStatus(lease["status"])
+                    lease_attempt = lease["attempt_id"]
+                    if (
+                        lease_status == JobStatus.RUNNING
+                        and lease_attempt != attempt_id
+                        and not recover
+                    ):
+                        raise BuildConflict(
+                            f"job {job_id!r} already has a live execution attempt "
+                            f"(attempt_id={lease_attempt!r}); refusing duplicate "
+                            f"attempt {attempt_id!r} on RUNNING lease"
+                        )
+                    # Same owner resume / retry / recovery: reset job + lease to
+                    # running and advance the fencing token so a taken-over stale
+                    # owner is rejected before mutating shared state (E-008.3
+                    # P1-2). The lease-bound previous_active_version is carried
+                    # forward; the new attempt_id + claimed_at are persisted.
                     cur.execute(
                         "UPDATE document_builds "
                         "SET status='running', base_revision=?, acquired_at=?, "
-                        "lease_generation=?, previous_active_version=? "
+                        "lease_generation=?, previous_active_version=?, "
+                        "attempt_id=?, claimed_at=? "
                         "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
                         "AND document_version=?",
                         (
@@ -312,6 +347,8 @@ class MetadataStore:
                             _now_iso(),
                             generation,
                             previous_version,
+                            attempt_id,
+                            _now_iso(),
                             tenant_id,
                             corpus_id,
                             document_id,

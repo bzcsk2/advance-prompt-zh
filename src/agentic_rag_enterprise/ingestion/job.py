@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -188,11 +189,18 @@ class IngestionJob:
     # ------------------------------------------------------------------ #
     # Public entry point
     # ------------------------------------------------------------------ #
-    def run(self, max_step: Optional[str] = None) -> IngestionResult:
+    def run(
+        self, max_step: Optional[str] = None, recover: bool = False
+    ) -> IngestionResult:
         """Run steps up to and including ``max_step`` (None = all).
 
         A ``max_step`` shorter than the full pipeline simulates a crash/interrupt;
         a subsequent ``run()`` resumes from the last completed step marker.
+
+        ``recover=True`` marks this invocation as an explicit recovery of a
+        prior (crashed) execution attempt for the same build. At the database
+        level a RUNNING lease owned by a *different* attempt is a duplicate
+        delivery and rejected unless ``recover=True`` (E-008.4 P1-3).
         """
         steps = self.STEPS
         stopped_early = False
@@ -228,8 +236,15 @@ class IngestionJob:
                 error_code="build_conflict",
                 error_message=f"build {key!r} already in-flight in this process",
             )
+        attempt_id = uuid.uuid4().hex
         try:
-            return self._run_body(_max_step=max_step, steps=steps, stopped_early=stopped_early)
+            return self._run_body(
+                _max_step=max_step,
+                steps=steps,
+                stopped_early=stopped_early,
+                attempt_id=attempt_id,
+                recover=recover,
+            )
         finally:
             _release_build_guard(key)
 
@@ -238,6 +253,8 @@ class IngestionJob:
         _max_step: Optional[str],
         steps: list[str],
         stopped_early: bool,
+        attempt_id: str,
+        recover: bool,
     ) -> IngestionResult:
         # P1-4 (fast pre-check): a job_id is an immutable binding. Reject reuse
         # with a different request up front; the authoritative atomic check lives
@@ -307,7 +324,7 @@ class IngestionJob:
         # step marker is already done) so a resuming job re-asserts ownership and
         # refreshes its fencing token every run() (E-008.3 P1-2).
         try:
-            self._step_acquire()
+            self._step_acquire(attempt_id=attempt_id, recover=recover)
             for step in steps:
                 if step == "acquire":
                     continue
@@ -401,7 +418,7 @@ class IngestionJob:
             document_version=self._req.document_version,
         )
 
-    def _step_acquire(self) -> None:
+    def _step_acquire(self, *, attempt_id: str, recover: bool) -> None:
         # P1-3: capture and persist the monotonic lifecycle revision at acquire
         # time. The commit phase CASes against THIS value, so a newer revision
         # landing first makes this (older) job lose the race.
@@ -425,6 +442,8 @@ class IngestionJob:
             raw_hash=self._raw_hash,
             base_revision=base_revision,
             document=self._source_doc,
+            attempt_id=attempt_id,
+            recover=recover,
         )
         self._lease_generation = generation
 
@@ -916,7 +935,11 @@ class DocumentManager:
         self._sparse = sparse_encoder
 
     def ingest(
-        self, request: IngestionRequest, *, max_step: Optional[str] = None
+        self,
+        request: IngestionRequest,
+        *,
+        max_step: Optional[str] = None,
+        recover: bool = False,
     ) -> IngestionResult:
         job = IngestionJob(
             store=self._store,
@@ -927,4 +950,4 @@ class DocumentManager:
             sparse_encoder=self._sparse,
             request=request,
         )
-        return job.run(max_step=max_step)
+        return job.run(max_step=max_step, recover=recover)
