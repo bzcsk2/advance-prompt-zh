@@ -7,7 +7,9 @@ DB, in-memory Qdrant, fake encoders.
 """
 
 import os
+import shutil
 import tempfile
+from pathlib import Path
 
 from qdrant_client import QdrantClient
 
@@ -24,6 +26,7 @@ from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
 from agentic_rag_enterprise.security.policy import ResourceAcl
+from agentic_rag_enterprise.storage import metadata_store as ms
 from agentic_rag_enterprise.storage.metadata_store import (
     JobIdentityConflict,
     MetadataStore,
@@ -504,5 +507,85 @@ def test_same_job_id_concurrent_delivery_is_serialized() -> None:
     # The data plane carries exactly the winner's single write and is visible.
     assert store.get_active_document("t1", "eng", "doc1").version == "v1"
     assert _retrieve_versions(retriever) == ["v1"]
+    store.close()
+    os.unlink(db_path)
+
+
+def test_upgrade_008_backfill_then_takeover_cleans_old_data_plane() -> None:
+    # E-008.4 P1-2 (real upgrade path): a DB that already deployed the prior
+    # closure commit (migration 006 recorded as applied, backfill never ran)
+    # must, on upgrading to the fixed build (migration 008), backfill the lease's
+    # previous_active_version and then let a takeover PUBLISH and clean the truly
+    # replaced version's data plane. Reproduces the full pipeline, not just the
+    # control plane.
+    work = Path(tempfile.mkdtemp()) / "migrations"
+    work.mkdir()
+    for p in sorted(ms.MIGRATIONS_DIR.glob("*.sql")):
+        if p.stem < "008":  # 006 already "deployed" (ALTER-only), 008 not yet
+            shutil.copy(p, work / p.name)
+    orig = ms.MIGRATIONS_DIR
+    ms.MIGRATIONS_DIR = work
+    try:
+        manager, store, vector, parents, retriever, db_path = _build()
+    finally:
+        ms.MIGRATIONS_DIR = orig
+
+    manager.ingest(_request(job_id="j0", version="v0", content=SAMPLE_MARKDOWN))
+    assert _retrieve_versions(retriever) == ["v0"]
+
+    class PublishFailingJob(IngestionJob):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self._publish_attempts = 0
+
+        def _step_publish(self) -> None:
+            self._publish_attempts += 1
+            if self._publish_attempts == 1:
+                raise RuntimeError("simulated publish failure")
+            return super()._step_publish()
+
+    # jA brings v1 active but publish fails; control plane active = v1, jA FAILED.
+    req_v1 = _request(job_id="jA", version="v1", content=SAMPLE_MARKDOWN + "\n\n## v1\n")
+    PublishFailingJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req_v1,
+    ).run()
+    assert store.get_active_document("t1", "eng", "doc1").version == "v1"
+    assert store.get_job_status("jA") == JobStatus.FAILED
+    # jA's lease KNOWS the replaced version on the job row...
+    assert store.get_job_previous_version("jA") == "v0"
+    # ...but the lease column was never backfilled (pre-008 state): NULL.
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE document_builds SET previous_active_version = NULL "
+        "WHERE owner_job_id='jA'"
+    )
+    store._conn.commit()
+
+    # Real upgrade: apply migrations from the fixed dir (now incl. 008). 006 is
+    # already deployed -> skipped; 008 runs the backfill.
+    store.apply_migrations()
+    row = store._conn.execute(  # noqa: SLF001
+        "SELECT previous_active_version FROM document_builds WHERE owner_job_id='jA'"
+    ).fetchone()
+    assert row["previous_active_version"] == "v0"
+
+    # A DIFFERENT job_id takes over the same version and publishes; the TRUE
+    # replaced version (v0) must be cleaned from the data plane.
+    res = manager.ingest(_request(job_id="jB", version="v1", content=SAMPLE_MARKDOWN + "\n\n## v1\n"))
+    assert res.status == IngestionStatus.INDEXED
+    assert store.get_job_status("jB") == JobStatus.SUCCEEDED
+    assert store.get_active_document("t1", "eng", "doc1").version == "v1"
+    assert _retrieve_versions(retriever) == ["v1"]
+
+    v0_parents = [c for c in parents._store.values() if c.document_version == "v0"]
+    assert v0_parents
+    assert all(c.metadata.get("deprecated") for c in v0_parents)
+    # jB inherited the lease-bound previous_active_version (not recomputed).
+    assert store.get_job_previous_version("jB") == "v0"
     store.close()
     os.unlink(db_path)

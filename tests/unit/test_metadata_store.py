@@ -1,9 +1,10 @@
 """Unit tests for MetadataStore (ingestion control-plane source of truth)."""
 
 import os
-import sqlite3
+import shutil
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agentic_rag_enterprise.domain.document import SourceDocument
 from agentic_rag_enterprise.domain.ingestion import (
@@ -561,53 +562,62 @@ def test_build_attempt_rejects_duplicate_execution_for_same_job_id() -> None:
     os.unlink(path)
 
 
-def test_migration_006_backfills_previous_version_on_upgrade() -> None:
-    # E-008.4 P1-2 (upgrade path): an E-008.3 DB upgraded in place must
-    # backfill document_builds.previous_active_version from the per-job value so
-    # a post-commit-failed build taken over AFTER upgrade still inherits the true
-    # replaced version instead of recomputing against the switched-active one.
+def _broken_579d729_migrations_dir() -> Path:
+    # A migrations dir holding ONLY 001..007 (the state after deploying the
+    # prior closure commit, where 006 was ALTER-only and the backfill had NOT
+    # yet run). Used to reproduce the real upgrade path where 006 is already
+    # recorded as applied and therefore SKIPPED.
+    work = Path(tempfile.mkdtemp()) / "migrations"
+    work.mkdir()
+    for p in sorted(ms.MIGRATIONS_DIR.glob("*.sql")):
+        if p.stem < "008":
+            shutil.copy(p, work / p.name)
+    return work
+
+
+def test_migration_008_backfills_on_real_upgrade_from_deployed_026190f() -> None:
+    # E-008.4 P1-2 (upgrade path): a database that ALREADY deployed the prior
+    # closure commit (migration 006 recorded as applied) must still get the
+    # previous_active_version backfill when upgraded to the fixed build. The
+    # backfill therefore lives in a NEW migration 008, not inside the already-
+    # published 006 (which the migrator skips).
     path = _tmp_db_path()
-    store = MetadataStore(path)  # full schema (incl. 006)
+    work = _broken_579d729_migrations_dir()  # 006 already "deployed", no backfill
+    orig = ms.MIGRATIONS_DIR
+    ms.MIGRATIONS_DIR = work
+    try:
+        # Builds schema via 001..007 (006 = ALTER only, no backfill).
+        store = MetadataStore(path)
+    finally:
+        ms.MIGRATIONS_DIR = orig
+
     _seed_corpus(store)
     store.upsert_document(_make_doc(version="v0", status=DocumentStatus.ACTIVE))
-    # jA acquires the v1 build; captures the truly-replaced version 'v0'.
-    store.acquire_job(
-        job_id="jA",
-        document_id="d1",
-        document_version="v1",
-        corpus_id="eng",
-        tenant_id="t1",
-        parser_version="1.0",
-        chunking_version="1.0",
-        embedding_version="1.0",
-        raw_hash="abc",
-        base_revision=0,
-        document=_make_doc(version="v1", status=DocumentStatus.PROCESSING),
-    )
-    store.mark_job_terminal("jA", JobStatus.SUCCEEDED)
-    # Simulate an E-008.3 DB BEFORE migration 006: the lease row's
-    # previous_active_version was absent (NULL on upgrade).
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.PROCESSING))
+    # Legacy E-008.3 lease owned by jA (claimed before 006): column is NULL and
+    # the replaced version is recorded only on the JOBS row (as 006 captured it).
     store._conn.execute(  # noqa: SLF001
-        "UPDATE document_builds SET previous_active_version = NULL "
-        "WHERE owner_job_id='jA'"
+        "INSERT INTO ingestion_jobs "
+        "(job_id, document_id, document_version, corpus_id, tenant_id, status, "
+        " started_at, raw_hash, parent_count, child_count, parser_version, "
+        " chunking_version, embedding_version, base_revision, previous_active_version) "
+        "VALUES ('jA','d1','v1','eng','t1','failed','','',0,0,'','','',1,'v0')"
+    )
+    store._conn.execute(  # noqa: SLF001
+        "INSERT INTO document_builds "
+        "(tenant_id, corpus_id, document_id, document_version, owner_job_id, "
+        " status, base_revision, acquired_at, lease_generation) "
+        "VALUES ('t1','eng','d1','v1','jA','failed',1,'x',1)"
     )
     store._conn.commit()
 
-    # Apply ONLY the 006 backfill against the upgraded DB.
-    m006 = ms.MIGRATIONS_DIR / "006_e0084_lease_previous_version.sql"
-    script = m006.read_text().strip()
-    sql_lines = [
-        ln for ln in script.splitlines()
-        if ln.strip() and not ln.strip().startswith("--")
-    ]
-    statements = [s.strip() for s in ("\n".join(sql_lines)).split(";") if s.strip()]
-    backfill = next(s for s in statements if s.upper().startswith("UPDATE"))
-    raw = sqlite3.connect(path, isolation_level=None)
-    raw.execute(backfill)
-    row = raw.execute(
+    # The FIXED upgrade: applying migrations from the real dir (now incl. 008).
+    # 006 is already recorded as applied -> SKIPPED; 008 runs the backfill.
+    store.apply_migrations()
+    row = store._conn.execute(  # noqa: SLF001
         "SELECT previous_active_version FROM document_builds WHERE owner_job_id='jA'"
     ).fetchone()
-    assert row[0] == "v0"
+    assert row["previous_active_version"] == "v0"
 
     # A takeover AFTER upgrade inherits the true replaced version (not recomputed).
     take = MetadataStore(path)
@@ -626,6 +636,50 @@ def test_migration_006_backfills_previous_version_on_upgrade() -> None:
     )
     assert take.get_job_previous_version("jB") == "v0"
     take.close()
-    raw.close()
+    store.close()
+    os.unlink(path)
+
+
+def test_acquire_resumes_terminal_succeeded_lease_without_recover() -> None:
+    # E-008.4 P1-3 terminal semantics: a same-job_id re-acquire on a TERMINAL
+    # lease (succeeded -> build-lease status 'done') is a safe recovery and must
+    # NOT raise (the build-lease status vocabulary is 'done'/'failed', NOT the
+    # JobStatus enum). It resumes without recover=True.
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.PROCESSING))
+    store.acquire_job(
+        job_id="j1",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+        attempt_id="attempt-aaa",
+        document=_make_doc(version="v1", status=DocumentStatus.PROCESSING),
+    )
+    # Succeeded job -> build-lease status is 'done' (not a JobStatus member).
+    store.mark_job_terminal("j1", JobStatus.SUCCEEDED)
+    # Same job_id, different attempt, NO recover -> terminal lease resumes safely.
+    status, generation = store.acquire_job(
+        job_id="j1",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+        attempt_id="attempt-bbb",
+    )
+    assert status == JobStatus.RUNNING
+    assert generation == 2
     store.close()
     os.unlink(path)

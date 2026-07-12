@@ -318,10 +318,14 @@ class MetadataStore:
                     # deterministic data plane. Explicit recovery (recover=True,
                     # e.g. resuming a crashed attempt) or a dead (terminal) lease
                     # is allowed to advance.
-                    lease_status = JobStatus(lease["status"])
+                    # The build-lease status column uses its OWN vocabulary
+                    # ('running' / 'done' / 'failed'), independent of the
+                    # JobStatus enum, so compare the raw string rather than
+                    # coercing through JobStatus (which has no 'done' member).
+                    lease_is_running = lease["status"] == "running"
                     lease_attempt = lease["attempt_id"]
                     if (
-                        lease_status == JobStatus.RUNNING
+                        lease_is_running
                         and lease_attempt != attempt_id
                         and not recover
                     ):

@@ -5,18 +5,11 @@
 -- lease -- captured at the FIRST claim, carried forward on takeover/resume --
 -- keeps "the version this build replaces" stable across the whole build
 -- identity (see docs/issue-e0084-contract.md P1-2).
+--
+-- NOTE: the one-time backfill of existing (NULL) lease rows for databases
+-- already upgraded through the prior closure commit lives in migration
+-- 008_e0084_lease_previous_version_backfill.sql -- it MUST NOT be added here,
+-- because a database that already deployed this migration version would skip a
+-- modified 006 and never run the backfill.
 
 ALTER TABLE document_builds ADD COLUMN previous_active_version TEXT;
-
--- One-time backfill for E-008.3 databases upgraded in place: copy the
--- per-job previous_active_version onto the (already-claimed) lease it owns,
--- so a post-commit-failed build taken over after upgrade still inherits the
--- true replaced version instead of recomputing against the switched active
--- version. Idempotent: only fills NULL lease rows.
-UPDATE document_builds
-SET previous_active_version = (
-    SELECT ingestion_jobs.previous_active_version
-    FROM ingestion_jobs
-    WHERE ingestion_jobs.job_id = document_builds.owner_job_id
-)
-WHERE previous_active_version IS NULL;

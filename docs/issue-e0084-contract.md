@@ -66,13 +66,16 @@ beyond the three P1 state-transition gaps below.
 - `publish` reads the persisted `previous_active_version`; a replacement job
   taking over a post-commit-failed build now inherits the true replaced version
   (`v1`) and deprecates its data plane correctly.
-- **Upgrade backfill:** migration `006` ends with a one-time `UPDATE
-  document_builds SET previous_active_version = (SELECT
-  ingestion_jobs.previous_active_version ...) WHERE previous_active_version IS NULL`,
-  so an E-008.3 database upgraded in place copies the per-job replaced version
-  onto the (already-claimed) lease it owns. Without it, a post-commit-failed
-  build taken over after upgrade would recompute the replaced version against the
-  already-switched active version and fail to clean the true prior data plane.
+- **Upgrade backfill (separate migration):** the one-time backfill
+  `UPDATE document_builds SET previous_active_version = (SELECT
+  ingestion_jobs.previous_active_version ...) WHERE previous_active_version IS NULL`
+  lives in a **NEW** migration `008_e0084_lease_previous_version_backfill.sql`,
+  NOT inside the already-published `006`. A database that already deployed `006`
+  records it as applied, so the migrator **skips** a modified `006` and the
+  backfill would never run on upgrade — placing it in `008` guarantees it
+  executes for already-upgraded databases. Idempotent (only fills NULL rows);
+  safe on a fresh database (no rows) and on rows already populated by
+  `acquire_job` (non-NULL → untouched).
 
 ### P1-3 — Execution attempt is DB-backed (cross-process serialization)
 - `document_builds` gains `attempt_id TEXT` + `claimed_at TEXT`
@@ -90,8 +93,19 @@ beyond the three P1 state-transition gaps below.
   `recover=True` to `acquire_job`, which advances the generation and resumes.
   Implicit (non-recover) re-acquire of a RUNNING same-`job_id` lease is
   rejected — the contract no longer auto-interprets any same-`job_id` re-call
-  as a recovery. A **terminal** (failed/succeeded/cancelled) same-`job_id`
-  lease is a safe recovery and resumes without `recover=True`.
+  as a recovery. A **terminal** same-`job_id` lease (build-lease status
+  `'done'` for a succeeded job, or `'failed'`) is a safe recovery and resumes
+  without `recover=True`. NOTE: `mark_job_terminal` only synchronizes
+  `SUCCEEDED`/`FAILED` to the build-lease status; `CANCELLED` is **not** a
+  build-lease terminal state and is not currently handled as one.
+- `recover=True` is a **force recovery**: it should only be called once the
+  prior execution attempt is known to have stopped (the old worker is dead or
+  confirmed halted). Parent/Qdrant writes do NOT themselves re-check ownership;
+  ownership is asserted at commit/publish/compensate. If the old process is
+  merely paused and resumes, a concurrent `recover=True` can race on the
+  deterministic data plane. This is the operational precondition for using
+  `recover=True` (M1; a lease timeout/heartbeat would remove the need and is
+  explicitly out of scope).
 - The in-process guard (`_claim_build_guard` / `_release_build_guard`) is
   retained as an extra layer for genuine same-process concurrency; the DB-level
   `attempt_id` is the authoritative execution-attempt owner. Cross-process
@@ -103,12 +117,18 @@ beyond the three P1 state-transition gaps below.
   - `test_build_attempt_rejects_duplicate_execution_for_same_job_id` (P1-3
     DB-level attempt: duplicate RUNNING same-`job_id` rejected; `recover=True`
     advances).
-  - `test_migration_006_backfills_previous_version_on_upgrade` (P1-2 upgrade
-    backfill + post-upgrade takeover inherits the true replaced version).
+  - `test_migration_008_backfills_on_real_upgrade_from_deployed_026190f` (P1-2
+    real upgrade path: migrator skips `006`, runs `008` backfill; post-upgrade
+    takeover inherits the true replaced version).
+  - `test_acquire_resumes_terminal_succeeded_lease_without_recover` (P1-3
+    terminal `'done'` lease resumes without `recover=True`; no `JobStatus`
+    coercion crash).
 - `tests/integration/test_e008_crash_points.py`:
   - `test_deprecated_version_redelivery_is_idempotent` (P1-1)
   - `test_takeover_after_publish_failure_keeps_true_previous_version` (P1-2)
   - `test_same_job_id_concurrent_delivery_is_serialized` (P1-3 in-process)
+  - `test_upgrade_008_backfill_then_takeover_cleans_old_data_plane` (P1-2 full
+    pipeline: real upgrade → backfill → takeover → publish cleans old data plane)
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` all green.
 
