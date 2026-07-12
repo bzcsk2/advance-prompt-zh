@@ -141,3 +141,39 @@ ruff check src/agentic_rag_enterprise tests
 mypy src/agentic_rag_enterprise
 python -m pytest -q
 ```
+
+## Closure patch (`5828ca1`)
+
+Audit verdict on baseline `79a2cb7`: **CONDITIONAL FAIL** — functional happy path
+passes, but three P1 blockers plus one concurrency gap block formal closure. The
+closure patch is a narrow, plan-mandated fix (baseline kept intact; no upstream
+modifications). Findings and resolutions:
+
+- **P1-1 — Delete/update ordering.** `delete()` only flipped `status`; it did not
+  advance `lifecycle_revision`. An in-flight `update` job holding a stale
+  `base_revision` could win its `commit_active_version` CAS after the delete and
+  resurrect a deleted document. Fix: new `MetadataStore.logical_delete` flips
+  `status=deleted` AND advances `lifecycle_revision` inside one `BEGIN IMMEDIATE`
+  transaction; `DocumentManager.delete` uses it. Re-running on an already-deleted
+  row is idempotent (no double bump).
+- **P1-2 — Parent Store isolation.** `deprecate_document`/`delete_document`/
+  `update_acl_document` matched only `(document_id, version)`, so a shared Parent
+  Store could cross-tenant/cross-corpus mutate. Fix: all three now match
+  `tenant_id`+`corpus_id`+`document_id`+`document_version`; `DocumentManager` call
+  sites pass the tenant/corpus.
+- **P1-3 — Write authorization.** `can_manage_document` only re-checked READ
+  access, so any reader could mutate. Fix: it now requires READ access AND
+  explicit ownership (named in the ACL allow lists) or admin break-glass.
+- **ACL-fencing concurrency gap.** `update_document_acl` preserved
+  `lifecycle_revision`, so an `update` job acquired before an ACL tighten could
+  publish a new version carrying the pre-tighten ACL. Fix: `update_document_acl`
+  now advances `lifecycle_revision`, so the stale job fails its commit CAS.
+
+Acceptance (all green): `tests/unit/test_parent_store.py` (cross-tenant/cross-
+corpus isolation), `tests/unit/test_document_manager.py`
+(`test_same_tenant_readable_but_not_owner_is_refused`,
+`test_delete_advances_revision_blocks_stale_in_flight_update`),
+`tests/unit/test_metadata_store.py` (`test_logical_delete_advances_revision_*
+`, `test_update_document_acl_advances_lifecycle_revision_for_fencing`),
+`tests/integration/test_e010_lifecycle_e2e.py`, `tests/security/
+test_e010_authorization.py`, full `pytest` (357), `ruff`, `mypy`.
