@@ -177,3 +177,44 @@ corpus isolation), `tests/unit/test_document_manager.py`
 `, `test_update_document_acl_advances_lifecycle_revision_for_fencing`),
 `tests/integration/test_e010_lifecycle_e2e.py`, `tests/security/
 test_e010_authorization.py`, full `pytest` (357), `ruff`, `mypy`.
+
+## Closure patch v2 (`5016bfa`)
+
+Second review of `5828ca1` returned **CONDITIONAL FAIL** on a residual race
+window. P1-2 (Parent Store isolation) and P1-3 (write-auth owner check) were
+affirmed PASS; the delete/update and ACL/update revision fences (P1-1 / ACL-
+fencing gap) were only PARTIAL: `delete()` and `tighten_acl()` still propagated
+the data plane (Qdrant `status` flip / Parent Store) and the ACL payload
+**before** the Metadata DB `lifecycle_revision` bump. An in-flight `update` job
+that captured `base_revision` before the delete/tighten could therefore still
+commit its active version and resurrect a deleted document or publish a
+pre-tighten ACL. v2 is a narrow, plan-mandated fix (baselines `79a2cb7` and
+`5828ca1` kept intact; no upstream modifications). Resolutions:
+
+- **Control-plane-first atomicity (delete + tighten).** `MetadataStore.logical_delete`
+  now resolves the *target* version INSIDE `BEGIN IMMEDIATE`; if the passed
+  `version` is no longer the active version (superseded by a concurrent update),
+  it flips the **currently active** version instead, so the fence always protects
+  the live document. `update_document_acl` now verifies inside the same
+  transaction that the row is still `status='active'` before bumping the
+  revision; a concurrent delete makes the ACL patch a no-op (idempotent on
+  already-deleted rows). Both bump `lifecycle_revision` **before** any data-plane
+  effect.
+- **Job ordering (delete / tighten_acl).** `DocumentManager.delete` and
+  `tighten_acl` now apply the control-plane revision bump **FIRST**
+  (`logical_delete` / `update_document_acl`), then propagate idempotently to
+  Qdrant + Parent Store. An in-flight `update` that commits after the bump hits
+  `commit_active_version`'s CAS and fails with `ActiveVersionConflict`, so it
+  cannot resurrect a deleted document or publish a pre-tighten ACL.
+- **ACL-widening guard.** `security/policy.py` adds `is_acl_tightening(old, new)`,
+  which returns `True` only when the new ACL is not a widening (no added allowed
+  principal, no removed denied entry, no `restricted -> tenant` scope change, no
+  less-restrictive `security_level`). `DocumentManager.tighten_acl` raises
+  `DocumentMutationError` when the requested change would widen.
+
+Acceptance (all green): `tests/unit/test_document_manager.py`
+(`test_delete_control_plane_fence_blocks_in_flight_update`,
+`test_tighten_control_plane_fence_blocks_in_flight_update`,
+`test_tighten_rejects_widening`, `test_tighten_acl_patches_payloads_without_reembedding`
+rewritten for removal-style tightening), plus the prior P1/P2 suites;
+full `pytest` (362), `ruff`, `mypy`. **E-010 is now fully CLOSED.**
