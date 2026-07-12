@@ -1,5 +1,6 @@
 """Unit tests for MetadataStore (ingestion control-plane source of truth)."""
 
+import json
 import os
 import shutil
 import tempfile
@@ -681,5 +682,96 @@ def test_acquire_resumes_terminal_succeeded_lease_without_recover() -> None:
     )
     assert status == JobStatus.RUNNING
     assert generation == 2
+    store.close()
+    os.unlink(path)
+
+
+# --- E-010: document mutation control-plane API ---------------------------------
+
+
+def test_set_document_status_flips_and_records_deleted_at() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
+    store.set_document_status(
+        "t1", "eng", "d1", "v1", DocumentStatus.DELETED, deleted_at=_FIXED
+    )
+    doc = store.get_document("t1", "eng", "d1", "v1")
+    assert doc is not None
+    assert doc.status == DocumentStatus.DELETED
+    assert doc.deleted_at == _FIXED
+    store.close()
+    os.unlink(path)
+
+
+def test_set_document_status_idempotent() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
+    store.set_document_status("t1", "eng", "d1", "v1", DocumentStatus.DELETED, deleted_at=_FIXED)
+    # Re-asserting the same status must not raise and must keep the row deleted.
+    store.set_document_status("t1", "eng", "d1", "v1", DocumentStatus.DELETED, deleted_at=_FIXED)
+    assert store.get_document("t1", "eng", "d1", "v1").status == DocumentStatus.DELETED
+    store.close()
+    os.unlink(path)
+
+
+def test_list_document_versions_and_get_document_latest() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
+    store.upsert_document(_make_doc(version="v2", status=DocumentStatus.DEPRECATED))
+    assert set(store.list_document_versions("t1", "eng", "d1")) == {"v1", "v2"}
+    latest = store.get_document_latest("t1", "eng", "d1")
+    assert latest is not None
+    assert latest.version in {"v1", "v2"}
+    store.close()
+    os.unlink(path)
+
+
+def test_delete_document_removes_all_versions_and_is_idempotent() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
+    store.upsert_document(_make_doc(version="v2", status=DocumentStatus.DEPRECATED))
+    store.delete_document("t1", "eng", "d1")
+    assert store.get_document("t1", "eng", "d1", "v1") is None
+    assert store.get_document("t1", "eng", "d1", "v2") is None
+    # Purging an already-absent document is a no-op.
+    store.delete_document("t1", "eng", "d1")
+    store.close()
+    os.unlink(path)
+
+
+def test_update_document_acl_preserves_lifecycle_revision() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
+    rev_before = store._conn.execute(  # noqa: SLF001
+        "SELECT lifecycle_revision FROM documents WHERE tenant_id='t1' AND corpus_id='eng' "
+        "AND document_id='d1' AND version='v1'"
+    ).fetchone()["lifecycle_revision"]
+    store.update_document_acl(
+        "t1", "eng", "d1", "v1",
+        security_level="secret",
+        acl_scope="restricted",
+        allowed_user_ids=["u9"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
+    )
+    row = store._conn.execute(  # noqa: SLF001
+        "SELECT lifecycle_revision, security_level, acl_scope, allowed_user_ids "
+        "FROM documents WHERE tenant_id='t1' AND corpus_id='eng' AND document_id='d1' AND version='v1'"
+    ).fetchone()
+    assert row["lifecycle_revision"] == rev_before  # monotonic revision untouched
+    assert row["security_level"] == "secret"
+    assert row["acl_scope"] == "restricted"
+    assert json.loads(row["allowed_user_ids"]) == ["u9"]
     store.close()
     os.unlink(path)

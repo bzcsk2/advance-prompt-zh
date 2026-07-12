@@ -54,5 +54,30 @@ class ParentStore:
         metadata["deprecated"] = True
         self._store[parent_id] = chunk.model_copy(update={"metadata": metadata})
 
+    def deprecate_document(self, document_id: str, document_version: str) -> None:
+        """Logical-delete every parent of one (document, version). Idempotent."""
+        for chunk in list(self._store.values()):
+            if chunk.document_id == document_id and chunk.document_version == document_version:
+                self.deprecate(chunk.parent_id)
+
+    def delete_document(self, document_id: str, document_version: str) -> None:
+        """Physical-purge every parent of one (document, version). Idempotent."""
+        for chunk in list(self._store.values()):
+            if chunk.document_id == document_id and chunk.document_version == document_version:
+                self.delete(chunk.parent_id)
+
+    def update_acl_document(
+        self, document_id: str, document_version: str, acl_fields: dict[str, object]
+    ) -> None:
+        """Patch ACL metadata on every parent of one (document, version).
+
+        No content/vector change; used by ACL tightening (§10.7).
+        """
+        for chunk in list(self._store.values()):
+            if chunk.document_id == document_id and chunk.document_version == document_version:
+                metadata = dict(chunk.metadata)
+                metadata.update(acl_fields)
+                self._store[chunk.parent_id] = chunk.model_copy(update={"metadata": metadata})
+
     def __contains__(self, parent_id: str) -> bool:
         return parent_id in self._store

@@ -28,8 +28,9 @@ from agentic_rag_enterprise.domain.ingestion import (
     IngestionManifest,
     JobStatus,
 )
+from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.ingestion.chunker import ChildChunk, ParentChildChunker, ParentChunk
-from agentic_rag_enterprise.security.policy import ResourceAcl
+from agentic_rag_enterprise.security.policy import ResourceAcl, can_manage_document
 from agentic_rag_enterprise.storage.metadata_store import (
     ActiveVersionConflict,
     BuildConflict,
@@ -92,6 +93,14 @@ class IngestionStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     FAILED = "failed"
     BUILD_CONFLICT = "build_conflict"
+
+
+class DocumentMutationError(Exception):
+    """Raised when a document mutation (update/delete/purge/ACL) is refused.
+
+    Fail-closed: covers missing documents, unauthorized callers, and purging a
+    document that has not first been logically deleted (build plan §10.6/§10.7).
+    """
 
 
 @dataclass
@@ -951,3 +960,183 @@ class DocumentManager:
             request=request,
         )
         return job.run(max_step=max_step, recover=recover)
+
+    # ------------------------------------------------------------------ #
+    # Document mutation (build plan §10.4 / §10.6 / §10.7 / §3530)
+    # ------------------------------------------------------------------ #
+    def _resolve_active(self, ctx: SecurityContext, corpus_id: str, document_id: str) -> SourceDocument:
+        doc = self._store.get_active_document(ctx.tenant_id, corpus_id, document_id)
+        if doc is None:
+            raise DocumentMutationError(
+                f"no active document {document_id!r} in corpus {corpus_id!r}"
+            )
+        if not can_manage_document(ctx, doc):
+            raise DocumentMutationError(
+                f"caller not authorized to mutate document {document_id!r}"
+            )
+        return doc
+
+    def update(
+        self,
+        ctx: SecurityContext,
+        *,
+        corpus_id: str,
+        document_id: str,
+        content: str,
+        job_id: str,
+        document_version: Optional[str] = None,
+        acl: Optional[ResourceAcl] = None,
+        **meta: object,
+    ) -> IngestionResult:
+        """Content change -> new version via the idempotent ingest pipeline.
+
+        Reuses :meth:`ingest`; a new ``content`` yields a new version, which
+        switches the active version and deprecates the old one (E-008 machinery).
+        Unchanged content returns ``ALREADY_INDEXED`` (idempotent).
+        """
+        doc = self._resolve_active(ctx, corpus_id, document_id)
+        version = document_version or _sha256(content)
+        request = IngestionRequest(
+            tenant_id=doc.tenant_id,
+            corpus_id=corpus_id,
+            document_id=document_id,
+            document_version=version,
+            content=content,
+            acl=acl or _acl_from_doc(doc),
+            job_id=job_id,
+            title=doc.title,
+            source_uri=doc.source_uri,
+            source_connector=doc.source_connector,
+            source_native_id=doc.source_native_id,
+            source_filename=doc.source_filename,
+            mime_type=doc.mime_type,
+            acl_policy_id=doc.acl_policy_id,
+            parser_name=doc.parser_name,
+            parser_version=doc.parser_version,
+            chunking_version=doc.chunking_version,
+            embedding_model=doc.embedding_model,
+            embedding_version=doc.embedding_version,
+            authority_level=doc.authority_level,
+            security_level=doc.security_level,
+        )
+        for key, value in meta.items():
+            setattr(request, key, value)
+        return self.ingest(request)
+
+    def delete(self, ctx: SecurityContext, *, corpus_id: str, document_id: str) -> None:
+        """Logical delete (build plan §10.6): flip status to ``deleted`` across
+        the three planes IMMEDIATELY so retrieval filters with no dependency on a
+        background purge.
+
+        Resolves the latest version row (not necessarily ``active``: a second
+        delete on an already-deleted document is an idempotent no-op). Order is
+        fail-safe: any plane can be re-asserted by a re-run without corruption.
+        """
+        doc = self._store.get_document_latest(ctx.tenant_id, corpus_id, document_id)
+        if doc is None:
+            raise DocumentMutationError(
+                f"no document {document_id!r} in corpus {corpus_id!r}"
+            )
+        if not can_manage_document(ctx, doc):
+            raise DocumentMutationError(
+                f"caller not authorized to mutate document {document_id!r}"
+            )
+        if doc.status == DocumentStatus.DELETED:
+            return  # already logically deleted: idempotent no-op
+        version = doc.version
+
+        point_ids = self._vector.list_point_ids_by_document(
+            corpus_id, doc.tenant_id, corpus_id, document_id, version
+        )
+        if point_ids:
+            self._vector.update_payload(
+                corpus_id, point_ids, {"status": "deleted", "deprecated": True}
+            )
+        self._parents.deprecate_document(document_id, version)
+        self._store.set_document_status(
+            doc.tenant_id, corpus_id, document_id, version,
+            DocumentStatus.DELETED, deleted_at=_now(),
+        )
+
+    def purge(self, ctx: SecurityContext, *, corpus_id: str, document_id: str) -> None:
+        """Physical purge (build plan §10.6): remove the document's data plane.
+
+        Refuses to purge a document that has not first been logically deleted
+        (``delete`` must run first). Scoped strictly to the target document's
+        version(s); re-running on an already-purged document is a no-op.
+        """
+        doc = self._store.get_document_latest(ctx.tenant_id, corpus_id, document_id)
+        if doc is None:
+            return  # already purged: idempotent no-op
+        if not can_manage_document(ctx, doc):
+            raise DocumentMutationError(
+                f"caller not authorized to purge document {document_id!r}"
+            )
+        if doc.status != DocumentStatus.DELETED:
+            raise DocumentMutationError(
+                f"refuse to purge non-deleted document {document_id!r}; call delete() first"
+            )
+        for version in self._store.list_document_versions(ctx.tenant_id, corpus_id, document_id):
+            point_ids = self._vector.list_point_ids_by_document(
+                corpus_id, doc.tenant_id, corpus_id, document_id, version
+            )
+            if point_ids:
+                self._vector.delete(corpus_id, point_ids)
+            self._parents.delete_document(document_id, version)
+            self._store.delete_chunk_records(doc.tenant_id, corpus_id, document_id, version)
+        self._store.delete_document(doc.tenant_id, corpus_id, document_id)
+
+    def tighten_acl(
+        self,
+        ctx: SecurityContext,
+        *,
+        corpus_id: str,
+        document_id: str,
+        acl: ResourceAcl,
+    ) -> None:
+        """ACL tightening without content change (build plan §10.7).
+
+        Patchs the ACL payload on Qdrant points, parent-store metadata, and the
+        Metadata DB row. No re-embedding occurs (payload-only). The new ACL fully
+        replaces the old one; deny precedence is enforced by the canonical PDP
+        (``evaluate_access``), so tightening is automatically prioritized over
+        any widening it implies.
+        """
+        doc = self._resolve_active(ctx, corpus_id, document_id)
+        version = doc.version
+        acl_fields: dict[str, object] = {
+            "security_level": acl.security_level,
+            "acl_scope": acl.acl_scope,
+            "allowed_user_ids": acl.allowed_user_ids,
+            "allowed_group_ids": acl.allowed_group_ids,
+            "denied_user_ids": acl.denied_user_ids,
+            "denied_group_ids": acl.denied_group_ids,
+        }
+
+        point_ids = self._vector.list_point_ids_by_document(
+            corpus_id, doc.tenant_id, corpus_id, document_id, version
+        )
+        if point_ids:
+            self._vector.update_payload(corpus_id, point_ids, acl_fields)
+        self._parents.update_acl_document(document_id, version, acl_fields)
+        self._store.update_document_acl(
+            doc.tenant_id, corpus_id, document_id, version,
+            security_level=acl.security_level,
+            acl_scope=acl.acl_scope,
+            allowed_user_ids=acl.allowed_user_ids,
+            allowed_group_ids=acl.allowed_group_ids,
+            denied_user_ids=acl.denied_user_ids,
+            denied_group_ids=acl.denied_group_ids,
+        )
+
+
+def _acl_from_doc(doc: SourceDocument) -> ResourceAcl:
+    return ResourceAcl(
+        tenant_id=doc.tenant_id,
+        security_level=doc.security_level,
+        acl_scope=doc.acl_scope,
+        allowed_user_ids=doc.allowed_user_ids,
+        allowed_group_ids=doc.allowed_group_ids,
+        denied_user_ids=doc.denied_user_ids,
+        denied_group_ids=doc.denied_group_ids,
+    )

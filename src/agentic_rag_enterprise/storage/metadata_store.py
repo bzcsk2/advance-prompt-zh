@@ -881,6 +881,122 @@ class MetadataStore:
             (tenant_id, corpus_id, document_id, document_version),
         )
 
+    def set_document_status(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        version: str,
+        status: DocumentStatus,
+        deleted_at: Optional[datetime] = None,
+    ) -> None:
+        """Logical delete / lifecycle flip of a single (document, version) row.
+
+        Idempotent: re-asserting the same status is a no-op. When ``status`` is
+        ``DELETED`` the ``deleted_at`` timestamp is recorded (``SourceDocument``
+        requires it). Other callers may pass ``deleted_at`` for non-deleted
+        transitions too without effect.
+        """
+        self._conn.execute(
+            "UPDATE documents SET status=?, deleted_at=? "
+            "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
+            (
+                status.value,
+                deleted_at.isoformat() if deleted_at else None,
+                tenant_id,
+                corpus_id,
+                document_id,
+                version,
+            ),
+        )
+
+    def get_document_latest(
+        self, tenant_id: str, corpus_id: str, document_id: str
+    ) -> Optional[SourceDocument]:
+        """Return the version row with the highest ``lifecycle_revision``.
+
+        Unlike :meth:`get_active_document`, this ignores status, so a logically
+        deleted document can still be resolved (for authorize-then-purge).
+        """
+        row = self._conn.execute(
+            "SELECT * FROM documents WHERE tenant_id=? AND corpus_id=? AND document_id=? "
+            "ORDER BY lifecycle_revision DESC, rowid DESC LIMIT 1",
+            (tenant_id, corpus_id, document_id),
+        ).fetchone()
+        return self._row_to_document(row) if row else None
+
+    def list_document_versions(
+        self, tenant_id: str, corpus_id: str, document_id: str
+    ) -> list[str]:
+        """All version rows for a document (active, deprecated, failed, deleted)."""
+        rows = self._conn.execute(
+            "SELECT version FROM documents WHERE tenant_id=? AND corpus_id=? AND document_id=?",
+            (tenant_id, corpus_id, document_id),
+        ).fetchall()
+        return [r["version"] for r in rows]
+
+    def update_document_acl(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        version: str,
+        *,
+        security_level: str,
+        acl_scope: str,
+        allowed_user_ids: list[str],
+        allowed_group_ids: list[str],
+        denied_user_ids: list[str],
+        denied_group_ids: list[str],
+    ) -> None:
+        """Patch only the ACL columns of one (document, version) row.
+
+        Targeted UPDATE (not a full upsert) so the monotonic ``lifecycle_revision``
+        is never disturbed by an ACL change (build plan §10.7, no re-embedding).
+        """
+        self._conn.execute(
+            "UPDATE documents SET security_level=?, acl_scope=?, "
+            "allowed_user_ids=?, allowed_group_ids=?, denied_user_ids=?, denied_group_ids=? "
+            "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
+            (
+                security_level,
+                acl_scope,
+                _as_json_list(allowed_user_ids),
+                _as_json_list(allowed_group_ids),
+                _as_json_list(denied_user_ids),
+                _as_json_list(denied_group_ids),
+                tenant_id,
+                corpus_id,
+                document_id,
+                version,
+            ),
+        )
+
+    def delete_document(self, tenant_id: str, corpus_id: str, document_id: str) -> None:
+        """Physical purge: remove every version row for a document. Idempotent.
+
+        Child build/job rows that reference ``documents`` are removed first so the
+        foreign-key constraint is not violated.
+        """
+        self._conn.execute(
+            "DELETE FROM document_builds WHERE tenant_id=? AND corpus_id=? AND document_id=?",
+            (tenant_id, corpus_id, document_id),
+        )
+        self._conn.execute(
+            "DELETE FROM job_steps WHERE job_id IN ("
+            "SELECT job_id FROM ingestion_jobs "
+            "WHERE tenant_id=? AND corpus_id=? AND document_id=?)",
+            (tenant_id, corpus_id, document_id),
+        )
+        self._conn.execute(
+            "DELETE FROM ingestion_jobs WHERE tenant_id=? AND corpus_id=? AND document_id=?",
+            (tenant_id, corpus_id, document_id),
+        )
+        self._conn.execute(
+            "DELETE FROM documents WHERE tenant_id=? AND corpus_id=? AND document_id=?",
+            (tenant_id, corpus_id, document_id),
+        )
+
     # ------------------------------------------------------------------ #
     # Row <-> model mapping
     # ------------------------------------------------------------------ #

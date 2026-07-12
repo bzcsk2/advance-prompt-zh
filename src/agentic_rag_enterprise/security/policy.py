@@ -23,6 +23,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from agentic_rag_enterprise.domain.document import SourceDocument
 from agentic_rag_enterprise.domain.security import SecurityContext
 
 
@@ -90,6 +91,30 @@ def can_discover_corpus(ctx: SecurityContext, corpus_id: str) -> bool:
     if ctx.allowed_corpus_ids is None:
         return True
     return corpus_id in ctx.allowed_corpus_ids
+
+
+def can_manage_document(ctx: SecurityContext, doc: SourceDocument) -> bool:
+    """Write-authorization for document mutation (update/delete/purge/ACL).
+
+    Fail-closed: a caller may mutate a document only if it is in their tenant,
+    the corpus is discoverable to them, AND they can already read the document
+    (the canonical PDP allows the document's ACL for ``ctx``). Cross-tenant and
+    non-discoverable corpora are denied outright (build plan §10.6/§10.7).
+    """
+    if ctx.tenant_id != doc.tenant_id:
+        return False
+    if not can_discover_corpus(ctx, doc.corpus_id):
+        return False
+    acl = ResourceAcl(
+        tenant_id=doc.tenant_id,
+        security_level=doc.security_level,
+        acl_scope=doc.acl_scope,
+        allowed_user_ids=doc.allowed_user_ids,
+        allowed_group_ids=doc.allowed_group_ids,
+        denied_user_ids=doc.denied_user_ids,
+        denied_group_ids=doc.denied_group_ids,
+    )
+    return evaluate_access(ctx, acl) is AuthorizationDecision.ALLOW
 
 
 class AccessPolicy:

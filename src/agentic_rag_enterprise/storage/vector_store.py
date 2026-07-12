@@ -17,9 +17,11 @@ from uuid import NAMESPACE_URL, uuid5
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
+    FieldCondition,
     Filter,
     Fusion,
     FusionQuery,
+    MatchValue,
     PointIdsList,
     PointStruct,
     Prefetch,
@@ -96,6 +98,58 @@ class VectorStore:
                 collection_name=name,
                 points_selector=PointIdsList(points=point_ids),  # type: ignore[arg-type]
             )
+
+    def update_payload(self, name: str, point_ids: list[str], payload: dict) -> None:
+        """Patch payload fields on existing points WITHOUT touching vectors.
+
+        Used by ACL tightening (build plan §10.7): the ACL changes but the
+        content does not, so re-embedding must never happen. The point's vector
+        is left untouched by ``set_payload``.
+        """
+        if point_ids:
+            self._client.set_payload(
+                collection_name=name,
+                payload=payload,
+                points=PointIdsList(points=point_ids),  # type: ignore[arg-type]
+            )
+
+    def list_point_ids_by_document(
+        self,
+        name: str,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        document_version: str,
+        batch: int = 256,
+    ) -> list[str]:
+        """Return every point id belonging to one (document, version).
+
+        Scoped strictly by tenant/corpus/document/version so a mutation can never
+        address another document's data plane. Used for logical delete / purge /
+        ACL tightening.
+        """
+        scroll_filter = Filter(
+            must=[
+                FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+                FieldCondition(key="corpus_id", match=MatchValue(value=corpus_id)),
+                FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+                FieldCondition(key="document_version", match=MatchValue(value=document_version)),
+            ]
+        )
+        ids: list[str] = []
+        offset: object = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=name,
+                scroll_filter=scroll_filter,
+                with_payload=False,
+                limit=batch,
+                offset=offset,  # type: ignore[arg-type]
+            )
+            ids.extend(str(p.id) for p in points)
+            if offset is None:
+                break
+        return ids
 
     def search(
         self,
