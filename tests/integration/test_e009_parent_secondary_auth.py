@@ -108,8 +108,18 @@ def test_result_does_not_leak_parent_existence() -> None:
 
     result = _run(store, pstore)
 
+    # Internal observability is preserved (telemetry path).
+    assert result.denied_reasons["PARENT_NOT_FOUND"] > 0
+
+    # But serialization must NOT carry the denial reasons nor any per-parent id
+    # (build plan §12.9: avoid leaking whether an unauthorized resource exists).
     dumped = result.model_dump()
-    assert set(dumped) == {"hits", "denied_parent_count", "denied_reasons"}
+    assert set(dumped) == {"hits", "denied_parent_count"}
+    assert "denied_reasons" not in dumped
+    assert "PARENT_NOT_FOUND" not in result.model_dump_json()
+    assert "PARENT_NOT_AUTHORIZED" not in result.model_dump_json()
+    assert "DOCUMENT_DELETED" not in result.model_dump_json()
+    assert "VERSION_MISMATCH" not in result.model_dump_json()
     assert dumped["hits"] == []
     for value in _parent_ids(children):
         assert value not in repr(dumped)

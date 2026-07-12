@@ -16,6 +16,15 @@ capability-completion commit. Scope is a strict subset of the M1 retrieval/stora
 paths (`retrieval/`, `storage/`, `security/`, `tests/...`, `docs/`,
 `AGENTS.md`); no upstream modifications, no `config.py`/`domain/` changes.
 
+### Closure patch (audit verdict: CONDITIONAL FAIL)
+Review of `74c298d` found `RetrievalResult.denied_reasons` was a plain public
+Pydantic field, so `model_dump()`/`model_dump_json()` serialized the §12.9 codes to
+the end user — violating the E-009 contract ("non-user-exposed") and build plan §12.9
+("avoid leaking existence"). Fix: `denied_reasons` is now `Field(default_factory=dict,
+exclude=True)` — excluded from all serialization, still readable internally for
+telemetry. The integration test asserts `model_dump()` omits `denied_reasons` and the
+JSON form contains none of the §12.9 codes. `74c298d` is NOT rolled back.
+
 ## Goal
 Make the parent store readable **only** through the authorized second-auth path, and
 classify every parent-auth denial with the §12.9 code — without ever leaking to the

@@ -71,7 +71,10 @@ class RetrievalResult(BaseModel):
 
     hits: list[tuple[RetrievalHit, AuthorizedParent]] = Field(default_factory=list)
     denied_parent_count: int = 0
-    denied_reasons: dict[str, int] = Field(default_factory=dict)
+    # §12.9 telemetry only. ``exclude=True`` keeps it out of any serialized
+    # output so the end user never learns whether/why an unauthorized resource
+    # exists. Read the attribute directly for internal observability.
+    denied_reasons: dict[str, int] = Field(default_factory=dict, exclude=True)
 
 
 class ParentAuthorizationError(Exception):

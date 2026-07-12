@@ -12,7 +12,7 @@
 - Issue: **E-008.2** — Audit-remediation of E-008.1 (real-crash + concurrency windows) — CLOSED at this commit; full contract at `docs/issue-e0082-contract.md`.
 - Issue: **E-008.3** — Audit-remediation of E-008.2 (lease-ownership + verify precision) — CLOSED at `b7012cb`; full contract at `docs/issue-e0083-contract.md`.
 - Issue: **E-008.4** — Audit-remediation of E-008.3 (state-transition gaps: deprecated-version idempotency, `previous_active_version` transfer across takeover, same-`job_id` concurrency) — CLOSED at this commit; full contract at `docs/issue-e0084-contract.md`.
-- Issue: **E-009** — Add parent-store secondary authorization (M1): complete §12.5 Parent 二次权限校验 + §12.9 distinct failure semantics (`PARENT_NOT_FOUND`/`PARENT_NOT_AUTHORIZED`/`DOCUMENT_DELETED`/`VERSION_MISMATCH`), no un-authorized direct read. CLOSED at this commit; full contract at `docs/issue-e009-contract.md`.
+- Issue: **E-009** — Add parent-store secondary authorization (M1): complete §12.5 Parent 二次权限校验 + §12.9 distinct failure semantics (`PARENT_NOT_FOUND`/`PARENT_NOT_AUTHORIZED`/`DOCUMENT_DELETED`/`VERSION_MISMATCH`), no un-authorized direct read. CLOSED at `74c298d`; closure patch CLOSED at this commit — `RetrievalResult.denied_reasons` marked `Field(exclude=True)` so §12.9 telemetry is never serialized to the user (build plan §12.9 "avoid leaking existence"). Full contract at `docs/issue-e009-contract.md`.
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
 
 > **AGENTS.md is a slim entry point** (build plan §1.7): current Milestone/Issue, fixed
