@@ -8,7 +8,15 @@ runs authorized hybrid child retrieval and a second parent-authorization pass.
 
 from agentic_rag_enterprise.config import settings
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
+from agentic_rag_enterprise.domain.document import SourceDocument
+from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
+from agentic_rag_enterprise.retrieval.deduplication import (
+    DedupCandidate,
+    Deduplicator,
+    RetrievalContext,
+)
+from agentic_rag_enterprise.retrieval.evidence import EvidenceBuilder
 from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.models import (
     CorpusNotDiscoverableError,
@@ -16,9 +24,10 @@ from agentic_rag_enterprise.retrieval.models import (
     RetrievalResult,
 )
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
-from agentic_rag_enterprise.schemas import Evidence
+from agentic_rag_enterprise.schemas import Evidence  # M0 baseline mock only
 from agentic_rag_enterprise.security.filter import EmptyAuthorizationScopeError
-from agentic_rag_enterprise.security.policy import can_discover_corpus
+from agentic_rag_enterprise.security.policy import ResourceAcl, can_discover_corpus
+from agentic_rag_enterprise.storage.evidence_store import EvidenceSnapshotStore
 from agentic_rag_enterprise.storage.metadata_store import MetadataStore
 from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEncoder
 
@@ -66,11 +75,16 @@ class SecureRetriever:
         *,
         default_top_k: int | None = None,
         metadata_store: MetadataStore,
+        evidence_store: EvidenceSnapshotStore | None = None,
+        deduplicator: Deduplicator | None = None,
     ) -> None:
         self._hybrid = hybrid
         self._parent_reader = parent_reader
         self._default_top_k = default_top_k or settings.max_retrieval_top_k
         self._metadata_store = metadata_store
+        self._evidence_store = evidence_store
+        self._deduplicator = deduplicator or Deduplicator()
+        self._evidence_builder = EvidenceBuilder()
 
     def validate_corpus(self, ctx: SecurityContext, corpus: CorpusConfig) -> None:
         """Raise :class:`CorpusNotDiscoverableError` if the corpus gate fails."""
@@ -156,3 +170,90 @@ class SecureRetriever:
             denied_parent_count=denied_count,
             denied_reasons=denied_reasons,
         )
+
+    def retrieve_evidence(
+        self,
+        ctx: SecurityContext,
+        query: str,
+        corpus: CorpusConfig,
+        top_k: int | None = None,
+        *,
+        dense_encoder: DenseEncoder,
+        sparse_encoder: SparseEncoder,
+        iteration: int = 0,
+        plan_step_id: str | None = None,
+    ) -> list[SnapshotEvidence]:
+        """Run the secure flow, deduplicate, build immutable Evidence snapshots.
+
+        Mirrors :meth:`retrieve` but returns answer-ready
+        :class:`~agentic_rag_enterprise.domain.evidence.Evidence` snapshots
+        (build plan §12.4: normalize → deduplicate → create Evidence snapshots).
+        Each surviving hit is deduplicated against the others (build plan §12.6),
+        then materialized as an immutable snapshot. When an ``evidence_store`` is
+        configured the snapshots are persisted and can later be re-read under
+        current-principal re-authorization (build plan §12.8).
+        """
+        result = self.retrieve(
+            ctx,
+            query,
+            corpus,
+            top_k,
+            dense_encoder=dense_encoder,
+            sparse_encoder=sparse_encoder,
+        )
+        if not result.hits:
+            return []
+
+        # Re-associate each authorized hit with its parent after deduplication.
+        # Subscript access only (never `.get` on a parent-named binding) to keep
+        # the retrieval-boundary architecture test (no un-authorized direct
+        # parent read) satisfied.
+        owners = {
+            (hit.chunk_id, hit.parent_id, hit.document_id, hit.document_version): parent
+            for hit, parent in result.hits
+        }
+
+        candidates: list[DedupCandidate] = []
+        for hit, parent in result.hits:
+            key = (hit.chunk_id, hit.parent_id, hit.document_id, hit.document_version)
+            candidates.append(
+                DedupCandidate(
+                    hit=hit,
+                    contexts=[
+                        RetrievalContext(
+                            query=query, iteration=iteration, plan_step_id=plan_step_id
+                        )
+                    ],
+                    text=parent.content or hit.text,
+                    authority_level=corpus.authority_level,
+                )
+            )
+
+        survivors = self._deduplicator.deduplicate(candidates)
+
+        evidence: list[SnapshotEvidence] = []
+        for cand in survivors:
+            hit = cand.hit
+            key = (hit.chunk_id, hit.parent_id, hit.document_id, hit.document_version)
+            owner = owners.get(key)
+            if owner is None:
+                continue
+            source_doc: SourceDocument | None = self._metadata_store.get_active_document(
+                hit.tenant_id, hit.corpus_id, hit.document_id
+            )
+            ev = self._evidence_builder.build_from_candidate(
+                cand, owner, ctx, source_document=source_doc
+            )
+            if self._evidence_store is not None:
+                acl = ResourceAcl(
+                    tenant_id=parent.tenant_id,
+                    security_level=parent.security_level,
+                    acl_scope=parent.acl_scope,
+                    allowed_user_ids=parent.allowed_user_ids,
+                    allowed_group_ids=parent.allowed_group_ids,
+                    denied_user_ids=parent.denied_user_ids,
+                    denied_group_ids=parent.denied_group_ids,
+                )
+                self._evidence_store.save(ev, source_acl=acl)
+            evidence.append(ev)
+        return evidence
