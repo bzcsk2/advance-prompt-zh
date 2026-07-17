@@ -110,9 +110,7 @@ class Deduplicator:
         after_span = self._collapse(
             candidates, key=lambda c: (c.hit.document_id, c.hit.document_version, c.hit.chunk_id)
         )
-        after_parent = self._collapse(
-            after_span, key=lambda c: c.hit.parent_id
-        )
+        after_parent = self._collapse(after_span, key=lambda c: c.hit.parent_id)
         # Text pass may reorder winners by authority; handled inside _collapse.
         after_text = self._collapse_text(after_parent)
 
@@ -121,9 +119,7 @@ class Deduplicator:
 
     # -- internals --------------------------------------------------------
 
-    def _collapse(
-        self, candidates: list[DedupCandidate], *, key
-    ) -> list[DedupCandidate]:
+    def _collapse(self, candidates: list[DedupCandidate], *, key) -> list[DedupCandidate]:
         """Group by ``key`` keeping the highest-scoring survivor."""
         groups: dict[Any, DedupCandidate] = {}
         for cand in candidates:
@@ -146,33 +142,36 @@ class Deduplicator:
         groups: dict[str, DedupCandidate] = {}
         for cand in candidates:
             text_key = normalize_text(cand.text)
-            existing = self._find_text_match(groups, cand, text_key)
-            if existing is None:
+            match = self._find_text_match(groups, text_key)
+            if match is None:
                 groups[text_key] = cand
                 continue
+            matched_key, existing = match
             # Decide the winner for this text group.
             if self._is_better(cand, existing):
                 # cand wins: demote the old survivor into a duplicate source and
                 # re-home it as a merged entry under cand.
                 old = existing
                 self._fold(cand, old)
-                # Re-key the losing survivor out of the group map; the group now
-                # points at cand.
-                groups[text_key] = cand
+                # Keep the established group key. With fuzzy matching, text_key
+                # can differ from matched_key; inserting under text_key would
+                # leave the old survivor in the map and emit both duplicates.
+                groups[matched_key] = cand
                 # old may itself have carried duplicate sources — already folded.
             else:
                 self._fold(existing, cand)
         return list(groups.values())
 
     def _find_text_match(
-        self, groups: dict[str, DedupCandidate], cand: DedupCandidate, text_key: str
-    ) -> DedupCandidate | None:
+        self, groups: dict[str, DedupCandidate], text_key: str
+    ) -> tuple[str, DedupCandidate] | None:
         if self._threshold >= 1.0:
-            return groups.get(text_key)
+            existing = groups.get(text_key)
+            return (text_key, existing) if existing is not None else None
         cand_norm = text_key
         for key, existing in groups.items():
             if difflib.SequenceMatcher(None, key, cand_norm).ratio() >= self._threshold:
-                return existing
+                return key, existing
         return None
 
     @staticmethod

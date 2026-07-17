@@ -1,7 +1,7 @@
 # E-011 Issue Contract (M2) — Evidence snapshot store and deduplication
 
-First capability of Milestone 2 (Evidence, Fast Path, Grounded Answer, build
-plan §3532). Extends the E-007/E-009 retrieval chain so that, before a claim is
+First capability of Milestone 2 (single-corpus Internal MVP, build plan §22).
+Extends the E-007/E-009 retrieval chain so that, before a claim is
 cited, each surviving hit is (a) deduplicated against its siblings by span,
 same-parent, and near-duplicate text, and (b) frozen into an immutable
 `Evidence` snapshot that is independently re-authorized at read time. This is
@@ -34,9 +34,9 @@ collapsing redundant hits before they are cited.
 - **E-009** — parent-store secondary authorization (`ParentReader`). E-011
   reuses the already-authorized `AuthorizedParent` returned by `retrieve()` as
   the snapshot body source and the ACL summary for write-time save.
-- **build plan §12.4** — pipeline order: normalize → deduplicate → rerank →
-  authority/freshness → snapshot. E-011 owns the `deduplicate` and `snapshot`
-  stages (rerank/authority/freshness are later M2 issues).
+- **build plan §12.4** — target pipeline order. E-011 owns only the required
+  `deduplicate` and `snapshot` stages; rerank/authority/freshness remain deferred
+  beyond the Internal MVP unless a benchmark justifies them.
 - **build plan §12.6** — three deduplication dimensions: exact span,
   same-parent multi-child, near-duplicate text. E-011 implements all three as
   sequential collapse passes.
@@ -46,7 +46,7 @@ collapsing redundant hits before they are cited.
   auditors produce audit events.
 
 ## Non-goals (M2 only)
-- No reranker / authority / freshness stages (later M2 issues) — dedup runs on
+- No reranker / authority / freshness stages (later milestones) — dedup runs on
   the raw `retrieve()` hits and their `authority_level`/`score` only.
 - No claim-citation or grounded-answer composition (later M2 issues).
 - No new dependencies; the evidence store is SQLite-backed like `MetadataStore`.
@@ -76,16 +76,19 @@ collapsing redundant hits before they are cited.
    from the `SecurityContext`. This keeps the "snapshot, not a link" guarantee:
    the stored body never re-reads the document at read time.
 4. **Write-time save is idempotent** (`INSERT OR IGNORE` keyed on `evidence_id`)
-   and stores a source `ResourceAcl` summary so read-time re-auth has the ACL
-   that was in force at write time.
+   and stores the write-time source `ResourceAcl` summary for immutable audit
+   provenance. The historical ACL MUST NOT authorize a later read.
 5. **Read-time re-authorization levels: FULL / REDACTED / DENIED.**
-   `EvidenceSnapshotStore.get(evidence_id, ctx)`:
+   `EvidenceSnapshotStore` receives the Metadata DB's
+   `get_active_document` as `current_document_resolver`; `get(evidence_id, ctx)`:
    - cross-tenant → `DENIED` (no body);
-   - same tenant AND `can_discover_corpus` → `FULL`;
+   - same tenant AND current active SourceDocument ACL allows the principal AND
+     `can_discover_corpus` → `FULL`;
    - else if `audit:evidence:read` in `ctx.permissions` → `FULL` + an audit
      event via `audit_callback`;
    - else → `REDACTED` (body withheld via `_redact_evidence`, metadata retained).
-   Authorization is fail-closed: any missing principal field → `DENIED`.
+   A missing resolver, missing/deleted active document, ACL tightening, or denied
+   current ACL fails closed to `REDACTED`; the write-time ACL never grants access.
 6. **Fine-grained `audit:evidence:read` is a capability, not a role.**
    `SecurityContext.permissions: list[str]` was added so an auditor can be
    granted evidence read without implying `is_admin` blanket access
@@ -104,7 +107,8 @@ collapsing redundant hits before they are cited.
   `RetrievalContext`, `DedupCandidate`, `Deduplicator`.
 - `src/agentic_rag_enterprise/retrieval/evidence.py` (new) — `EvidenceBuilder`.
 - `src/agentic_rag_enterprise/storage/evidence_store.py` (new) —
-  `EvidenceSnapshotStore`, `EvidenceAccess`, `EvidenceAccessLevel`.
+  `EvidenceSnapshotStore`, `EvidenceAccess`, `EvidenceAccessLevel`; current
+  SourceDocument resolver is mandatory for ordinary `FULL` reads.
 - `migrations/009_e011_evidence_store.sql` (new) — `evidence_snapshots` +
   `evidence_audit_log` DDL, matching `apply_migrations`.
 - `src/agentic_rag_enterprise/retrieval/retriever.py` — add
@@ -127,6 +131,8 @@ collapsing redundant hits before they are cited.
 - No direct `.get` on a parent-named binding in `retrieve_evidence` (boundary).
 - No silent granting of evidence bodies: fail-closed; cross-tenant reads are
   `DENIED`; non-discoverable reads are `REDACTED` unless `audit:evidence:read`.
+- No authorization from the stored write-time ACL; ordinary reads MUST resolve
+  the current active SourceDocument and its current ACL.
 - No import of `retrieval.models` from `storage/evidence_store.py` (circular).
 - MUST NOT mutate a stored snapshot (immutable); `save` is `INSERT OR IGNORE`.
 
@@ -139,14 +145,17 @@ collapsing redundant hits before they are cited.
   owning principal; `save` is idempotent (`INSERT OR IGNORE`); cross-tenant
   `get` → `DENIED`; non-discoverable same-tenant with no audit grant →
   `REDACTED` (body withheld); `audit:evidence:read` permission → FULL + audit
-  event; snapshot is immutable (re-`save` of same id is a no-op); missing id →
-  `DENIED`; `count(tenant_id)` and `exists` correct.
+  event; ACL tightening and logical delete revoke ordinary body reads; missing
+  current-policy resolver fails closed; snapshot is immutable (re-`save` of
+  same id is a no-op); missing id → `DENIED`; `count(tenant_id)` and `exists`
+  correct.
 - `tests/integration/test_e011_evidence_pipeline.py` — reuses the E-007 harness
   (Qdrant `:memory:`, `ParentChildChunker`, `active_metadata_store`):
   `test_retrieve_evidence_persists_snapshots` confirms each surviving hit yields
   one persisted `Evidence`; `test_deduplication_collapses_same_parent_children`
-  confirms multiple children of one parent collapse to a single snapshot.
-- `tests/retrieval/test_retrieval_boundary.py` and E-007/E-009 tests MUST stay
+  confirms multiple children of one parent collapse to a single snapshot;
+  mixed-parent results persist each surviving parent's own ACL summary.
+- `tests/unit/test_retrieval_boundary.py` and E-007/E-009 tests MUST stay
   green (no regression from additive `retrieve_evidence`).
 - `tests/baseline/` MUST remain green (M0/M1/M2-baseline regression).
 - `ruff`, `mypy src/agentic_rag_enterprise`, and the E-011 + relevant regression
@@ -157,7 +166,7 @@ collapsing redundant hits before they are cited.
 # E-011 unit + integration
 python -m pytest tests/unit/test_deduplication.py tests/unit/test_evidence_store.py tests/integration/test_e011_evidence_pipeline.py -q
 # regression: retrieval boundary + E-007/E-009 (additive change must not break)
-python -m pytest tests/retrieval tests/integration/test_e007_secure_retrieval.py tests/security/test_e009_authorization.py -q
+python -m pytest tests/unit/test_retrieval_boundary.py tests/integration/test_e007_end_to_end.py tests/integration/test_e009_parent_secondary_auth.py tests/security/test_parent_reader.py -q
 # baseline must stay green
 python -m pytest tests/baseline/ -q
 # quality gates

@@ -11,6 +11,7 @@ from agentic_rag_enterprise.storage.evidence_store import (
     EvidenceAccessLevel,
     EvidenceSnapshotStore,
 )
+from tests.fixtures import active_metadata_store
 
 
 def _evidence(**overrides) -> Evidence:
@@ -68,10 +69,11 @@ def _acl(**overrides) -> ResourceAcl:
 
 
 def _store() -> EvidenceSnapshotStore:
+    metadata_store = active_metadata_store("t1", "eng", "doc1", "v1")
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     os.unlink(path)
-    return EvidenceSnapshotStore(path)
+    return EvidenceSnapshotStore(path, current_document_resolver=metadata_store.get_active_document)
 
 
 def test_save_then_get_full_when_authorized() -> None:
@@ -103,12 +105,25 @@ def test_cross_tenant_read_denied() -> None:
 
 
 def test_redacted_when_source_acl_revoked() -> None:
-    # Source ACL is restricted to a different user; the requester no longer has
-    # access. The body must be withheld but provenance preserved (§12.8).
-    store = _store()
-    store.save(
-        _evidence(),
-        source_acl=_acl(acl_scope="restricted", allowed_user_ids=["other"]),
+    metadata_store = active_metadata_store("t1", "eng", "doc1", "v1")
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)
+    store = EvidenceSnapshotStore(
+        path, current_document_resolver=metadata_store.get_active_document
+    )
+    store.save(_evidence(), source_acl=_acl())
+    metadata_store.update_document_acl(
+        "t1",
+        "eng",
+        "doc1",
+        "v1",
+        security_level="internal",
+        acl_scope="restricted",
+        allowed_user_ids=["other"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
     access = store.get("ev-1", _ctx(user_id="u1"))
     assert access.level is EvidenceAccessLevel.REDACTED
@@ -120,13 +135,30 @@ def test_redacted_when_source_acl_revoked() -> None:
 
 def test_audit_grant_reads_body_and_emits_event() -> None:
     events: list[dict] = []
+    metadata_store = active_metadata_store("t1", "eng", "doc1", "v1")
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     os.unlink(path)
-    store = EvidenceSnapshotStore(path, audit_callback=events.append)
+    store = EvidenceSnapshotStore(
+        path,
+        audit_callback=events.append,
+        current_document_resolver=metadata_store.get_active_document,
+    )
     store.save(
         _evidence(),
         source_acl=_acl(acl_scope="restricted", allowed_user_ids=["other"]),
+    )
+    metadata_store.update_document_acl(
+        "t1",
+        "eng",
+        "doc1",
+        "v1",
+        security_level="internal",
+        acl_scope="restricted",
+        allowed_user_ids=["other"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
     ctx = _ctx(user_id="u1", permissions=["audit:evidence:read"])
     access = store.get("ev-1", ctx)
@@ -152,3 +184,42 @@ def test_missing_evidence_denied() -> None:
     store = _store()
     access = store.get("nope", _ctx())
     assert access.level is EvidenceAccessLevel.DENIED
+
+
+def test_missing_current_policy_resolver_fails_closed() -> None:
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)
+    store = EvidenceSnapshotStore(path)
+    store.save(_evidence(), source_acl=_acl())
+
+    access = store.get("ev-1", _ctx())
+
+    assert access.level is EvidenceAccessLevel.REDACTED
+    assert access.evidence is not None
+    assert access.evidence.text == ""
+    assert access.reason == "current_policy_unavailable"
+
+
+def test_logically_deleted_source_is_redacted() -> None:
+    metadata_store = active_metadata_store("t1", "eng", "doc1", "v1")
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)
+    store = EvidenceSnapshotStore(
+        path, current_document_resolver=metadata_store.get_active_document
+    )
+    store.save(_evidence(), source_acl=_acl())
+    metadata_store.logical_delete(
+        "t1",
+        "eng",
+        "doc1",
+        "v1",
+        deleted_at=datetime.now(timezone.utc),
+    )
+
+    access = store.get("ev-1", _ctx())
+
+    assert access.level is EvidenceAccessLevel.REDACTED
+    assert access.evidence is not None
+    assert access.evidence.text == ""

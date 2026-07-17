@@ -9,6 +9,23 @@ directly.
 
 from agentic_rag_enterprise.retrieval.deduplication import Deduplicator
 from agentic_rag_enterprise.retrieval.evidence import EvidenceBuilder
+from agentic_rag_enterprise.retrieval.fast_path import (
+    FastPathBackendError,
+    FastPathResult,
+    FastPathStopReason,
+    FastPathSufficiency,
+    run_fast_path,
+)
 from agentic_rag_enterprise.retrieval.retriever import Retriever, SecureRetriever
 
-__all__ = ["Retriever", "SecureRetriever", "Deduplicator", "EvidenceBuilder"]
+__all__ = [
+    "Retriever",
+    "SecureRetriever",
+    "Deduplicator",
+    "EvidenceBuilder",
+    "run_fast_path",
+    "FastPathResult",
+    "FastPathSufficiency",
+    "FastPathStopReason",
+    "FastPathBackendError",
+]

@@ -77,6 +77,7 @@ class SecureRetriever:
         metadata_store: MetadataStore,
         evidence_store: EvidenceSnapshotStore | None = None,
         deduplicator: Deduplicator | None = None,
+        evidence_builder: EvidenceBuilder | None = None,
     ) -> None:
         self._hybrid = hybrid
         self._parent_reader = parent_reader
@@ -84,7 +85,7 @@ class SecureRetriever:
         self._metadata_store = metadata_store
         self._evidence_store = evidence_store
         self._deduplicator = deduplicator or Deduplicator()
-        self._evidence_builder = EvidenceBuilder()
+        self._evidence_builder = evidence_builder or EvidenceBuilder()
 
     def validate_corpus(self, ctx: SecurityContext, corpus: CorpusConfig) -> None:
         """Raise :class:`CorpusNotDiscoverableError` if the corpus gate fails."""
@@ -246,13 +247,13 @@ class SecureRetriever:
             )
             if self._evidence_store is not None:
                 acl = ResourceAcl(
-                    tenant_id=parent.tenant_id,
-                    security_level=parent.security_level,
-                    acl_scope=parent.acl_scope,
-                    allowed_user_ids=parent.allowed_user_ids,
-                    allowed_group_ids=parent.allowed_group_ids,
-                    denied_user_ids=parent.denied_user_ids,
-                    denied_group_ids=parent.denied_group_ids,
+                    tenant_id=owner.tenant_id,
+                    security_level=owner.security_level,
+                    acl_scope=owner.acl_scope,
+                    allowed_user_ids=owner.allowed_user_ids,
+                    allowed_group_ids=owner.allowed_group_ids,
+                    denied_user_ids=owner.denied_user_ids,
+                    denied_group_ids=owner.denied_group_ids,
                 )
                 self._evidence_store.save(ev, source_acl=acl)
             evidence.append(ev)

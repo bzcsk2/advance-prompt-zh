@@ -6,6 +6,7 @@ using the same real Qdrant + parent store harness as the E-007 tests.
 """
 
 import os
+import sqlite3
 import tempfile
 from datetime import datetime
 
@@ -17,7 +18,11 @@ from agentic_rag_enterprise.ingestion.chunker import ParentChildChunker, ParentC
 from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
-from agentic_rag_enterprise.retrieval.models import RetrievalResult
+from agentic_rag_enterprise.retrieval.models import (
+    AuthorizedParent,
+    RetrievalHit,
+    RetrievalResult,
+)
 from agentic_rag_enterprise.security.policy import ResourceAcl
 from agentic_rag_enterprise.storage.evidence_store import (
     EvidenceAccessLevel,
@@ -111,11 +116,11 @@ def _ingest(corpus_id: str, tenant_id: str, acl: dict, content: str = SAMPLE_MAR
     return store, pstore, parents, children
 
 
-def _evidence_store() -> EvidenceSnapshotStore:
+def _evidence_store(metadata_store) -> EvidenceSnapshotStore:
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     os.unlink(path)
-    return EvidenceSnapshotStore(path)
+    return EvidenceSnapshotStore(path, current_document_resolver=metadata_store.get_active_document)
 
 
 def test_retrieve_evidence_persists_snapshots() -> None:
@@ -125,12 +130,15 @@ def test_retrieve_evidence_persists_snapshots() -> None:
     fd, ev_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     os.unlink(ev_path)
-    evidence_store = EvidenceSnapshotStore(ev_path)
+    metadata_store = active_metadata_store("t1", "eng", "doc1", "v1")
+    evidence_store = EvidenceSnapshotStore(
+        ev_path, current_document_resolver=metadata_store.get_active_document
+    )
 
     retriever = SecureRetriever(
         _HybridSearchAdapter(store),
         ParentReader(pstore),
-        metadata_store=active_metadata_store("t1", "eng", "doc1", "v1"),
+        metadata_store=metadata_store,
         evidence_store=evidence_store,
     )
 
@@ -170,11 +178,12 @@ def test_deduplication_collapses_same_parent_children() -> None:
     store, pstore, _parents, children = _ingest("eng", "t1", acl, content=long_content)
     assert len(children) > 1, "fixture must produce multiple children to test dedup"
 
+    metadata_store = active_metadata_store("t1", "eng", "doc1", "v1")
     retriever = SecureRetriever(
         _HybridSearchAdapter(store),
         ParentReader(pstore),
-        metadata_store=active_metadata_store("t1", "eng", "doc1", "v1"),
-        evidence_store=_evidence_store(),
+        metadata_store=metadata_store,
+        evidence_store=_evidence_store(metadata_store),
     )
 
     raw: RetrievalResult = retriever.retrieve(
@@ -199,3 +208,83 @@ def test_deduplication_collapses_same_parent_children() -> None:
     # No two surviving evidence share the same parent (same-parent rule).
     parent_ids = [e.parent_id for e in evidence]
     assert len(parent_ids) == len(set(parent_ids))
+
+
+def test_each_snapshot_persists_its_own_parent_acl(monkeypatch) -> None:
+    acl = acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
+    vector_store, parent_store, _parents, _children = _ingest("eng", "t1", acl)
+    metadata_store = active_metadata_store("t1", "eng", "doc1", "v1")
+    doc1 = metadata_store.get_active_document("t1", "eng", "doc1")
+    assert doc1 is not None
+    metadata_store.upsert_document(
+        doc1.model_copy(
+            update={
+                "document_id": "doc2",
+                "source_uri": "inline://doc2",
+                "source_filename": "doc2.md",
+                "acl_scope": "restricted",
+                "allowed_user_ids": ["u1"],
+            }
+        )
+    )
+
+    fd, ev_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(ev_path)
+    evidence_store = EvidenceSnapshotStore(
+        ev_path, current_document_resolver=metadata_store.get_active_document
+    )
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(vector_store),
+        ParentReader(parent_store),
+        metadata_store=metadata_store,
+        evidence_store=evidence_store,
+    )
+
+    def pair(document_id: str, parent_id: str, text: str, acl_scope: str):
+        hit = RetrievalHit(
+            chunk_id=f"{parent_id}:0",
+            parent_id=parent_id,
+            document_id=document_id,
+            document_version="v1",
+            corpus_id="eng",
+            tenant_id="t1",
+            text=text,
+            score=1.0,
+            security_level="public",
+            acl_scope=acl_scope,
+            allowed_user_ids=["u1"] if acl_scope == "restricted" else [],
+        )
+        parent = AuthorizedParent(
+            parent_id=parent_id,
+            document_id=document_id,
+            document_version="v1",
+            corpus_id="eng",
+            tenant_id="t1",
+            content=text,
+            security_level="public",
+            acl_scope=acl_scope,
+            allowed_user_ids=["u1"] if acl_scope == "restricted" else [],
+        )
+        return hit, parent
+
+    result = RetrievalResult(
+        hits=[
+            pair("doc1", "p1", "first parent body", "tenant"),
+            pair("doc2", "p2", "second parent body", "restricted"),
+        ]
+    )
+    monkeypatch.setattr(retriever, "retrieve", lambda *_args, **_kwargs: result)
+
+    snapshots = retriever.retrieve_evidence(
+        make_security_context(),
+        "query",
+        _corpus(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+    )
+
+    assert len(snapshots) == 2
+    with sqlite3.connect(ev_path) as conn:
+        rows = dict(conn.execute("SELECT document_id, acl_scope FROM evidence_snapshots"))
+    assert rows == {"doc1": "tenant", "doc2": "restricted"}

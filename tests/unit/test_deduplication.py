@@ -79,6 +79,23 @@ def test_near_duplicate_text_collapses() -> None:
     assert len(survivors[0].duplicate_sources) == 1
 
 
+def test_fuzzy_duplicate_replaces_lower_authority_without_leaking_old_group() -> None:
+    low_auth = _cand(
+        _hit(chunk_id="c1", parent_id="p1", text="service outage root cause"),
+        authority_level=10,
+    )
+    high_auth = _cand(
+        _hit(chunk_id="c2", parent_id="p2", text="service outage root causes"),
+        authority_level=90,
+    )
+
+    survivors = Deduplicator(text_similarity_threshold=0.9).deduplicate([low_auth, high_auth])
+
+    assert len(survivors) == 1
+    assert survivors[0].hit.chunk_id == "c2"
+    assert survivors[0].duplicate_sources[0]["chunk_id"] == "c1"
+
+
 def test_cross_corpus_keeps_higher_authority() -> None:
     # Same normalized text copied across two corpora; higher authority wins.
     low_auth = _cand(

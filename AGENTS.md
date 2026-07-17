@@ -4,7 +4,23 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M1** — Secure single-corpus data vertical slice
+- Milestone: **M2** — Single-corpus Internal MVP (`E-011 -> E-014`)
+- Issue: **E-011** — Evidence snapshot store and required deduplication — merged at
+  `4b32b34`; acceptance remediation completed in the current change set (current-policy
+  reauthorization after ACL tightening/delete, per-owner ACL persistence, fuzzy-dedup
+  replacement, and executable acceptance commands). Full contract at
+  `docs/issue-e011-contract.md`.
+- Issue: **E-012** — Single-corpus Fast Path and one-pass sufficiency decision —
+  implemented in the current change set (additive; no E-011 behaviour changed). Adds
+  `retrieval/fast_path.py`: `run_fast_path` calls `SecureRetriever.retrieve_evidence`
+  exactly once and applies the deterministic baseline sufficiency rule (≥1 Evidence →
+  `sufficient`; 0 → `insufficient`, downstream must abstain). Typed `FastPathResult`
+  (`sufficiency` + `stop_reason` + derived `is_sufficient`/`should_abstain`) and a typed
+  `FastPathBackendError` so a retrieval fault is never relabelled as "no answer". Full
+  contract at `docs/issue-e012-contract.md`.
+- Next issue: **E-013** — AnswerEnvelope, citation rendering, single key-claim support
+  verification, and conservative refusal. Reuses the E-012 Fast Path result; must NOT
+  start until E-012 is accepted.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
@@ -32,8 +48,9 @@ UPSTREAM_REPO=/vol4/Agent/agentic-rag-for-dummies
 TARGET_REPO=/vol4/Agent/agentic-rag-enterprise
 ```
 
-## Fixed Commits (M1 baseline)
-- Target: `3748b33ffa37a0f977d9ba448e6d760a639b5eba` (main)
+## Fixed Commits
+- M2 / E-011 merge baseline: `79b087f` (main)
+- M1 original target baseline: `3748b33ffa37a0f977d9ba448e6d760a639b5eba`
 - Upstream: `8b3e5ff0619f7ede593d728e4a8b459fbbec9b08` (main, tag v2.3)
 
 ## Permanent Rules (all milestones)

@@ -14,7 +14,7 @@ Read-time re-authorization (§12.8)
 A snapshot is only as readable as the *current* principal's access to its
 source at read time:
 
-* Same tenant + source ACL still grants access + corpus still discoverable
+* Same tenant + current control-plane ACL grants access + corpus still discoverable
   → ``FULL`` (body returned).
 * Source ACL revoked for the caller (e.g. ACL tightened, document deleted,
   tenant changed) → ``REDACTED``: only the provenance metadata is returned,
@@ -36,8 +36,9 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Literal, Optional
+from typing import Callable, Optional
 
+from agentic_rag_enterprise.domain.document import SourceDocument
 from agentic_rag_enterprise.domain.evidence import Evidence
 from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.security.policy import (
@@ -46,11 +47,6 @@ from agentic_rag_enterprise.security.policy import (
     can_discover_corpus,
     evaluate_access,
 )
-
-
-def _as_acl_scope(value: object) -> Literal["tenant", "restricted"]:
-    """Coerce a stored ACL-scope value to the literal; default to restricted."""
-    return "tenant" if value == "tenant" else "restricted"
 
 
 class EvidenceAccessLevel(str, Enum):
@@ -69,6 +65,7 @@ class EvidenceAccess:
 
 
 _AUDIT_PERMISSION = "audit:evidence:read"
+CurrentDocumentResolver = Callable[[str, str, str], Optional[SourceDocument]]
 
 
 def _now_iso() -> str:
@@ -104,9 +101,11 @@ class EvidenceSnapshotStore:
         db_path: str = "evidence.db",
         *,
         audit_callback: Optional[Callable[[dict], None]] = None,
+        current_document_resolver: Optional[CurrentDocumentResolver] = None,
     ) -> None:
         self._db_path = db_path
         self._audit_callback = audit_callback
+        self._current_document_resolver = current_document_resolver
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -178,7 +177,8 @@ class EvidenceSnapshotStore:
         Idempotent on ``evidence_id``: re-saving the same id is a no-op, so a
         retried retrieval never duplicates a snapshot. The body is never
         updated once written. ``source_acl`` is the ACL in effect at creation
-        time and is used for read-time re-authorization (build plan §12.8).
+        time and is retained as audit provenance. Ordinary reads are authorized
+        only through ``current_document_resolver`` (build plan §12.8).
         """
         self._conn.execute(
             """
@@ -262,34 +262,58 @@ class EvidenceSnapshotStore:
 
         evidence = self._row_to_evidence(row)
 
-        acl = ResourceAcl(
-            tenant_id=row["tenant_id"],
-            security_level=row["security_level"],
-            acl_scope=_as_acl_scope(row["acl_scope"]),
-            allowed_user_ids=_as_text_list(row["allowed_user_ids"]),
-            allowed_group_ids=_as_text_list(row["allowed_group_ids"]),
-            denied_user_ids=_as_text_list(row["denied_user_ids"]),
-            denied_group_ids=_as_text_list(row["denied_group_ids"]),
-        )
-        if self._is_allowed_now(ctx, acl, row["corpus_id"]):
+        current_document = self._resolve_current_document(row)
+        if current_document is not None and self._is_allowed_now(
+            ctx, self._acl_from_document(current_document), row["corpus_id"]
+        ):
             return EvidenceAccess(EvidenceAccessLevel.FULL, evidence, "authorized")
 
         if _AUDIT_PERMISSION in ctx.permissions:
             self._record_audit(evidence_id, ctx, "audit_read", "audit:evidence:read grant")
             return EvidenceAccess(EvidenceAccessLevel.FULL, evidence, "audit_grant")
 
-        return EvidenceAccess(
-            EvidenceAccessLevel.REDACTED, _redact_evidence(evidence), "source_acl_revoked"
+        reason = (
+            "current_policy_unavailable"
+            if self._current_document_resolver is None
+            else "source_acl_revoked_or_document_inactive"
         )
+        return EvidenceAccess(EvidenceAccessLevel.REDACTED, _redact_evidence(evidence), reason)
 
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
     @staticmethod
     def _is_allowed_now(ctx: SecurityContext, acl: ResourceAcl, corpus_id: str) -> bool:
-        return (
-            evaluate_access(ctx, acl) is AuthorizationDecision.ALLOW
-            and can_discover_corpus(ctx, corpus_id)
+        return evaluate_access(ctx, acl) is AuthorizationDecision.ALLOW and can_discover_corpus(
+            ctx, corpus_id
+        )
+
+    def _resolve_current_document(self, row: sqlite3.Row) -> Optional[SourceDocument]:
+        """Load the current control-plane document; absence fails closed.
+
+        The ACL stored beside a snapshot is historical audit metadata. It cannot
+        authorize a later read because ACL tightening or logical deletion may
+        have happened since the snapshot was written.
+        """
+        if self._current_document_resolver is None:
+            return None
+        document = self._current_document_resolver(
+            row["tenant_id"], row["corpus_id"], row["document_id"]
+        )
+        if document is None or document.status.value != "active" or document.deprecated:
+            return None
+        return document
+
+    @staticmethod
+    def _acl_from_document(document: SourceDocument) -> ResourceAcl:
+        return ResourceAcl(
+            tenant_id=document.tenant_id,
+            security_level=document.security_level,
+            acl_scope=document.acl_scope,
+            allowed_user_ids=document.allowed_user_ids,
+            allowed_group_ids=document.allowed_group_ids,
+            denied_user_ids=document.denied_user_ids,
+            denied_group_ids=document.denied_group_ids,
         )
 
     def _record_audit(
