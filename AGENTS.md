@@ -34,17 +34,31 @@
   verified claims, caller prose never returned) + `b7ed855` (whole-tree format gate clean).
   Full contract at `docs/issue-e013-contract.md`.
 - Issue: **E-014** — shared chat application service, synchronous `/v1/chat` contract, and a
-  minimal Gradio adapter — **CLOSED** (this commit). `services/chat_service.py`
-  `ChatService` wires E-012 `run_fast_path` → E-013 `build_answer_envelope` /
-  `conservative_refusal`, calls the LLM only for claim extraction (structured
-  `ClaimExtraction`), and never returns the raw LLM draft (E-013 fail-closed).
-  `api/routes/chat.py` `POST /v1/chat` is an adapter that injects the runtime
-  `SecurityContext` and returns the `AnswerEnvelope` (no SSE, no `denied_reasons` leak);
-  `ui/gradio_app.py` is import-safe (lazy gradio). Backend / model faults propagate as typed
-  errors, never as a refusal. **Internal MVP (E-011 → E-014) complete.** Full contract at
+  minimal Gradio adapter — **acceptance remediation (current change set)**: the original
+  implementation passed unit tests but failed acceptance on 4 P1 + 1 P2 findings. Fixed:
+  (P1-1) the default `/v1/chat` is now runnable — `get_chat_service` returns a shared, in-process
+  `DefaultServiceContainer` (in-memory Qdrant, deterministic encoders, a hermetic synthesis model
+  that registers `ClaimExtraction`, and a storage stack **shared with the ingestion pipeline**), so
+  ingest → chat works end-to-end with no external dependency; (P1-2) `ChatRequest` carries only
+  `query` + `corpus_id` — the `SecurityContext` is built from **trusted request headers**
+  (gateway-injected), never the client body, so a client cannot assert `tenant_id` / `is_admin`;
+  (P1-3) error handlers return only **fixed generic** messages and log the real exception
+  internally, so no evidence/tenant id leaks; (P1-4) Gradio now renders citations / Evidence
+  snippets / a single-corpus entry (not just `answer_markdown`) and ships a real smoke test
+  (gradio installed as an optional extra); (P2) milestone order corrected below.
+  `services/chat_service.py` `ChatService` wires E-012 `run_fast_path` → E-013
+  `build_answer_envelope` / `conservative_refusal`, calls the LLM only for claim extraction
+  (structured `ClaimExtraction`), and never returns the raw LLM draft (E-013 fail-closed).
+  `api/routes/chat.py` `POST /v1/chat` is an adapter that injects the runtime `SecurityContext`
+  and returns the `AnswerEnvelope` (no SSE, no `denied_reasons` leak); `ui/gradio_app.py` is
+  import-safe (lazy gradio). Backend / model faults propagate as typed errors, never as a refusal.
+  **Internal MVP (E-011 → E-014) run-chain complete (pending re-verification).** Full contract at
   `docs/issue-e014-contract.md`.
-- Next milestone: **M3 / E-015** — Research MVP begins (multi-Corpus Registry, Planner DAG,
-  Required-Fact Judge, iteration). Not started.
+- Next milestones (after the Internal MVP):
+  - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP (E-019 grounding/eval harness,
+    E-020 Required-Fact Judge + sufficiency refine). Not started.
+  - **M4 / E-015 → E-016** — Research MVP (multi-Corpus Registry, Planner DAG, Required-Fact
+    Judge, iteration). Not started.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

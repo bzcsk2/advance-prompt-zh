@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from agentic_rag_enterprise.domain.chunk import ChunkRecord
+from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.document import SourceDocument
 from agentic_rag_enterprise.domain.ingestion import (
     DocumentStatus,
@@ -49,6 +51,86 @@ def _as_json_list(value) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(list(value))
+
+
+class _LockedSqliteConn:
+    """Serialize access to a sqlite3 connection shared across threads.
+
+    The dev/service container is built in the process main thread but HTTP
+    requests are dispatched on worker threads (starlette ``TestClient`` / the
+    ASGI server). ``check_same_thread=False`` lets the connection be used from
+    those worker threads; the lock ensures statements from concurrent requests
+    do not interleave on the single shared connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.Lock) -> None:
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_lock", lock)
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return self._conn.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return self._conn.executemany(*args, **kwargs)
+
+    def commit(self):
+        with self._lock:
+            return self._conn.commit()
+
+    def rollback(self):
+        with self._lock:
+            return self._conn.rollback()
+
+    def cursor(self):
+        return _LockedSqliteCursor(self._conn.cursor(), self._lock)
+
+    def close(self):
+        with self._lock:
+            return self._conn.close()
+
+    @property
+    def row_factory(self):
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._conn.row_factory = value
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _LockedSqliteCursor:
+    """Cursor that takes the shared connection lock per statement."""
+
+    def __init__(self, cur: sqlite3.Cursor, lock: threading.Lock) -> None:
+        object.__setattr__(self, "_cur", cur)
+        object.__setattr__(self, "_lock", lock)
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return self._cur.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return self._cur.executemany(*args, **kwargs)
+
+    def fetchone(self):
+        with self._lock:
+            return self._cur.fetchone()
+
+    def fetchall(self):
+        with self._lock:
+            return self._cur.fetchall()
+
+    def __iter__(self):
+        with self._lock:
+            return list(self._cur)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
 
 
 class ActiveVersionConflict(Exception):
@@ -111,7 +193,13 @@ class MetadataStore:
     def __init__(self, db_path: str = "metadata.db") -> None:
         self._db_path = db_path
         # autocommit off; explicit BEGIN/COMMIT for multi-statement transactions.
-        self._conn = sqlite3.connect(db_path, isolation_level=None)
+        # The container is built in the main thread but HTTP requests run on
+        # worker threads (TestClient / ASGI server), so check_same_thread=False
+        # is required; the _LockedSqliteConn proxy serializes statements so
+        # concurrent requests cannot interleave on the single shared connection.
+        raw = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
+        self._lock = threading.Lock()
+        self._conn = _LockedSqliteConn(raw, self._lock)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self.apply_migrations()
@@ -678,6 +766,63 @@ class MetadataStore:
             names = ", ".join(cols)
             placeholders = ", ".join(f":{c}" for c in cols)
             self._conn.execute(f"INSERT INTO documents ({names}) VALUES ({placeholders})", cols)
+
+    def register_corpus(self, corpus: CorpusConfig) -> None:
+        """Register (or refresh) a corpus in the ``corpus_registry`` control-plane table.
+
+        The ``documents`` table has a foreign key to ``corpus_registry``, so a
+        corpus MUST be registered before any document is ingested into it. Safe
+        to call repeatedly (idempotent upsert keyed by ``(corpus_id, tenant_id)``).
+        """
+        self._conn.execute(
+            """
+            INSERT INTO corpus_registry (
+                corpus_id, tenant_id, name, description, domain, owner, source_type,
+                vector_collection, parent_store_namespace, enabled, searchable,
+                authority_level, freshness_sla_hours, security_policy_id,
+                default_security_level, capability_ids, metadata_schema,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(corpus_id, tenant_id) DO UPDATE SET
+                name=excluded.name,
+                description=excluded.description,
+                domain=excluded.domain,
+                owner=excluded.owner,
+                source_type=excluded.source_type,
+                vector_collection=excluded.vector_collection,
+                parent_store_namespace=excluded.parent_store_namespace,
+                enabled=excluded.enabled,
+                searchable=excluded.searchable,
+                authority_level=excluded.authority_level,
+                freshness_sla_hours=excluded.freshness_sla_hours,
+                security_policy_id=excluded.security_policy_id,
+                default_security_level=excluded.default_security_level,
+                capability_ids=excluded.capability_ids,
+                metadata_schema=excluded.metadata_schema,
+                updated_at=excluded.updated_at
+            """,
+            (
+                corpus.corpus_id,
+                corpus.tenant_id,
+                corpus.name,
+                corpus.description,
+                corpus.domain,
+                corpus.owner,
+                corpus.source_type,
+                corpus.vector_collection,
+                corpus.parent_store_namespace,
+                int(corpus.enabled),
+                int(corpus.searchable),
+                corpus.authority_level,
+                corpus.freshness_sla_hours,
+                corpus.security_policy_id,
+                corpus.default_security_level,
+                json.dumps(corpus.capability_ids),
+                json.dumps(corpus.metadata_schema),
+                corpus.created_at.isoformat(),
+                corpus.updated_at.isoformat(),
+            ),
+        )
 
     def get_document(
         self, tenant_id: str, corpus_id: str, document_id: str, version: str

@@ -5,11 +5,15 @@ the ``ChatService``, and returns the validated ``AnswerEnvelope``. It never
 exposes ``denied_reasons`` / internal telemetry, and it never masks a backend or
 model fault as a grounded answer or a refusal.
 
-Registered on the FastAPI ``app`` in ``api/main.py`` (this environment's
-``include_router`` is a no-op, so the repo's ``@app.post`` style is used).
+Error handling is fail-closed for the *caller*: every 5xx returns a fixed,
+generic message. Internal identifiers (tenant ids, evidence ids, corpus ids) and
+the underlying exception text must NEVER leave the process — they are written to
+the internal log only (build plan §5.4 / §12.8).
 """
 
 from __future__ import annotations
+
+import logging
 
 from fastapi import Depends, HTTPException, status
 
@@ -23,6 +27,14 @@ from agentic_rag_enterprise.services.chat_service import (
     ModelInvocationError,
 )
 
+logger = logging.getLogger("agentic_rag_enterprise.api.chat")
+
+# Fixed, generic messages returned to the client. They never embed internal
+# identifiers or the underlying exception text (build plan §12.8).
+_MSG_BACKEND_UNAVAILABLE = "The retrieval backend is temporarily unavailable."
+_MSG_MODEL_UNAVAILABLE = "The answer service is temporarily unavailable."
+_MSG_INTERNAL_ERROR = "An internal error occurred."
+
 
 def chat_v1(
     request: ChatRequest,
@@ -32,22 +44,26 @@ def chat_v1(
     try:
         return service.answer(request.query, ctx, request.corpus_id)
     except FastPathBackendError as exc:
+        logger.exception("FastPath backend error for request %s", ctx.request_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"retrieval backend unavailable: {exc}",
+            detail=_MSG_BACKEND_UNAVAILABLE,
         ) from exc
     except ModelInvocationError as exc:
+        logger.exception("Model invocation error for request %s", ctx.request_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(exc),
+            detail=_MSG_MODEL_UNAVAILABLE,
         ) from exc
     except ChatServiceError as exc:
+        logger.exception("Chat service error for request %s", ctx.request_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
+            detail=_MSG_INTERNAL_ERROR,
         ) from exc
     except Exception as exc:  # noqa: BLE001 - surface as 500; never mask as answer
+        logger.exception("Unexpected error for request %s", ctx.request_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"chat service error: {exc}",
+            detail=_MSG_INTERNAL_ERROR,
         ) from exc

@@ -30,6 +30,9 @@ dev = [
   "mypy>=1.10.0",
   "types-PyYAML>=6.0.12"
 ]
+gradio = [
+  "gradio>=5.0.0"
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

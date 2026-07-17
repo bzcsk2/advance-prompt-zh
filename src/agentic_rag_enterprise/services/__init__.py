@@ -12,6 +12,11 @@ from agentic_rag_enterprise.services.composition import (
     build_default_model,
     resolve_corpus_from_yaml,
 )
+from agentic_rag_enterprise.services.container import (
+    DENSE_DIM,
+    DefaultServiceContainer,
+    get_default_container,
+)
 
 __all__ = [
     "ChatService",
@@ -22,4 +27,7 @@ __all__ = [
     "build_chat_service_from_settings",
     "build_default_model",
     "resolve_corpus_from_yaml",
+    "DefaultServiceContainer",
+    "get_default_container",
+    "DENSE_DIM",
 ]

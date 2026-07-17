@@ -108,7 +108,7 @@ def build_chat_service_from_settings(
         metadata_store=mstore,
     )
     resolver = resolve_corpus_from_yaml(
-        corpus_yaml or Path(__file__).resolve().parents[2] / "configs" / "corpora.yaml"
+        corpus_yaml or Path(__file__).resolve().parents[3] / "configs" / "corpora.yaml"
     )
     return build_chat_service(
         retriever=retriever,
