@@ -204,6 +204,42 @@ def test_explicitly_unsupported_claim_removed() -> None:
     assert "supported fact" in env.answer_markdown
 
 
+def test_missing_claims_fail_closed_without_returning_caller_text() -> None:
+    env = build_answer_envelope(
+        _sufficient(_evidence()),
+        _ctx(),
+        answer_markdown="UNSUPPORTED CALLER FACT",
+        claims=None,
+    )
+
+    assert env.claims == ()
+    assert env.completeness == "partial"
+    assert env.confidence == "medium"
+    assert "UNSUPPORTED CALLER FACT" not in env.answer_markdown
+    assert (
+        env.answer_markdown
+        == "No supported claim could be established from the available evidence."
+    )
+
+
+def test_empty_claims_fail_closed_without_returning_caller_text() -> None:
+    env = build_answer_envelope(
+        _sufficient(_evidence()),
+        _ctx(),
+        answer_markdown="UNSUPPORTED CALLER FACT",
+        claims=[],
+    )
+
+    assert env.claims == ()
+    assert env.completeness == "partial"
+    assert env.confidence == "medium"
+    assert "UNSUPPORTED CALLER FACT" not in env.answer_markdown
+    assert (
+        env.answer_markdown
+        == "No supported claim could be established from the available evidence."
+    )
+
+
 def test_critical_claim_with_empty_evidence_downgraded_and_removed() -> None:
     ev = _evidence()
     claims = [Claim(claim_id="C1", text="unsupported fact", importance="critical", evidence_ids=())]

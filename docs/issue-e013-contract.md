@@ -63,11 +63,12 @@ claim decomposition / Judge calibration / auto-rewrite are explicitly deferred.
   used Evidence. A removed *critical* claim is recorded so `completeness` is
   downgraded to `partial`. No LLM Judge, no regeneration loop (those are
   deferred).
-- **Unsupported claims never reach the final answer** — when `claims` are
-  supplied, `build_answer_envelope` renders `answer_markdown` from the *kept*
+- **Unsupported claims never reach the final answer** —
+  `build_answer_envelope` always renders `answer_markdown` from the *kept*
   (supported) claims only (`_render_answer_from_claims`), so an unsupported
-  claim's fact cannot appear in the answer text; the caller's prose is used only
-  as a fallback when no claims are supplied.
+  claim's fact cannot appear in the answer text. Missing or empty `claims` fail
+  closed to a generic `partial` response; caller-supplied prose is never returned
+  without a verified Claim map.
 - **Conservative refusal** — when `FastPathResult` is `insufficient`, build an
   `abstained` envelope: empty `claims`, empty `evidence`, `completeness ==
   insufficient`, `confidence == low`, `stop_reason == no_evidence`, and a fixed
@@ -150,11 +151,13 @@ claim decomposition / Judge calibration / auto-rewrite are explicitly deferred.
     `test_cross_tenant_evidence_rejected` / `test_cross_corpus_evidence_rejected`:
     any tenant/corpus mismatch raises `TenantBindingError` (fail-closed).
   - `test_explicitly_unsupported_claim_removed` /
+    `test_missing_claims_fail_closed_without_returning_caller_text` /
+    `test_empty_claims_fail_closed_without_returning_caller_text` /
     `test_critical_claim_with_empty_evidence_downgraded_and_removed` /
     `test_dangling_evidence_id_claim_removed`: unsupported / evidence-less /
     unresolved claims are removed and their facts never appear in
-    `answer_markdown`; a removed critical claim downgrades `completeness` to
-    `partial`.
+    `answer_markdown`; missing/empty Claim maps fail closed; a removed critical
+    claim downgrades `completeness` to `partial`.
   - `test_claim_and_citation_are_frozen` / `test_dangling_claim_rejected_by_validator`
     / `test_dangling_citation_rejected_by_validator`: `Claim`/`Citation` are
     frozen (no post-construction mutation) and both claim and citation ids must

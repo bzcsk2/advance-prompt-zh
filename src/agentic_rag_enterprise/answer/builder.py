@@ -9,9 +9,10 @@ conservative refusal envelope with no fabricated facts.
 Safety invariants enforced here (fail-closed):
 * the ``SecurityContext`` tenant must match the ``FastPathResult`` tenant and
   the tenant/corpus of every cited Evidence (no cross-tenant leakage);
-* unsupported claims never reach the final answer — when claims are supplied the
-  answer text is rendered from the *kept* (supported) claims, so an unsupported
-  claim's fact cannot appear in the answer;
+* unsupported claims never reach the final answer — the answer text is always
+  rendered from the *kept* (supported) claims, so an unsupported claim's fact
+  cannot appear in the answer; missing or empty claims fail closed to a safe
+  partial response;
 * ``conservative_refusal`` only accepts an ``insufficient`` result.
 """
 
@@ -83,10 +84,10 @@ def build_answer_envelope(
             the ``should_abstain`` signal).
         ctx: The runtime-injected security context (supplies ``request_id`` /
             ``session_id`` and the tenant binding).
-        answer_markdown: Caller-supplied grounded answer text. When ``claims`` are
-            supplied this is used only as a fallback if no claim survives
-            verification; the final answer is otherwise rendered from the kept
-            claims so unsupported facts cannot leak through.
+        answer_markdown: Caller-supplied draft answer text. It is never returned
+            directly; the final answer is rendered from verified claims so
+            unsupported facts cannot leak through. The argument remains part of
+            the E-014 boundary so the draft and extracted claims travel together.
         claims: The caller-supplied atomic claims to verify and cite.
 
     Returns:
@@ -108,19 +109,16 @@ def build_answer_envelope(
     verification = verify_claims(claims or [], evidence_ids)
     citations = render_citations(evidence)
 
-    if verification.removed_claims:
+    if verification.removed_claims or not verification.kept_claims:
         completeness: Completeness = "partial"
         confidence: Confidence = "medium"
     else:
         completeness = "complete"
         confidence = "high"
 
-    # Derive the final answer from the kept claims so unsupported facts cannot
-    # enter the final answer; fall back to the caller text only when no claims
-    # were supplied to verify against.
-    final_answer = (
-        _render_answer_from_claims(verification.kept_claims) if claims else answer_markdown
-    )
+    # Always derive the final answer from verified claims. Missing/empty claims
+    # fail closed to the generic partial response returned by the renderer.
+    final_answer = _render_answer_from_claims(verification.kept_claims)
 
     return AnswerEnvelope(
         request_id=ctx.request_id,

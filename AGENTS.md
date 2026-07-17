@@ -22,7 +22,8 @@
   verification, and conservative refusal — implemented and in acceptance remediation
   (4 P1 fixes applied: fail-closed tenant/corpus binding via `TenantBindingError`;
   unsupported / evidence-less / unresolved claims removed and their facts excluded from
-  `answer_markdown`; `Claim`/`Citation` frozen + validator checks `Citation.evidence_id`;
+  `answer_markdown`, with missing/empty Claim maps failing closed to a safe partial response;
+  `Claim`/`Citation` frozen + validator checks `Citation.evidence_id`;
   `conservative_refusal` rejects a `sufficient` result and the envelope locks
   `abstained` ⇒ `stop_reason == no_evidence`). Adds `answer/`: `AnswerEnvelope` (deeply
   frozen, validated), `Claim`/`Citation` (frozen), `render_citations`/`format_citation_panel`
