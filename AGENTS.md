@@ -30,11 +30,21 @@
   (immutable snapshot refs), `verify_claims`, `build_answer_envelope`/`conservative_refusal`
   driven by the E-012 `FastPathResult`. Whole-tree `ruff format --check .` gate now
   CLEAN (the 2 last drifting pre-existing test files reformatted; no behavior change).
-  Local commit `4cb0fb8` (4 P1 fixes) + format-gate follow-up commit. Full contract at
-  `docs/issue-e013-contract.md`.
-- Next issue: **E-014** — shared chat application service, synchronous `/v1/chat` contract,
-  and a minimal Gradio adapter. Wires the LLM that produces `answer_markdown` + `claims`
-  consumed by E-013; must NOT start until E-013 is accepted.
+  Local commits `4cb0fb8` (4 P1 fixes) + `2770971` (fail-closed: answer derived only from
+  verified claims, caller prose never returned) + `b7ed855` (whole-tree format gate clean).
+  Full contract at `docs/issue-e013-contract.md`.
+- Issue: **E-014** — shared chat application service, synchronous `/v1/chat` contract, and a
+  minimal Gradio adapter — **CLOSED** (this commit). `services/chat_service.py`
+  `ChatService` wires E-012 `run_fast_path` → E-013 `build_answer_envelope` /
+  `conservative_refusal`, calls the LLM only for claim extraction (structured
+  `ClaimExtraction`), and never returns the raw LLM draft (E-013 fail-closed).
+  `api/routes/chat.py` `POST /v1/chat` is an adapter that injects the runtime
+  `SecurityContext` and returns the `AnswerEnvelope` (no SSE, no `denied_reasons` leak);
+  `ui/gradio_app.py` is import-safe (lazy gradio). Backend / model faults propagate as typed
+  errors, never as a refusal. **Internal MVP (E-011 → E-014) complete.** Full contract at
+  `docs/issue-e014-contract.md`.
+- Next milestone: **M3 / E-015** — Research MVP begins (multi-Corpus Registry, Planner DAG,
+  Required-Fact Judge, iteration). Not started.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

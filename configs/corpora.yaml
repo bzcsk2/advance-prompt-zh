@@ -1,0 +1,25 @@
+# Single-corpus definition for the Internal MVP (E-014).
+# Consumed by services.composition.resolve_corpus_from_yaml into the DOMAIN
+# CorpusConfig (the type run_fast_path / SecureRetriever require), NOT the M0
+# baseline schemas.CorpusConfig. Multi-corpus routing is deferred.
+corpora:
+  - corpus_id: eng
+    tenant_id: t1
+    name: Enterprise Knowledge (English)
+    description: >-
+      Single Internal-MVP corpus of enterprise knowledge documents used to
+      validate the one-corpus user loop (ingest -> retrieve -> answer / abstain).
+    domain: general
+    owner: platform
+    source_type: documents
+    capability_ids: []
+    vector_collection: eng
+    parent_store_namespace: eng
+    enabled: true
+    searchable: true
+    authority_level: 50
+    security_policy_id: policy-default
+    default_security_level: internal
+    metadata_schema: {}
+    created_at: 2025-01-01T00:00:00
+    updated_at: 2025-01-01T00:00:00
