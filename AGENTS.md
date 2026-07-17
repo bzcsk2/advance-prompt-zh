@@ -27,7 +27,10 @@
   `abstained` ⇒ `stop_reason == no_evidence`). Adds `answer/`: `AnswerEnvelope` (deeply
   frozen, validated), `Claim`/`Citation` (frozen), `render_citations`/`format_citation_panel`
   (immutable snapshot refs), `verify_claims`, `build_answer_envelope`/`conservative_refusal`
-  driven by the E-012 `FastPathResult`. Full contract at `docs/issue-e013-contract.md`.
+  driven by the E-012 `FastPathResult`. Whole-tree `ruff format --check .` gate now
+  CLEAN (the 2 last drifting pre-existing test files reformatted; no behavior change).
+  Local commit `4cb0fb8` (4 P1 fixes) + format-gate follow-up commit. Full contract at
+  `docs/issue-e013-contract.md`.
 - Next issue: **E-014** — shared chat application service, synchronous `/v1/chat` contract,
   and a minimal Gradio adapter. Wires the LLM that produces `answer_markdown` + `claims`
   consumed by E-013; must NOT start until E-013 is accepted.

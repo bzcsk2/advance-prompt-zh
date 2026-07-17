@@ -64,9 +64,9 @@ def test_retrieval_api_surface_never_calls_parent_store_get(path: Path) -> None:
     # No ``from ...storage.parent_store import ParentStore`` on these modules.
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
-            assert "storage.parent_store" not in node.module, (
-                f"{path.name} must not import ParentStore (use ParentReader)"
-            )
+            assert (
+                "storage.parent_store" not in node.module
+            ), f"{path.name} must not import ParentStore (use ParentReader)"
 
     # No ``<something>.get(...)`` where the receiver is a parent store binding.
     for node in ast.walk(tree):
