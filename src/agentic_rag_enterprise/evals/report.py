@@ -31,7 +31,12 @@ def _evaluate_case(case: EvalCase) -> dict:
 
     fs_m3 = false_sufficient(m3, case.gold_missing_fact_ids)
     fs_m2 = false_sufficient(m2, case.gold_missing_fact_ids)
-    jt_m3 = judge_timeout_degradation(m3)
+    # NOTE (P1-D): `judge_timeout_degradation` must NOT be computed on a normally
+    # produced envelope. A confident `complete` answer from a healthy run would be
+    # mis-scored as 0.0 because the metric assumes the input came from a judge-fault
+    # scenario. The timeout-degradation path is exercised separately by
+    # `_evaluate_timeout_case`, which injects a JudgeTimeoutError, so normal cases
+    # simply carry `None` here.
     cc_m3 = citation_coverage(
         [c.evidence_id for c in m3.citations],
         [e.evidence_id for e in m3.evidence],
@@ -51,7 +56,7 @@ def _evaluate_case(case: EvalCase) -> dict:
             "stop_reason": m3.stop_reason,
             "claims": len(m3.claims),
             "false_sufficient": fs_m3.score,
-            "judge_timeout_degradation": jt_m3.score,
+            "judge_timeout_degradation": None,
             "citation_coverage": cc_m3.score,
         },
         "m2_baseline": {
@@ -63,20 +68,57 @@ def _evaluate_case(case: EvalCase) -> dict:
     }
 
 
+def _evaluate_timeout_case(case: EvalCase) -> dict:
+    """Exercise the judge-timeout degradation path with a real JudgeTimeoutError.
+
+    This is the E-020 contract requirement that the eval harness cover the
+    judge-timeout degradation path: we swap in a judge that always raises
+    ``JudgeTimeoutError`` and confirm the service degrades conservatively to an
+    abstain (the metric then scores 1.0). A healthy run must never be fed to this
+    metric (see the note in ``_evaluate_case``).
+    """
+    from agentic_rag_enterprise.judge.deterministic_coverage_judge import (
+        DeterministicCoverageJudge,
+    )
+    from agentic_rag_enterprise.judge.protocol import JudgeTimeoutError
+
+    class _TimeoutJudge(DeterministicCoverageJudge):
+        def judge(self, **kwargs):  # type: ignore[override]
+            raise JudgeTimeoutError("injected judge timeout")
+
+    env = run_case(case, judge=_TimeoutJudge())
+    jt = judge_timeout_degradation(env)
+    return {
+        "id": case.id,
+        "query": case.query,
+        "abstained": env.abstained,
+        "completeness": env.completeness,
+        "stop_reason": env.stop_reason,
+        "judge_timeout_degradation": jt.score,
+        "judge_fault_injected": True,
+    }
+
+
 def generate_m3_report(name: str = "m3_v1", *, write: bool = True) -> dict:
     """Generate (and optionally persist) the M3 eval report.
 
     Returns a machine-readable dict with per-case records and an aggregate
     ``summary`` (M3 vs M2 complete-rate delta, mean guard scores, and the
-    provisional False-Sufficient gate result).
+    provisional False-Sufficient gate result). A dedicated ``timeout_cases`` block
+    proves the judge-fault degradation path with a real ``JudgeTimeoutError``.
     """
     dataset = load_dataset(name)
     cases = [_evaluate_case(c) for c in dataset.cases]
+
+    # Real judge-timeout degradation scenarios (P1-D): re-run every case through a
+    # faulting judge so the conservative-degradation guard is genuinely exercised.
+    timeout_cases = [_evaluate_timeout_case(c) for c in dataset.cases]
 
     n = len(cases) or 1
     m3_complete = [c for c in cases if c["m3"]["completeness"] == "complete"]
     m2_complete = [c for c in cases if c["m2_baseline"]["completeness"] == "complete"]
     m3_fs_failures = [c for c in cases if c["m3"]["false_sufficient"] < 1.0]
+    timeout_failures = [c for c in timeout_cases if c["judge_timeout_degradation"] < 1.0]
 
     summary = {
         "n_cases": len(cases),
@@ -87,12 +129,15 @@ def generate_m3_report(name: str = "m3_v1", *, write: bool = True) -> dict:
         "mean_false_sufficient": sum(c["m3"]["false_sufficient"] for c in cases) / n,
         "mean_citation_coverage": sum(c["m3"]["citation_coverage"] for c in cases) / n,
         "provisional_gate_pass": len(m3_fs_failures) == 0,
+        "n_timeout_cases": len(timeout_cases),
+        "judge_timeout_degradation_failures": len(timeout_failures),
     }
 
     report = {
         "version": name,
         "generated_for": "M3 E-019/E-020 quality-iteration exit gate",
         "summary": summary,
+        "timeout_cases": timeout_cases,
         "cases": cases,
     }
 

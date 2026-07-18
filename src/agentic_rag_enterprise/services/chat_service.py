@@ -243,6 +243,14 @@ class ChatService:
                 assert coverage is not None
                 plan = gap_planner.plan(coverage, prior_queries=prior_queries, corpus_id=corpus_id)
                 round_queries = list(plan.queries)
+                if not round_queries:
+                    # No remaining gap queries to run (every candidate has already
+                    # been executed or is not retrievable). There is nothing left to
+                    # retrieve, so stop immediately rather than spinning an empty
+                    # round that re-judges unchanged evidence — that would be a
+                    # no-op, not a genuine second iteration (P1-A).
+                    final_reason = "all_sources_exhausted"
+                    break
                 new_evidence_ids = set()
                 round_new_content = False
                 for q in round_queries:
@@ -271,11 +279,21 @@ class ChatService:
                                 f"({ev.tenant_id}/{ev.corpus_id}) does not match request "
                                 f"({ctx.tenant_id}/{corpus.corpus_id})"
                             )
+                        is_new_content = (
+                            ev.text_hash not in seen_text_hashes
+                            or (ev.document_id, ev.document_version) not in seen_doc_versions
+                        )
                         existing = evidence_by_id.get(ev.evidence_id)
                         if existing is None:
                             seen_ids.add(ev.evidence_id)
                             evidence_by_id[ev.evidence_id] = ev
-                            new_evidence_ids.add(ev.evidence_id)
+                            # P2-2: a brand-new id only counts as a *gain* when it
+                            # actually carries new information. A snapshot that merely
+                            # re-states already-seen text under a fresh id (e.g. the
+                            # same paragraph re-embedded) must NOT reset the no-gain
+                            # counter — only a new id with new content/version does.
+                            if is_new_content:
+                                new_evidence_ids.add(ev.evidence_id)
                         elif (
                             existing.document_version != ev.document_version
                             or existing.text_hash != ev.text_hash
@@ -286,10 +304,7 @@ class ChatService:
                             evidence_by_id[ev.evidence_id] = ev
                         # §14.6 novelty: a new document version or new text hash is a
                         # genuine gain even when the id was already seen (P2-2).
-                        if (
-                            ev.text_hash not in seen_text_hashes
-                            or (ev.document_id, ev.document_version) not in seen_doc_versions
-                        ):
+                        if is_new_content:
                             round_new_content = True
                         seen_text_hashes.add(ev.text_hash)
                         seen_doc_versions.add((ev.document_id, ev.document_version))

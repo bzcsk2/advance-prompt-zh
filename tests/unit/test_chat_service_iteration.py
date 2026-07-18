@@ -62,6 +62,7 @@ def _evidence(
     tenant_id: str = "t1",
     corpus_id: str = "eng",
     document_version: str = "v1",
+    text_hash: str | None = None,
 ) -> SnapshotEvidence:
     return SnapshotEvidence(
         evidence_id=evidence_id,
@@ -72,7 +73,7 @@ def _evidence(
         source_uri="inline://d1",
         source_filename="d1.md",
         text=text,
-        text_hash=f"h-{evidence_id}",
+        text_hash=text_hash if text_hash is not None else f"h-{evidence_id}",
         retrieval_query="q",
         authority_level=50,
         retrieved_at=datetime(2024, 1, 1),
@@ -308,7 +309,12 @@ def test_max_rounds_honoured() -> None:
     assert env.completeness == "partial"
 
 
-def test_no_new_evidence_stops_early() -> None:
+def test_all_sources_exhausted_when_no_gap_queries() -> None:
+    # The gap query returns nothing new, and GapPlanner has no further candidate
+    # after it (the query is added to `prior_queries`). The loop must stop
+    # immediately with `all_sources_exhausted` rather than spinning an empty
+    # re-judge round (P1-A). Round 0 gains; round 1 runs the single gap query and
+    # gains nothing; round 2 has no candidate query -> stop.
     retriever = _FakeLoopRetriever(
         {
             "q": [_evidence("e1", "The alpha requirement is met.")],
@@ -323,13 +329,36 @@ def test_no_new_evidence_stops_early() -> None:
         judge=DeterministicCoverageJudge(),
         required_facts=_facts("alpha requirement", "gamma specification"),
     )
-    # Build plan §14.5/§14.6: two consecutive no-gain rounds -> no_new_evidence.
-    # Round 0 gains (initial evidence); rounds 1 and 2 are no-gain -> stop at
-    # round 2 (3 total rounds), well before max_rounds=5.
     assert env.gap_rounds == 3
-    assert len(retriever.calls) == 3
+    assert len(retriever.calls) == 2
     assert env.completeness == "partial"
-    assert env.stop_reason == "no_new_evidence"
+    assert env.stop_reason == "all_sources_exhausted"
+
+
+def test_no_new_evidence_is_unreachable_when_no_candidate_queries() -> None:
+    # A fresh id carrying the SAME text hash as already-seen evidence must NOT be
+    # counted as a gain (P2-2): the loop reaches `all_sources_exhausted`, not a
+    # fabricated `no_new_evidence` after an empty spin. The StopPolicy-level
+    # `no_new_evidence` branch (two consecutive genuinely gainless rounds) is
+    # covered directly in tests/unit/judge/test_stop_policy.py.
+    retriever = _FakeLoopRetriever(
+        {
+            "q": [_evidence("e1", "The alpha requirement is met.")],
+            "gamma specification": [
+                _evidence("e2", "The alpha requirement is met.", text_hash="h-e1")
+            ],
+        }
+    )
+    env = _service(retriever).answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=6,
+        judge=DeterministicCoverageJudge(),
+        required_facts=_facts("alpha requirement", "gamma specification"),
+    )
+    assert env.stop_reason == "all_sources_exhausted"
+    assert env.completeness == "partial"
 
 
 def test_gap_retrieval_rejects_cross_tenant_evidence() -> None:
@@ -477,3 +506,79 @@ def test_judge_timeout_degrades_conservatively() -> None:
     assert env.abstained is True
     assert env.completeness == "insufficient"
     assert env.stop_reason == "no_evidence"
+
+
+# --- Stage B critical/empty claim downgrade (P1-2 acceptance) ----------------
+
+
+class _StageBModel:
+    """Fake model that emits one SUPPORTED claim plus one critical claim whose
+    text does NOT lexically overlap any evidence (so Stage B must mark it
+    unsupported). The critical claim is asserted critical so the downgrade is
+    observable on an otherwise ``sufficient`` coverage.
+    """
+
+    def __init__(self, evidence_id: str) -> None:
+        self._evidence_id = evidence_id
+
+    def invoke(self, messages: list[dict[str, str]], **kwargs: object) -> str:
+        return ""
+
+    def with_structured_output(self, schema: type, **kwargs: object) -> object:
+        return self._Wrapper(self, schema)
+
+    class _Wrapper:
+        def __init__(self, model: "_StageBModel", schema: type) -> None:
+            self._model = model
+            self._schema = schema
+
+        def invoke(self, messages: list[dict[str, str]], **kwargs: object):
+            eid = self._model._evidence_id
+            claims = [
+                Claim(
+                    claim_id="c_supported",
+                    text="The vacation policy grants 20 days paid leave.",
+                    importance="supporting",
+                    evidence_ids=(eid,),
+                ),
+                Claim(
+                    claim_id="c_critical",
+                    text="The bonus pool is funded entirely by crypto holdings.",
+                    importance="critical",
+                    evidence_ids=(eid,),
+                ),
+            ]
+            return ClaimExtraction(draft_answer="\n".join(c.text for c in claims), claims=claims)
+
+
+def test_stage_b_downgrades_sufficient_when_critical_claim_unsupported() -> None:
+    # P1-2 acceptance: a `sufficient` Stage-A coverage must NOT reach a `complete`
+    # envelope when Stage B removes a CRITICAL claim (the critical claim's text
+    # does not overlap the evidence). The builder forces the envelope down to
+    # partial/low (never a confident complete answer).
+    retriever = _FakeLoopRetriever(
+        {"q": [_evidence("e1", "The vacation policy grants 20 days paid leave.")]}
+    )
+    model = _StageBModel("e1")
+    service = ChatService(
+        retriever=retriever,
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        model=model,
+        resolve_corpus=lambda cid: _corpus(corpus_id=cid, tenant_id="t1"),
+    )
+    env = service.answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=1,
+        judge=DeterministicCoverageJudge(),
+        required_facts=_facts("vacation policy"),
+    )
+    # Coverage says sufficient, but Stage B removed the critical claim.
+    assert env.coverage is not None
+    assert env.coverage.overall_status == "sufficient"
+    assert env.completeness == "partial"
+    assert env.confidence == "low"
+    # The critical (unsupported) claim must NOT appear in the final answer.
+    assert all(c.claim_id != "c_critical" for c in env.claims)

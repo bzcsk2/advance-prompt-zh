@@ -87,9 +87,19 @@ def test_false_sufficient_clean_when_not_complete() -> None:
     assert res.score == 1.0
 
 
-def test_false_sufficient_no_coverage_is_clean() -> None:
+def test_false_sufficient_complete_with_gold_missing_fires_without_coverage() -> None:
+    # P1-B: the M2 baseline carries no coverage, but gold still says a fact is
+    # missing — the primary gold check must fire even when coverage is None.
     env = _make_env(completeness="complete", coverage=None)
     res = false_sufficient(env, gold_missing_fact_ids=["f1"])
+    assert res.score == 0.0
+    assert res.details["fired"] is True
+
+
+def test_false_sufficient_complete_no_gold_and_no_coverage_is_clean() -> None:
+    # A complete answer with no gold-missing fact and no coverage is clean.
+    env = _make_env(completeness="complete", coverage=None)
+    res = false_sufficient(env, gold_missing_fact_ids=[])
     assert res.score == 1.0
 
 
@@ -121,7 +131,8 @@ def test_citation_coverage_baseline() -> None:
 def test_report_generated_and_gate_passes() -> None:
     # The M3 exit gate: run the whole versioned dataset through the loop + the
     # M2 baseline, emit the machine-readable report, and confirm the provisional
-    # False-Sufficient gate is green (P1-5).
+    # False-Sufficient gate is green (P1-5). The judge-timeout degradation block
+    # must also be exercised with a real JudgeTimeoutError (P1-D).
     from agentic_rag_enterprise.evals.report import _REPORT_PATH, generate_m3_report
 
     report = generate_m3_report(write=True)
@@ -131,3 +142,10 @@ def test_report_generated_and_gate_passes() -> None:
     for case in report["cases"]:
         if case["m3"]["completeness"] == "complete":
             assert case["m3"]["false_sufficient"] == 1.0
+    # Every timeout scenario must degrade conservatively (abstain, not a
+    # fabricated complete answer) — proving P1-D end-to-end.
+    assert report["summary"]["n_timeout_cases"] >= 1
+    assert report["summary"]["judge_timeout_degradation_failures"] == 0
+    for tcase in report["timeout_cases"]:
+        assert tcase["abstained"] is True
+        assert tcase["judge_timeout_degradation"] == 1.0

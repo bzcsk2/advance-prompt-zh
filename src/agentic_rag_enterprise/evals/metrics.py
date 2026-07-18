@@ -45,34 +45,44 @@ def false_sufficient(
     ("partial information must not be marked fully supported"): a ``complete``
     answer when the gold/standard answer expects a required fact to be uncovered.
 
-    Two complementary checks (build plan §14 / M3 acceptance P1-5):
+    Two complementary checks (build plan §14 / M3 acceptance P1-5). They are
+    *independent* — neither is gated on the presence of the other:
 
     1. **Real judge-error detection (primary).** If the envelope reports
        ``completeness == "complete"`` but ``gold_missing_fact_ids`` is non-empty,
-       the answer is a False Sufficient *regardless* of what the system's own
-       coverage says. This catches the case the old metric missed: gold says a
-       fact is missing, the Coverage Judge wrongly marked it ``supported``, and
-       the envelope came back ``complete``.
-    2. **Independent coverage cross-check.** Gold fact references are resolved to
-       their canonical ids (``make_required_fact``) and intersected with the
-       coverage's own ``missing`` / ``contradicted`` sets, so a description-based
-       gold label lines up with the ``fact_<sha>`` ids the runner/coverage use
-       (the dataset keeps human-readable descriptions; conversion is at metric
-       time — no dataset rewrite required).
+       the answer is a False Sufficient *regardless* of whether ``coverage`` is
+       attached and regardless of what the system's own coverage says. This is
+       the principal rule and must fire even for envelopes that carry no
+       ``coverage`` (e.g. the M2 baseline), because gold is the source of truth.
+    2. **Independent coverage cross-check.** When a ``coverage`` IS attached, gold
+       fact references are resolved to their canonical ids (``make_required_fact``)
+       and intersected with the coverage's own ``missing`` / ``contradicted`` sets,
+       so a description-based gold label lines up with the ``fact_<sha>`` ids the
+       runner/coverage use. This is a separate guard that can fire on its own.
+
+    A non-``complete`` answer (partial / insufficient / conflicted) is never a
+    False Sufficient, so it scores 1.0.
 
     Args:
-        envelope: The produced answer envelope (must carry ``coverage``).
+        envelope: The produced answer envelope (coverage is optional).
         gold_missing_fact_ids: Fact references (descriptions or ids) the gold /
             standard answer expects to be uncovered for this query (i.e. the
             answer should NOT be ``complete``).
     """
-    if envelope.coverage is None:
+    if envelope.completeness != "complete":
+        # A non-complete answer is by definition not a False Sufficient.
         return EvalResult(
-            name="false_sufficient", score=1.0, details={"reason": "no coverage attached"}
+            name="false_sufficient",
+            score=1.0,
+            details={"reason": "not complete", "completeness": envelope.completeness},
         )
-    if envelope.completeness == "complete" and gold_missing_fact_ids:
-        # Primary guard: a `complete` answer while gold expects a missing fact is
-        # a False Sufficient (the judge may have wrongly marked the fact supported).
+
+    # Primary guard: a `complete` answer while gold expects a missing fact is a
+    # False Sufficient regardless of Coverage (the judge may have wrongly marked
+    # the fact supported, or there may be no coverage attached at all). This is
+    # checked BEFORE the coverage-None short-circuit so the M2 baseline cannot
+    # dodge it (P1-B).
+    if gold_missing_fact_ids:
         return EvalResult(
             name="false_sufficient",
             score=0.0,
@@ -81,17 +91,22 @@ def false_sufficient(
                 "reason": "complete answer while gold expects a missing fact",
                 "completeness": envelope.completeness,
                 "gold_missing": sorted(gold_missing_fact_ids),
+                "via": "gold_missing",
             },
         )
-    if envelope.completeness != "complete":
+
+    # Independent secondary guard (only meaningful when a coverage is attached):
+    # gold references resolved to canonical ids intersect the coverage's own
+    # uncovered facts (P1-C — no longer dead code reached only after an early
+    # return chain; this branch is reachable for complete answers with gold empty
+    # but coverage reporting missing/contradicted facts).
+    if envelope.coverage is None:
         return EvalResult(
             name="false_sufficient",
             score=1.0,
-            details={"reason": "not complete", "completeness": envelope.completeness},
+            details={"reason": "complete and no gold-missing fact; no coverage to cross-check"},
         )
 
-    # Complete with no gold-missing fact: cross-check the system's own coverage
-    # against gold (id-resolved), as an independent guard.
     gold_ids = {make_required_fact(g).fact_id for g in gold_missing_fact_ids}
     uncovered = set(envelope.coverage.missing_fact_ids) | set(
         envelope.coverage.contradicted_fact_ids
@@ -102,6 +117,7 @@ def false_sufficient(
         score=0.0 if fired else 1.0,
         details={
             "fired": fired,
+            "via": "coverage_cross_check",
             "uncovered": sorted(uncovered),
             "gold_missing": sorted(gold_missing_fact_ids),
         },

@@ -64,16 +64,22 @@
   (delegates to `answer_with_iteration(max_rounds=1, judge=None)`) so E-014 behaviour is unchanged.
   Full contract at `docs/issue-e019-contract.md`.
 - Issue: **E-020** — Bounded gap retrieval + no-new-evidence stop policy — **implemented**
-  (current change set). Reuses the E-019 `Judge`; adds `GapPlanner` (queries only for
-  `missing`/`partially_supported`/`not_retrievable`) and `StopPolicy` (`sufficient` / `no_new_evidence`
-  / `max_rounds` / `budget_exhausted` / `tool_unavailable`) driving a bounded 2–3 round loop in
+  (current change set; acceptance-remediation applied). Reuses the E-019 `Judge`; adds `GapPlanner`
+  (queries ONLY for `missing`/`partially_supported` — `not_retrievable` is explicitly EXCLUDED, as is
+  `contradicted`/`ambiguous`/`policy_blocked`/`supported`; repeats of already-executed queries are
+  dropped) and `StopPolicy` (`sufficient` / `no_new_evidence` / `all_sources_exhausted` / `max_rounds`
+  / `budget_exhausted` / `tool_unavailable`) driving a bounded 1–3 round loop in
   `ChatService.answer_with_iteration` (accumulates Evidence, re-judges, synthesizes only after the
-  loop). A judge fault degrades conservatively to an abstain (never a fabricated complete answer).
-  Adds a deterministic eval harness (`evals/dataset.py`, `evals/runner.py`, `false_sufficient`,
-  `judge_timeout_degradation`, `evals/data/m3_v1.json`). Full contract at `docs/issue-e020-contract.md`.
+  loop). When `GapPlanner` has no remaining candidate query the loop stops immediately with
+  `all_sources_exhausted` (it does NOT spin an empty re-judge round). A fresh Evidence id that carries
+  already-seen text/version is NOT counted as a gain (P2-2). A judge fault degrades conservatively to an
+  abstain (never a fabricated complete answer). Adds a deterministic eval harness
+  (`evals/dataset.py`, `evals/runner.py`, `false_sufficient`, `judge_timeout_degradation`,
+  `evals/data/m3_v1.json`); the report exercises `judge_timeout_degradation` via a real injected
+  `JudgeTimeoutError` (not on healthy envelopes). Full contract at `docs/issue-e020-contract.md`.
 - Next milestones (after the Internal MVP):
-  - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP — **implemented** (current change set);
-    pending local commit + push.
+  - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP — **implemented**; local commit + push
+    pending (remediation branch).
   - **M4 / E-015 → E-016** — Research MVP (multi-Corpus Registry, Planner DAG, Required-Fact
     Judge, iteration). Not started.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
