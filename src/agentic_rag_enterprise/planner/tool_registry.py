@@ -142,9 +142,7 @@ class RetrieverTool:
 
         # Resolve corpus configs (throws CorpusNotDiscoverableError if any
         # corpus is unauthorised — that's a security binding failure).
-        corpus_configs = [
-            self._corpus_registry.get(cid, ctx) for cid in step.target_corpus_ids
-        ]
+        corpus_configs = [self._corpus_registry.get(cid, ctx) for cid in step.target_corpus_ids]
 
         # Retrieve per corpus.
         per_corpus: dict[str, list[SnapshotEvidence]] = {}

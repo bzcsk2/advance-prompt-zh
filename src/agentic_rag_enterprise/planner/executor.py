@@ -45,9 +45,7 @@ from agentic_rag_enterprise.security.filter import EmptyAuthorizationScopeError
 # Template placeholder regex (reuses validator's pattern)
 # ---------------------------------------------------------------------------
 _TMPL_FIND_RE = re.compile(r"\{\{[^}]+\}\}")
-_TMPL_PARSE_RE = re.compile(
-    r"^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$"
-)
+_TMPL_PARSE_RE = re.compile(r"^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$")
 
 # Security binding exceptions — any of these from a Tool causes immediate
 # whole-execution fail-closed (contract §9).
@@ -138,7 +136,11 @@ class PlanExecutor:
 
         # ---- 5. Build final result ----
         return self._build_result(
-            plan, results, any_tool_launched, limitations, budget,
+            plan,
+            results,
+            any_tool_launched,
+            limitations,
+            budget,
         )
 
     # ------------------------------------------------------------------
@@ -196,9 +198,7 @@ class PlanExecutor:
                     StepStatus.skipped_dependency,
                     StepStatus.budget_exhausted,
                 ):
-                    limitations.append(
-                        f"step {step_id}: {result.status.value}"
-                    )
+                    limitations.append(f"step {step_id}: {result.status.value}")
             return layer_results
 
     # ------------------------------------------------------------------
@@ -231,9 +231,7 @@ class PlanExecutor:
 
         # ---- Resolve inputs and check optional bindings ----
         try:
-            resolved_inputs = _resolve_inputs(
-                step, completed, fact_values, spec
-            )
+            resolved_inputs = _resolve_inputs(step, completed, fact_values, spec)
         except PlanExecutionError:
             raise  # security binding failure
         except Exception as exc:
@@ -259,9 +257,11 @@ class PlanExecutor:
         # ---- Execute with optional retry ----
         n_corpora = len(step.target_corpus_ids)
         max_attempts = (
-            2 if step.max_tool_calls >= n_corpora * 2 else
-            1 if step.max_tool_calls >= n_corpora else
-            0
+            2
+            if step.max_tool_calls >= n_corpora * 2
+            else 1
+            if step.max_tool_calls >= n_corpora
+            else 0
         )
 
         attempts = 0
@@ -282,9 +282,7 @@ class PlanExecutor:
             attempts += 1
 
             try:
-                output = self._run_tool_with_timeout(
-                    tool, step, resolved_inputs, ctx, spec
-                )
+                output = self._run_tool_with_timeout(tool, step, resolved_inputs, ctx, spec)
 
                 # ---- Validate output against ToolSpec.output_models ----
                 output_model = spec.output_models.get(step.output_schema_id)
@@ -303,8 +301,7 @@ class PlanExecutor:
                         status=StepStatus.failed,
                         error_code="output_schema_error",
                         message="step output failed schema validation",
-                        detail=f"schema_id={step.output_schema_id} "
-                        f"validation error: {exc}",
+                        detail=f"schema_id={step.output_schema_id} validation error: {exc}",
                         attempts=attempts,
                         tool_calls_consumed=attempts * n_corpora,
                     )
@@ -367,9 +364,7 @@ class PlanExecutor:
                 )
 
         # Exhausted retries.
-        error_code = (
-            "retry_exhausted" if last_exception else "execution_error"
-        )
+        error_code = "retry_exhausted" if last_exception else "execution_error"
         return StepResult(
             step_id=step_id,
             status=StepStatus.failed,
@@ -436,9 +431,7 @@ class PlanExecutor:
                         any_evidence = True
 
         total_tool_calls = budget.used()
-        degraded = any(
-            s.status != StepStatus.succeeded for s in steps_in_order
-        ) and any_evidence
+        degraded = any(s.status != StepStatus.succeeded for s in steps_in_order) and any_evidence
 
         if not any_evidence:
             raise PlanExecutionError(
@@ -540,8 +533,7 @@ def _resolve_inputs(
                 field_info = spec.input_model.model_fields.get(field_name)
                 if field_info and field_info.is_required():
                     raise ValueError(
-                        f"binding {field_name}: required field "
-                        f"{expr.output_field} is missing"
+                        f"binding {field_name}: required field {expr.output_field} is missing"
                     )
                 # Optional field — leave as None/default.
             resolved[field_name] = value
@@ -549,9 +541,7 @@ def _resolve_inputs(
             assert expr.fact_id is not None
             value = fact_values.get(expr.fact_id)
             if value is None:
-                raise ValueError(
-                    f"binding {field_name}: fact {expr.fact_id} not found"
-                )
+                raise ValueError(f"binding {field_name}: fact {expr.fact_id} not found")
             resolved[field_name] = value
 
     # Resolve query / query_template.
@@ -587,14 +577,11 @@ def _substitute_template(
         step_id, field = m.group(1), m.group(2)
         upstream = completed.get(step_id)
         if upstream is None:
-            raise ValueError(
-                f"template references step {step_id} which is not completed"
-            )
+            raise ValueError(f"template references step {step_id} which is not completed")
         value = upstream.outputs.get(field)
         if value is None:
             raise ValueError(
-                f"template references field {field} on step {step_id} "
-                f"which is not in outputs"
+                f"template references field {field} on step {step_id} which is not in outputs"
             )
         return str(value)
 

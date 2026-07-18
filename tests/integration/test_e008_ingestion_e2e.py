@@ -70,9 +70,9 @@ def _corpus(corpus_id: str = "eng", tenant_id: str = "t1") -> CorpusConfig:
     )
 
 
-def _build() -> (
-    tuple[DocumentManager, MetadataStore, VectorStore, ParentStore, SecureRetriever, str]
-):
+def _build() -> tuple[
+    DocumentManager, MetadataStore, VectorStore, ParentStore, SecureRetriever, str
+]:
     db_path = _tmp_db_path()
     store = MetadataStore(db_path)
     _seed_corpus(store)

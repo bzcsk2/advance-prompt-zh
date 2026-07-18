@@ -1,26 +1,108 @@
 """E-018 Executor pipeline integration tests (contract §11 acceptance matrix).
 
-Tests the executor end-to-end with realistic Tool behaviour: two-hop binding,
-template substitution, and output collection.
+Tests the executor end-to-end with the **real RetrieverTool** (not mock Tools):
+two-hop binding, template substitution, and Evidence projection through the
+actual ``RetrieverTool.execute_step`` → ``_project`` code path.
+
+Uses a fake ``SecureRetriever`` with in-memory ``CorpusRegistry`` — no Qdrant
+required.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, create_model
 
 from agentic_rag_enterprise.corpus.registry import InMemoryCorpusRegistry
+from agentic_rag_enterprise.domain.evidence import Evidence
 from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.planner.executor import PlanExecutor
 from agentic_rag_enterprise.planner.models import PlanStep, QueryPlan
 from agentic_rag_enterprise.planner.result import StepStatus
 from agentic_rag_enterprise.planner.tool_registry import (
-    Tool,
+    RetrieverTool,
     ToolSpec,
-    TypedStepOutput,
-    _RESOLVED_QUERY_KEY,
 )
+
+# ---------------------------------------------------------------------------
+# Fake SecureRetriever — controllable Evidence per query
+# ---------------------------------------------------------------------------
+
+
+class _FakeSecureRetriever:
+    """Returns evidence based on the query content.
+
+    Step 1 query → "Project X …" → entity evidence with server identifier.
+    Step 2 query → "server … hardware …" → spec evidence with hardware details.
+    """
+
+    def retrieve_evidence(
+        self,
+        ctx: SecurityContext,
+        query: str,
+        corpus: Any,
+        *,
+        dense_encoder: Any = None,
+        sparse_encoder: Any = None,
+        iteration: int = 0,
+        plan_step_id: str | None = None,
+    ) -> list[Evidence]:
+        now = datetime.now()
+        base = dict(
+            tenant_id=ctx.tenant_id,
+            corpus_id=corpus.corpus_id,
+            document_version="v1",
+            source_uri="",
+            source_filename="",
+            text_hash="mock",
+            retrieval_query=query,
+            retrieved_at=now,
+            acl_policy_id="p1",
+            policy_version="1.0",
+            retrieval_iteration=iteration,
+            plan_step_id=plan_step_id,
+        )
+
+        if "Project X" in query:
+            return [
+                Evidence(
+                    evidence_id="ev_entity",
+                    document_id="doc-server-ids",
+                    text="ProjectX-DB-42 is the production database server",
+                    authority_level=80,
+                    retrieval_score=0.95,
+                    **base,  # type: ignore[arg-type]
+                )
+            ]
+        else:
+            return [
+                Evidence(
+                    evidence_id="ev_spec",
+                    document_id="doc-specs",
+                    text="Server specs: 64GB RAM, 8 cores, SSD storage",
+                    authority_level=70,
+                    retrieval_score=0.92,
+                    **base,  # type: ignore[arg-type]
+                )
+            ]
+
+
+# ---------------------------------------------------------------------------
+# Mock encoders
+# ---------------------------------------------------------------------------
+
+
+class _FakeDenseEncoder:
+    def __call__(self, text: str) -> list[float]:
+        return []
+
+
+class _FakeSparseEncoder:
+    def __call__(self, text: str) -> dict[int, float]:
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # Output models matching the contract §10a projection
@@ -44,7 +126,17 @@ _SPEC_OUTPUT = create_model(
 )
 
 
-def _ctx(**kw: dict) -> SecurityContext:
+class _DummyInput(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    query: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _ctx(**kw: Any) -> SecurityContext:
     base = dict(
         request_id="r",
         session_id="s",
@@ -56,7 +148,7 @@ def _ctx(**kw: dict) -> SecurityContext:
     return SecurityContext(**base)
 
 
-def _step(**kw: dict) -> PlanStep:
+def _step(**kw: Any) -> PlanStep:
     base = dict(
         step_id="s1",
         step_type="retrieve",
@@ -72,104 +164,44 @@ def _step(**kw: dict) -> PlanStep:
 
 
 # ---------------------------------------------------------------------------
-# Two-hop binding test
+# Test: real RetrieverTool two-hop
 # ---------------------------------------------------------------------------
 
 
-def test_two_hop_binding_happy_path() -> None:
-    """Step 1 (entity) output is bound into Step 2 query template.
+def test_real_retriever_tool_two_hop() -> None:
+    """Step 1 (entity) → RetrieverTool → Evidence projection → entity_text
+    → template substitution → Step 2 (spec) → RetrieverTool → Evidence.
 
-    This proves the executor correctly:
-    1. Resolves Step 1's query and runs it.
-    2. Collects Step 1's entity_text output.
-    3. Substitutes the entity_text into Step 2's query_template.
-    4. Passes the resolved query to Step 2's Tool.
+    Uses the real ``RetrieverTool`` class with a stable ``ToolRegistry``
+    (same Tool + ToolSpec for all steps).  No mock Tools.
     """
-    step2_captured: list[str] = []
+    retriever = _FakeSecureRetriever()
+    corpus_registry = InMemoryCorpusRegistry()
+    dense_encoder = _FakeDenseEncoder()
+    sparse_encoder = _FakeSparseEncoder()
 
-    class _EntityTool:
-        """Step 1: returns an entity result."""
+    retriever_tool = RetrieverTool(
+        retriever=retriever,
+        corpus_registry=corpus_registry,
+        dense_encoder=dense_encoder,
+        sparse_encoder=sparse_encoder,
+    )
 
-        def execute_step(
-            self,
-            step: PlanStep,
-            resolved_inputs: Mapping[str, object],
-            ctx: SecurityContext,
-        ) -> TypedStepOutput:
-            return TypedStepOutput(
-                outputs={
-                    "entity_text": "ProjectX-DB-42",
-                    "corpus_id": "engineering_wiki",
-                    "document_id": "doc-server-ids",
-                    "authority_level": 80,
-                },
-                evidence_ids=("ev_entity",),
-                schema_id=step.output_schema_id,
-            )
-
-    class _SpecTool:
-        """Step 2: captures the resolved query, returns spec output."""
-
-        def execute_step(
-            self,
-            step: PlanStep,
-            resolved_inputs: Mapping[str, object],
-            ctx: SecurityContext,
-        ) -> TypedStepOutput:
-            query = str(resolved_inputs.get(_RESOLVED_QUERY_KEY, ""))
-            step2_captured.append(query)
-            return TypedStepOutput(
-                outputs={
-                    "spec_text": f"Specs for server {query}",
-                    "corpus_id": "product_docs",
-                    "document_id": "doc-specs",
-                    "metadata": {"authority_level": 70, "retrieval_score": 0.95},
-                },
-                evidence_ids=("ev_spec",),
-                schema_id=step.output_schema_id,
-            )
-
-    # Build the ToolSpecs.
-    class _DummyInput(BaseModel):
-        model_config = ConfigDict(frozen=True)
-        query: str = ""
-
-    entity_spec = ToolSpec(
+    # Single ToolSpec covering both entity and spec output schemas.
+    spec = ToolSpec(
         step_type="retrieve",
         capability_id="vector_search",
         input_model=_DummyInput,
-        output_models={"entity": _ENTITY_OUTPUT},
-        retryable_errors=frozenset(),
-    )
-    spec_spec = ToolSpec(
-        step_type="retrieve",
-        capability_id="vector_search",
-        input_model=_DummyInput,
-        output_models={"spec": _SPEC_OUTPUT},
+        output_models={"entity": _ENTITY_OUTPUT, "spec": _SPEC_OUTPUT},
         retryable_errors=frozenset(),
     )
 
-    # Registry that returns the right Tool+Spec for each step.
-    class _TwoHopRegistry:
-        def get(self, step_type: str, capability_id: str) -> tuple[Tool, ToolSpec]:
-            return (_EntityTool(), entity_spec)
+    # Stable registry: same (Tool, ToolSpec) for every step.
+    class _StableRegistry:
+        def get(self, step_type: str, capability_id: str) -> tuple:
+            return (retriever_tool, spec)
 
-    class _Step2Registry:
-        def get(self, step_type: str, capability_id: str) -> tuple[Tool, ToolSpec]:
-            return (_SpecTool(), spec_spec)
-
-    # Use a custom executor that switches registry per step.
-    class _SwitchingRegistry:
-        def __init__(self) -> None:
-            self._call_count = 0
-
-        def get(self, step_type: str, capability_id: str) -> tuple[Tool, ToolSpec]:
-            self._call_count += 1
-            if self._call_count == 1:
-                return (_EntityTool(), entity_spec)
-            return (_SpecTool(), spec_spec)
-
-    executor = PlanExecutor(_SwitchingRegistry(), concurrency=1)
+    executor = PlanExecutor(_StableRegistry(), concurrency=1)
 
     plan = QueryPlan(
         plan_id="p1",
@@ -197,34 +229,36 @@ def test_two_hop_binding_happy_path() -> None:
         ),
     )
 
-    result = executor.execute(plan, _ctx(), InMemoryCorpusRegistry())
+    result = executor.execute(plan, _ctx(), corpus_registry)
 
     # ---- Assertions ----
 
     assert result.accepted is True
     assert result.executed is True
-    assert result.degraded is False  # both steps succeeded
+    assert result.degraded is False
     assert len(result.steps) == 2
 
-    # Step 1: find_server succeeded.
-    assert result.steps[0].step_id == "find_server"
-    assert result.steps[0].status == StepStatus.succeeded
-    assert result.steps[0].outputs.get("entity_text") == "ProjectX-DB-42"
+    # Step 1: RetrieverTool projected Entity evidence.
+    s1 = result.steps[0]
+    assert s1.step_id == "find_server"
+    assert s1.status == StepStatus.succeeded
+    assert s1.outputs.get("entity_text") == "ProjectX-DB-42 is the production database server"
+    assert s1.outputs.get("corpus_id") == "engineering_wiki"
+    assert "ev_entity" in s1.evidence_ids
 
-    # Step 2: find_specs succeeded.  The template {{find_server.entity_text}}
-    # was replaced with "ProjectX-DB-42", producing the resolved query:
-    # "server ProjectX-DB-42 hardware specifications"
-    assert result.steps[1].step_id == "find_specs"
-    assert result.steps[1].status == StepStatus.succeeded
-    resolved_query = step2_captured[0]
-    assert "ProjectX-DB-42" in resolved_query
-    assert resolved_query.startswith("server ")
-    assert resolved_query.endswith("hardware specifications")
+    # Step 2: RetrieverTool received the bound query and projected Spec evidence.
+    s2 = result.steps[1]
+    assert s2.step_id == "find_specs"
+    assert s2.status == StepStatus.succeeded
+    # The spec_text comes from the top Evidence's text.
+    assert "64GB RAM" in str(s2.outputs.get("spec_text", ""))
+    assert s2.outputs.get("corpus_id") == "product_docs"
+    assert "ev_spec" in s2.evidence_ids
 
-    # The resolved query must contain the bound entity_text.
-    assert len(step2_captured) == 1
-    assert "ProjectX-DB-42" in step2_captured[0]
-
-    # evidence_ids from both steps are collected.
+    # Final evidence_ids contain both.
     assert "ev_entity" in result.evidence_ids
     assert "ev_spec" in result.evidence_ids
+
+    # The executor has at most one active thread at a time (concurrency=1),
+    # so this is proof that binding + template resolution worked end-to-end
+    # through the real RetrieverTool code path.

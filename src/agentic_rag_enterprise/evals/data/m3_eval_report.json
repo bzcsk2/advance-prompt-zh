@@ -1,0 +1,246 @@
+{
+  "version": "m3_v1",
+  "generated_for": "M3 E-019/E-020 quality-iteration exit gate",
+  "summary": {
+    "n_cases": 7,
+    "m3_complete_rate": 0.2857142857142857,
+    "m2_complete_rate": 0.8571428571428571,
+    "complete_rate_delta": -0.5714285714285714,
+    "m3_false_sufficient_failures": 0,
+    "mean_false_sufficient": 1.0,
+    "mean_citation_coverage": 1.0,
+    "provisional_gate_pass": true,
+    "n_timeout_cases": 6,
+    "judge_timeout_degradation_failures": 0
+  },
+  "timeout_cases": [
+    {
+      "id": "case-sufficient",
+      "query": "what is the vacation policy?",
+      "abstained": true,
+      "completeness": "insufficient",
+      "stop_reason": "no_evidence",
+      "judge_timeout_degradation": 1.0,
+      "judge_fault_injected": true
+    },
+    {
+      "id": "case-gap-retrieval",
+      "query": "what is the vacation policy and how do i request time off?",
+      "abstained": true,
+      "completeness": "insufficient",
+      "stop_reason": "no_evidence",
+      "judge_timeout_degradation": 1.0,
+      "judge_fault_injected": true
+    },
+    {
+      "id": "case-partial-exhausted",
+      "query": "what is the vacation policy and the bonus structure?",
+      "abstained": true,
+      "completeness": "insufficient",
+      "stop_reason": "no_evidence",
+      "judge_timeout_degradation": 1.0,
+      "judge_fault_injected": true
+    },
+    {
+      "id": "case-contradicted",
+      "query": "is the office in new york?",
+      "abstained": true,
+      "completeness": "insufficient",
+      "stop_reason": "no_evidence",
+      "judge_timeout_degradation": 1.0,
+      "judge_fault_injected": true
+    },
+    {
+      "id": "case-non-latin",
+      "query": "员工休假政策是什么？",
+      "abstained": true,
+      "completeness": "insufficient",
+      "stop_reason": "no_evidence",
+      "judge_timeout_degradation": 1.0,
+      "judge_fault_injected": true
+    },
+    {
+      "id": "case-stopword-only",
+      "query": "the and for",
+      "abstained": true,
+      "completeness": "insufficient",
+      "stop_reason": "no_evidence",
+      "judge_timeout_degradation": 1.0,
+      "judge_fault_injected": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "case-sufficient",
+      "query": "what is the vacation policy?",
+      "expected_overall": "sufficient",
+      "gold_missing_fact_ids": [],
+      "m3": {
+        "overall_status": "sufficient",
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "gap_rounds": 1,
+        "stop_reason": "sufficient",
+        "claims": 1,
+        "false_sufficient": 1.0,
+        "judge_timeout_degradation": null,
+        "citation_coverage": 1.0
+      },
+      "m2_baseline": {
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "false_sufficient": 1.0
+      }
+    },
+    {
+      "id": "case-insufficient",
+      "query": "what is the secret project codename?",
+      "expected_overall": "insufficient",
+      "gold_missing_fact_ids": [
+        "secret project codename"
+      ],
+      "m3": {
+        "overall_status": null,
+        "completeness": "insufficient",
+        "confidence": "low",
+        "abstained": true,
+        "gap_rounds": 1,
+        "stop_reason": "no_evidence",
+        "claims": 0,
+        "false_sufficient": 1.0,
+        "judge_timeout_degradation": null,
+        "citation_coverage": 1.0
+      },
+      "m2_baseline": {
+        "completeness": "insufficient",
+        "confidence": "low",
+        "abstained": true,
+        "false_sufficient": 1.0
+      }
+    },
+    {
+      "id": "case-gap-retrieval",
+      "query": "what is the vacation policy and how do i request time off?",
+      "expected_overall": "sufficient",
+      "gold_missing_fact_ids": [],
+      "m3": {
+        "overall_status": "sufficient",
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "gap_rounds": 2,
+        "stop_reason": "sufficient",
+        "claims": 2,
+        "false_sufficient": 1.0,
+        "judge_timeout_degradation": null,
+        "citation_coverage": 1.0
+      },
+      "m2_baseline": {
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "false_sufficient": 1.0
+      }
+    },
+    {
+      "id": "case-partial-exhausted",
+      "query": "what is the vacation policy and the bonus structure?",
+      "expected_overall": "partially_sufficient",
+      "gold_missing_fact_ids": [
+        "bonus structure"
+      ],
+      "m3": {
+        "overall_status": "partially_sufficient",
+        "completeness": "partial",
+        "confidence": "medium",
+        "abstained": false,
+        "gap_rounds": 2,
+        "stop_reason": "all_sources_exhausted",
+        "claims": 1,
+        "false_sufficient": 1.0,
+        "judge_timeout_degradation": null,
+        "citation_coverage": 1.0
+      },
+      "m2_baseline": {
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "false_sufficient": 0.0
+      }
+    },
+    {
+      "id": "case-contradicted",
+      "query": "is the office in new york?",
+      "expected_overall": "contradicted",
+      "gold_missing_fact_ids": [],
+      "m3": {
+        "overall_status": "contradicted",
+        "completeness": "conflicted",
+        "confidence": "low",
+        "abstained": false,
+        "gap_rounds": 1,
+        "stop_reason": "all_sources_exhausted",
+        "claims": 1,
+        "false_sufficient": 1.0,
+        "judge_timeout_degradation": null,
+        "citation_coverage": 1.0
+      },
+      "m2_baseline": {
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "false_sufficient": 1.0
+      }
+    },
+    {
+      "id": "case-non-latin",
+      "query": "员工休假政策是什么？",
+      "expected_overall": "ambiguous",
+      "gold_missing_fact_ids": [],
+      "m3": {
+        "overall_status": "ambiguous",
+        "completeness": "partial",
+        "confidence": "low",
+        "abstained": false,
+        "gap_rounds": 1,
+        "stop_reason": "all_sources_exhausted",
+        "claims": 0,
+        "false_sufficient": 1.0,
+        "judge_timeout_degradation": null,
+        "citation_coverage": 1.0
+      },
+      "m2_baseline": {
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "false_sufficient": 1.0
+      }
+    },
+    {
+      "id": "case-stopword-only",
+      "query": "the and for",
+      "expected_overall": "ambiguous",
+      "gold_missing_fact_ids": [],
+      "m3": {
+        "overall_status": "ambiguous",
+        "completeness": "partial",
+        "confidence": "low",
+        "abstained": false,
+        "gap_rounds": 1,
+        "stop_reason": "all_sources_exhausted",
+        "claims": 1,
+        "false_sufficient": 1.0,
+        "judge_timeout_degradation": null,
+        "citation_coverage": 1.0
+      },
+      "m2_baseline": {
+        "completeness": "complete",
+        "confidence": "high",
+        "abstained": false,
+        "false_sufficient": 1.0
+      }
+    }
+  ]
+}

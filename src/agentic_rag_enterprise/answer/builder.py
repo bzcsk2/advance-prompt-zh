@@ -86,8 +86,7 @@ def _check_evidence_binding(
             )
         if ev.corpus_id != corpus_id:
             raise TenantBindingError(
-                f"Evidence {ev.evidence_id!r} belongs to corpus {ev.corpus_id!r}, "
-                f"not {corpus_id!r}"
+                f"Evidence {ev.evidence_id!r} belongs to corpus {ev.corpus_id!r}, not {corpus_id!r}"
             )
 
 

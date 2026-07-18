@@ -531,6 +531,7 @@ def test_tenant_binding_error_fails_closed_whole_execution() -> None:
 
 def test_timeout_does_not_wait_for_slow_tool() -> None:
     """A slow Tool that exceeds the step timeout does not block the Executor."""
+
     class _SlowTool:
         def execute_step(
             self,
@@ -631,7 +632,9 @@ def test_output_schema_not_registered_fails_closed() -> None:
             resolved_inputs: Mapping[str, object],
             ctx: SecurityContext,
         ) -> TypedStepOutput:
-            captured.append(f"schema_ids: spec={set(spec.output_models.keys())}, step={step.output_schema_id}")
+            captured.append(
+                f"schema_ids: spec={set(spec.output_models.keys())}, step={step.output_schema_id}"
+            )
             return TypedStepOutput(
                 outputs={"text": "any"},
                 evidence_ids=("ev1",),

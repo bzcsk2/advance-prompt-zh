@@ -50,10 +50,12 @@ _FORBIDDEN_IMPORTS = {
 }
 
 # E-018 files that legitimately import from the retrieval/storage surface.
-_E018_EXCLUDED_FILES = frozenset({
-    "executor.py",
-    "tool_registry.py",
-})
+_E018_EXCLUDED_FILES = frozenset(
+    {
+        "executor.py",
+        "tool_registry.py",
+    }
+)
 
 
 def test_planner_package_imports_no_execution_surface() -> None:
