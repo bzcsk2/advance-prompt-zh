@@ -13,10 +13,16 @@
   re-audit also hardened `PlanViolation.detail` to `Field(exclude=True, repr=False)` so
   the unauthorized Corpus name cannot leak via `str()`/`repr()` into logs. Full contract
   at `docs/issue-e017-contract.md`.
-- Issue: **E-018** — Controlled Executor + dependent multi-hop — **in progress** (current
-  change set). Consumes an accepted `QueryPlan`: `StepResult`, parallel-ready scheduling,
-  dependency binding, per-step timeout, atomic shared budget, exactly one retry, failure
-  degradation. Full contract at `docs/issue-e018-contract.md`.
+- Issue: **E-018** — Controlled Executor + dependent multi-hop — **contract frozen /
+  implementation pending** (acceptance of `docs/issue-e018-contract.md` unlocks
+  implementation). Consumes an accepted `QueryPlan`: `StepResult` (frozen state machine:
+  pending/running/succeeded/failed/timed_out/skipped_dependency/budget_exhausted),
+  parallel-ready scheduling in topological layers, required/optional dependency + binding
+  semantics, per-step timeout, **atomic** shared Tool-Call budget (`AtomicToolBudget`,
+  reserve-before-launch, no refunds), exactly one retry (initial + 1, retryable types only:
+  `RetrievalBackendError`/`ConnectionError`/`TimeoutError` + registered transient infra),
+  fail-closed security degradation, and a final `PlanExecutionResult`. Full contract at
+  `docs/issue-e018-contract.md`.
 - Prior milestone **M4 / E-015 -> E-016** — Multi-Corpus retrieval — **CLOSED / ACCEPTED**
   at `033c8e2` (E-016 second re-audit passed). E-015 (Corpus/Capability Registry
   + three Corpus fixtures + permission-safe discoverability) CLOSED; E-016
@@ -631,6 +637,37 @@ execution, no `SecureRetriever` call, no Tool.** Full contract at
   allocator (all E-018); no real `SecureRetriever` / Tool call; no LLM Planner (repair_fn
   is injected); no temporal-conflict arbitration; no `agents/`/`graph/` runtime change; no
   change to E-011→E-016 behaviour.
+
+## E-018 Allowed Changes (M5 only) — contract frozen / implementation pending
+Controlled Executor + dependent multi-hop (build plan §13.4). Full contract at
+`docs/issue-e018-contract.md`.
+- `src/agentic_rag_enterprise/planner/` (extend): `executor.py` (`PlanExecutor.execute(
+  plan, ctx, registry, *, tool_registry, concurrency=...)` — re-validates the plan via
+  `PlanValidator.validate`, then runs topological layers with `AtomicToolBudget`),
+  `result.py` (`StepResult`, `StepStatus`, `PlanExecutionResult` — all frozen + validated;
+  `StepStatus` = pending/running/succeeded/failed/timed_out/skipped_dependency/
+  budget_exhausted; `StepResult.detail` `Field(exclude=True, repr=False)`),
+  `budget.py` (`AtomicToolBudget` — thread-safe reserve-before-launch, consume, no refund),
+  `tool_registry.py` (`ToolRegistry` + `Tool` protocol; `RetrieverTool` wrapping
+  `SecureRetriever.retrieve_evidence`; lookup by `step_type + capability_id`),
+  `errors.py` (`PlanExecutionError`).
+- `tests/unit/planner/test_executor.py`, `tests/unit/planner/test_atomic_budget.py`,
+  `tests/integration/test_e018_executor_pipeline.py` — cover the §11 acceptance matrix
+  (parallel, diamond-once, binding, required-skip, optional-continue, timeout-no-overwrite,
+  retry-once-consumes-2, no-retry-on-programming-error, budget=1 single-flight,
+  retry+parallel no-overspend, unauthorized fail-closed, security-no-degrade, illegal-zero-
+  tool, deterministic order, tool_calls_used matches, no corpus/tenant leak, no dynamic step).
+- `docs/issue-e018-contract.md`, `AGENTS.md`.
+- **Reuse, no change:** `planner/models.py` (`QueryPlan`/`PlanStep`/`StepDependency`),
+  `planner/binding.py` (grammar parse), `planner/validator.py` (`PlanValidator`),
+  `corpus/registry.py`, `corpus/capability_registry.py`, `domain/security.py`,
+  `retrieval/retriever.py` (`SecureRetriever.retrieve_evidence`), `retrieval/models.py`
+  (`CorpusNotDiscoverableError`, `RetrievalBackendError`), `retrieval/backend_fault.py`.
+- **Forbidden:** no change to E-017 `QueryPlan` semantics (raise as contract amendment if a
+  hard gap appears); no temporal/authority/conflict arbitration; no distributed scheduling;
+  no infinite repair/retry; no Planner/Tool reading client-supplied tenant/role (only the
+  Executor injects `SecurityContext`); no write operation (`sql`/`api`/`graph`); no dynamic
+  step creation; no change to E-011→E-016 behaviour.
 
 ## Standard Checks
 ```bash
