@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import urllib.request
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, field_validator
@@ -236,14 +238,136 @@ class FakeModel:
         return str(messages[-1]["content"]) if messages else ""
 
 
-SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"fake"})
+# ---------------------------------------------------------------------------
+# Zen / Kilo providers (OpenAI-compatible, keyless)
+# ---------------------------------------------------------------------------
+
+_PROVIDER_BASE_URLS: dict[str, str] = {
+    "zen": "https://opencode.ai/zen/v1",
+    "kilo": "https://api.kilo.ai/api/gateway/v1",
+}
+
+_PROVIDER_DEFAULT_MODELS: dict[str, str] = {
+    "zen": "deepseek-v4-flash-free",
+    "kilo": "nvidia/nemotron-3-super-120b-a12b:free",
+}
 
 
-def create_provider(profile: ModelProfile) -> FakeModel:
+class _OpenAIStructuredWrapper:
+    """StructuredProvider wrapper for OpenAICompatibleProvider."""
+
+    def __init__(self, provider: OpenAICompatibleProvider, schema: type[BaseModel]) -> None:
+        self._provider = provider
+        self._schema = schema
+
+    def invoke(self, messages: list[dict[str, str]], **kwargs: Any) -> BaseModel:
+        raw = self._provider._chat_completion(messages, response_format="json")
+        return self._schema.model_validate(raw)
+
+
+class OpenAICompatibleProvider:
+    """Generic OpenAI-compatible chat completion provider.
+
+    Works with any OpenAI-compatible endpoint (supports ``/chat/completions``).
+    Uses ``urllib`` — no extra dependencies.
+    """
+
+    def __init__(self, profile: ModelProfile) -> None:
+        base_url = _PROVIDER_BASE_URLS.get(profile.provider)
+        if base_url is None:
+            raise UnsupportedProviderError(
+                f"Unknown provider {profile.provider!r}; known: {list(_PROVIDER_BASE_URLS)}"
+            )
+        self.profile = profile
+        self._base_url = base_url.rstrip("/")
+        self._model = profile.model
+
+    # ------------------------------------------------------------------
+    # ModelProvider protocol
+    # ------------------------------------------------------------------
+
+    def invoke(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        result = self._chat_completion(messages, response_format="text")
+        return str(result)
+
+    def with_structured_output(
+        self, schema: type[BaseModel], **kwargs: Any
+    ) -> _OpenAIStructuredWrapper:
+        return _OpenAIStructuredWrapper(self, schema)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        response_format: Literal["text", "json"] = "text",
+    ) -> Any:
+        """Call ``/chat/completions`` and return the parsed content."""
+        body: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "stream": False,
+        }
+        if response_format == "json":
+            body["response_format"] = {"type": "json_object"}
+
+        req = urllib.request.Request(
+            url=f"{self._base_url}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.profile.timeout_seconds) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            raise ProviderIOError(
+                f"provider={self.profile.provider} model={self._model}: {exc}"
+            ) from exc
+
+        try:
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderIOError(
+                f"unexpected response format from {self.profile.provider}: "
+                f"{json.dumps(data, indent=2)[:500]}"
+            ) from exc
+
+        if response_format == "json" and isinstance(content, str):
+            return json.loads(content)
+        return content
+
+
+# ---------------------------------------------------------------------------
+# ModelInvocationError
+# ---------------------------------------------------------------------------
+
+
+class ProviderIOError(IOError):
+    """Raised when a model provider call fails (network, auth, parsing, …)."""
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"fake", "zen", "kilo"})
+
+
+def create_provider(profile: ModelProfile) -> FakeModel | OpenAICompatibleProvider:
     """Create a model provider for the given profile.
 
-    Currently only "fake" is implemented. Real provider dispatch (Ollama,
-    OpenAI, etc.) will be added in the corresponding capability Issue.
+    Supported providers:
+    - ``fake`` — deterministic fake for testing and development.
+    - ``zen`` — ``https://opencode.ai/zen/v1`` (keyless).
+    - ``kilo`` — ``https://api.kilo.ai/api/gateway/v1`` (keyless).
     """
     if profile.provider not in SUPPORTED_PROVIDERS:
         raise UnsupportedProviderError(
@@ -251,4 +375,6 @@ def create_provider(profile: ModelProfile) -> FakeModel:
             f"Supported providers: {sorted(SUPPORTED_PROVIDERS)}. "
             f"Use provider='fake' for testing and development."
         )
-    return FakeModel(profile)
+    if profile.provider == "fake":
+        return FakeModel(profile)
+    return OpenAICompatibleProvider(profile)

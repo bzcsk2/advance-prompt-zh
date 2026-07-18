@@ -73,7 +73,18 @@ def resolve_corpus_from_yaml(path: str | Path) -> Callable[[str], CorpusConfig]:
 
 
 def build_default_model() -> ModelProvider:
-    """The Internal-MVP model: the ``fake`` provider (real dispatch deferred)."""
+    """Build a model provider from runtime settings."""
+    provider_name = settings.llm_provider
+    if provider_name in ("zen", "kilo"):
+        default_models = {
+            "zen": "deepseek-v4-flash-free",
+            "kilo": "nvidia/nemotron-3-super-120b-a12b:free",
+        }
+        model = settings.llm_model or default_models.get(provider_name, "default")
+        return create_provider(
+            ModelProfile(provider=provider_name, model=model, purpose="synthesis")
+        )
+    # Fall back to fake provider for testing / development.
     return create_provider(ModelProfile(provider="fake", model="fake-model", purpose="synthesis"))
 
 

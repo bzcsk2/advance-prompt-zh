@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     llm_provider: str = "mock"
+    llm_model: str = ""
     embedding_provider: str = "mock"
 
     qdrant_url: str = "http://localhost:6333"
