@@ -9,7 +9,6 @@ presenting a confident fabricated answer when the judge itself fails.
 """
 
 from agentic_rag_enterprise.answer.envelope import AnswerEnvelope
-from agentic_rag_enterprise.judge.query_fact_extractor import make_required_fact
 from pydantic import BaseModel
 
 
@@ -96,10 +95,11 @@ def false_sufficient(
         )
 
     # Independent secondary guard (only meaningful when a coverage is attached):
-    # gold references resolved to canonical ids intersect the coverage's own
-    # uncovered facts (P1-C — no longer dead code reached only after an early
-    # return chain; this branch is reachable for complete answers with gold empty
-    # but coverage reporting missing/contradicted facts).
+    # a `complete` envelope that carries its own coverage reporting missing /
+    # contradicted facts is internally inconsistent and must be flagged (P2-1).
+    # The gold set is empty here (the primary guard already handled gold-missing),
+    # so we must NOT intersect with it — that would make this branch dead code.
+    # Instead we flag directly on the coverage's own uncovered facts.
     if envelope.coverage is None:
         return EvalResult(
             name="false_sufficient",
@@ -107,11 +107,10 @@ def false_sufficient(
             details={"reason": "complete and no gold-missing fact; no coverage to cross-check"},
         )
 
-    gold_ids = {make_required_fact(g).fact_id for g in gold_missing_fact_ids}
     uncovered = set(envelope.coverage.missing_fact_ids) | set(
         envelope.coverage.contradicted_fact_ids
     )
-    fired = bool(gold_ids & uncovered)
+    fired = bool(uncovered)
     return EvalResult(
         name="false_sufficient",
         score=0.0 if fired else 1.0,

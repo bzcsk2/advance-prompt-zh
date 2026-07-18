@@ -236,80 +236,85 @@ class ChatService:
             if round_idx == 0:
                 # Already retrieved via run_fast_path; everything is "new" this round.
                 new_evidence_ids: set[str] = set(seen_ids)
-                round_queries: list[str] = [query]
                 round_new_content = False
             else:
                 # Coverage is always set by round 0's judge call above.
                 assert coverage is not None
                 plan = gap_planner.plan(coverage, prior_queries=prior_queries, corpus_id=corpus_id)
-                round_queries = list(plan.queries)
-                if not round_queries:
-                    # No remaining gap queries to run (every candidate has already
-                    # been executed or is not retrievable). There is nothing left to
-                    # retrieve, so stop immediately rather than spinning an empty
-                    # round that re-judges unchanged evidence — that would be a
-                    # no-op, not a genuine second iteration (P1-A).
+                # Only the candidate queries not yet executed this loop survive.
+                pending = [q for q in plan.queries if q not in prior_queries]
+                if not pending:
+                    # Every candidate gap query has already been executed; there is
+                    # nothing left to retrieve. This round did no work, so it must
+                    # NOT be counted as an executed round (P1-2): gap_rounds /
+                    # iterations reflect rounds that actually ran retrieval + judge.
                     final_reason = "all_sources_exhausted"
+                    gap_rounds = round_idx
                     break
+                # Execute exactly ONE new gap query this round (build plan §14.4/§14.5
+                # spirit). Running a single query per round lets two *distinct*
+                # gainless retrievals span two rounds and reach the `no_new_evidence`
+                # stop (P1-1) instead of being collapsed into one round that exhausts
+                # every candidate at once.
+                q = pending[0]
                 new_evidence_ids = set()
                 round_new_content = False
-                for q in round_queries:
-                    try:
-                        evs = self._retriever.retrieve_evidence(
-                            ctx,
-                            q,
-                            corpus,
-                            self._top_k,
-                            dense_encoder=self._dense_encoder,
-                            sparse_encoder=self._sparse_encoder,
-                            iteration=round_idx,
+                try:
+                    evs = self._retriever.retrieve_evidence(
+                        ctx,
+                        q,
+                        corpus,
+                        self._top_k,
+                        dense_encoder=self._dense_encoder,
+                        sparse_encoder=self._sparse_encoder,
+                        iteration=round_idx,
+                    )
+                except Exception as exc:  # noqa: BLE001 - surfaced as a backend fault
+                    raise FastPathBackendError(
+                        f"gap retrieval failed for corpus {corpus_id!r}: {exc}"
+                    ) from exc
+                retrieval_calls += 1
+                for ev in evs:
+                    # Fail-closed: a gap snapshot from another tenant/corpus must
+                    # never enter the answer (P1-1). This mirrors the E-013
+                    # cross-tenant guard that the M3 accumulation had regressed.
+                    if ev.tenant_id != ctx.tenant_id or ev.corpus_id != corpus.corpus_id:
+                        raise TenantBindingError(
+                            f"gap evidence {ev.evidence_id!r} tenant/corpus "
+                            f"({ev.tenant_id}/{ev.corpus_id}) does not match request "
+                            f"({ctx.tenant_id}/{corpus.corpus_id})"
                         )
-                    except Exception as exc:  # noqa: BLE001 - surfaced as a backend fault
-                        raise FastPathBackendError(
-                            f"gap retrieval failed for corpus {corpus_id!r}: {exc}"
-                        ) from exc
-                    retrieval_calls += 1
-                    for ev in evs:
-                        # Fail-closed: a gap snapshot from another tenant/corpus must
-                        # never enter the answer (P1-1). This mirrors the E-013
-                        # cross-tenant guard that the M3 accumulation had regressed.
-                        if ev.tenant_id != ctx.tenant_id or ev.corpus_id != corpus.corpus_id:
-                            raise TenantBindingError(
-                                f"gap evidence {ev.evidence_id!r} tenant/corpus "
-                                f"({ev.tenant_id}/{ev.corpus_id}) does not match request "
-                                f"({ctx.tenant_id}/{corpus.corpus_id})"
-                            )
-                        is_new_content = (
-                            ev.text_hash not in seen_text_hashes
-                            or (ev.document_id, ev.document_version) not in seen_doc_versions
-                        )
-                        existing = evidence_by_id.get(ev.evidence_id)
-                        if existing is None:
-                            seen_ids.add(ev.evidence_id)
-                            evidence_by_id[ev.evidence_id] = ev
-                            # P2-2: a brand-new id only counts as a *gain* when it
-                            # actually carries new information. A snapshot that merely
-                            # re-states already-seen text under a fresh id (e.g. the
-                            # same paragraph re-embedded) must NOT reset the no-gain
-                            # counter — only a new id with new content/version does.
-                            if is_new_content:
-                                new_evidence_ids.add(ev.evidence_id)
-                        elif (
-                            existing.document_version != ev.document_version
-                            or existing.text_hash != ev.text_hash
-                        ):
-                            # Same id but an updated snapshot: keep the latest version
-                            # so a new document version / new text is reflected in the
-                            # answer (§14.6); the gain signal is `round_new_content`.
-                            evidence_by_id[ev.evidence_id] = ev
-                        # §14.6 novelty: a new document version or new text hash is a
-                        # genuine gain even when the id was already seen (P2-2).
+                    is_new_content = (
+                        ev.text_hash not in seen_text_hashes
+                        or (ev.document_id, ev.document_version) not in seen_doc_versions
+                    )
+                    existing = evidence_by_id.get(ev.evidence_id)
+                    if existing is None:
+                        seen_ids.add(ev.evidence_id)
+                        evidence_by_id[ev.evidence_id] = ev
+                        # P2-2: a brand-new id only counts as a *gain* when it
+                        # actually carries new information. A snapshot that merely
+                        # re-states already-seen text under a fresh id (e.g. the
+                        # same paragraph re-embedded) must NOT reset the no-gain
+                        # counter — only a new id with new content/version does.
                         if is_new_content:
-                            round_new_content = True
-                        seen_text_hashes.add(ev.text_hash)
-                        seen_doc_versions.add((ev.document_id, ev.document_version))
-                    if q not in prior_queries:
-                        prior_queries.append(q)
+                            new_evidence_ids.add(ev.evidence_id)
+                    elif (
+                        existing.document_version != ev.document_version
+                        or existing.text_hash != ev.text_hash
+                    ):
+                        # Same id but an updated snapshot: keep the latest version
+                        # so a new document version / new text is reflected in the
+                        # answer (§14.6); the gain signal is `round_new_content`.
+                        evidence_by_id[ev.evidence_id] = ev
+                    # §14.6 novelty: a new document version or new text hash is a
+                    # genuine gain even when the id was already seen (P2-2).
+                    if is_new_content:
+                        round_new_content = True
+                    seen_text_hashes.add(ev.text_hash)
+                    seen_doc_versions.add((ev.document_id, ev.document_version))
+                if q not in prior_queries:
+                    prior_queries.append(q)
 
             # Stage A: judge coverage over all evidence accumulated so far.
             prev_covered = set(coverage.covered_fact_ids) if coverage else set()

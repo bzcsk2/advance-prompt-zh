@@ -83,11 +83,20 @@ def _evaluate_timeout_case(case: EvalCase) -> dict:
     from agentic_rag_enterprise.judge.protocol import JudgeTimeoutError
 
     class _TimeoutJudge(DeterministicCoverageJudge):
+        called = False
+
         def judge(self, **kwargs):  # type: ignore[override]
+            _TimeoutJudge.called = True
             raise JudgeTimeoutError("injected judge timeout")
 
+    _TimeoutJudge.called = False
     env = run_case(case, judge=_TimeoutJudge())
     jt = judge_timeout_degradation(env)
+    # P2-2: a case whose first-round retrieval is insufficient never invokes the
+    # judge (the service abstains before judging), so it does NOT prove the
+    # judge-timeout degradation path. Report it as not-injected so the aggregate
+    # counts only cases where the fault was actually exercised.
+    fault_injected = _TimeoutJudge.called
     return {
         "id": case.id,
         "query": case.query,
@@ -95,7 +104,7 @@ def _evaluate_timeout_case(case: EvalCase) -> dict:
         "completeness": env.completeness,
         "stop_reason": env.stop_reason,
         "judge_timeout_degradation": jt.score,
-        "judge_fault_injected": True,
+        "judge_fault_injected": fault_injected,
     }
 
 
@@ -112,7 +121,11 @@ def generate_m3_report(name: str = "m3_v1", *, write: bool = True) -> dict:
 
     # Real judge-timeout degradation scenarios (P1-D): re-run every case through a
     # faulting judge so the conservative-degradation guard is genuinely exercised.
-    timeout_cases = [_evaluate_timeout_case(c) for c in dataset.cases]
+    # Only cases where the faulting judge was *actually invoked* (first-round
+    # retrieval was sufficient, so the loop reached the judge) prove the path — a
+    # first-round-insufficient case abstains before judging and is excluded (P2-2).
+    all_timeout_cases = [_evaluate_timeout_case(c) for c in dataset.cases]
+    timeout_cases = [c for c in all_timeout_cases if c["judge_fault_injected"]]
 
     n = len(cases) or 1
     m3_complete = [c for c in cases if c["m3"]["completeness"] == "complete"]

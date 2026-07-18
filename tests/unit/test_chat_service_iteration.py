@@ -310,11 +310,10 @@ def test_max_rounds_honoured() -> None:
 
 
 def test_all_sources_exhausted_when_no_gap_queries() -> None:
-    # The gap query returns nothing new, and GapPlanner has no further candidate
-    # after it (the query is added to `prior_queries`). The loop must stop
-    # immediately with `all_sources_exhausted` rather than spinning an empty
-    # re-judge round (P1-A). Round 0 gains; round 1 runs the single gap query and
-    # gains nothing; round 2 has no candidate query -> stop.
+    # A single missing fact yields exactly one gap query. Round 0 gains; round 1
+    # runs that single gap query and gains nothing; round 2 has no candidate query
+    # left -> stop with `all_sources_exhausted`. The empty-plan round must NOT be
+    # counted, so gap_rounds == iterations == tool_calls == 2 (P1-2).
     retriever = _FakeLoopRetriever(
         {
             "q": [_evidence("e1", "The alpha requirement is met.")],
@@ -329,23 +328,29 @@ def test_all_sources_exhausted_when_no_gap_queries() -> None:
         judge=DeterministicCoverageJudge(),
         required_facts=_facts("alpha requirement", "gamma specification"),
     )
-    assert env.gap_rounds == 3
+    assert env.gap_rounds == 2
+    assert env.iterations == 2
     assert len(retriever.calls) == 2
     assert env.completeness == "partial"
     assert env.stop_reason == "all_sources_exhausted"
 
 
-def test_no_new_evidence_is_unreachable_when_no_candidate_queries() -> None:
-    # A fresh id carrying the SAME text hash as already-seen evidence must NOT be
-    # counted as a gain (P2-2): the loop reaches `all_sources_exhausted`, not a
-    # fabricated `no_new_evidence` after an empty spin. The StopPolicy-level
-    # `no_new_evidence` branch (two consecutive genuinely gainless rounds) is
-    # covered directly in tests/unit/judge/test_stop_policy.py.
+def test_no_new_evidence_stops_after_two_gainless_gap_rounds() -> None:
+    # Genuine `no_new_evidence` (build plan §14.5/§14.6): two *distinct* gap
+    # queries each retrieve evidence but yield NO new information (identical text
+    # hash already seen — a fresh id alone must NOT count as a gain, P2-2). With
+    # the loop running one new gap query per round, round 1 tries "gamma
+    # specification" (gainless), round 2 tries "delta specification" (gainless) ->
+    # two consecutive no-gain rounds -> `no_new_evidence` at round 2. This is now
+    # reachable end-to-end (P1-1), not merely a StopPolicy unit check.
     retriever = _FakeLoopRetriever(
         {
             "q": [_evidence("e1", "The alpha requirement is met.")],
             "gamma specification": [
                 _evidence("e2", "The alpha requirement is met.", text_hash="h-e1")
+            ],
+            "delta specification": [
+                _evidence("e3", "The alpha requirement is met.", text_hash="h-e1")
             ],
         }
     )
@@ -355,10 +360,12 @@ def test_no_new_evidence_is_unreachable_when_no_candidate_queries() -> None:
         "eng",
         max_rounds=6,
         judge=DeterministicCoverageJudge(),
-        required_facts=_facts("alpha requirement", "gamma specification"),
+        required_facts=_facts("alpha requirement", "gamma specification", "delta specification"),
     )
-    assert env.stop_reason == "all_sources_exhausted"
+    assert env.stop_reason == "no_new_evidence"
     assert env.completeness == "partial"
+    assert len(retriever.calls) == 3
+    assert env.gap_rounds == 3
 
 
 def test_gap_retrieval_rejects_cross_tenant_evidence() -> None:

@@ -78,8 +78,9 @@
   `evals/data/m3_v1.json`); the report exercises `judge_timeout_degradation` via a real injected
   `JudgeTimeoutError` (not on healthy envelopes). Full contract at `docs/issue-e020-contract.md`.
 - Next milestones (after the Internal MVP):
-  - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP — **implemented**; local commit + push
-    pending (remediation branch).
+  - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP — **implemented**; committed and pushed
+    (latest acceptance remediation `325dad0` → follow-up remediation). `no_new_evidence` is reachable
+    end-to-end via one-new-gap-query-per-round; `gap_rounds`/`iterations` equal executed rounds.
   - **M4 / E-015 → E-016** — Research MVP (multi-Corpus Registry, Planner DAG, Required-Fact
     Judge, iteration). Not started.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
