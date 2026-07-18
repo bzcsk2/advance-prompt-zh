@@ -53,6 +53,8 @@ __all__ = [
     "PlanRepairExhaustedError",
     "PlanStep",
     "PlanValidationResult",
+    "PlanViolation",
+    "PlanViolationCode",
     "QueryPlan",
     "RetrieverTool",
     "StepDependency",

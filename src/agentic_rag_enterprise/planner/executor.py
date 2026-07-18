@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from agentic_rag_enterprise.answer.envelope import TenantBindingError
 from agentic_rag_enterprise.corpus.registry import CorpusRegistry
 from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.planner.binding import BindingExpression, BindingKind
@@ -54,6 +55,7 @@ _SECURITY_BINDING_ERRORS = (
     CorpusNotDiscoverableError,
     ParentAuthorizationError,
     EmptyAuthorizationScopeError,
+    TenantBindingError,
 )
 
 # Programming errors — never retried (contract §8).
@@ -283,10 +285,34 @@ class PlanExecutor:
                 output = self._run_tool_with_timeout(
                     tool, step, resolved_inputs, ctx, spec
                 )
+
+                # ---- Validate output against ToolSpec.output_models ----
+                output_model = spec.output_models.get(step.output_schema_id)
+                if output_model is None:
+                    raise PlanExecutionError(
+                        f"output schema {step.output_schema_id} not registered",
+                        error_code="output_schema_error",
+                        detail=f"step={step_id} schema_id={step.output_schema_id}",
+                    )
+                try:
+                    validated = output_model.model_validate(output.outputs)
+                except Exception as exc:
+                    # Schema mismatch — non-retryable programming error.
+                    return StepResult(
+                        step_id=step_id,
+                        status=StepStatus.failed,
+                        error_code="output_schema_error",
+                        message="step output failed schema validation",
+                        detail=f"schema_id={step.output_schema_id} "
+                        f"validation error: {exc}",
+                        attempts=attempts,
+                        tool_calls_consumed=attempts * n_corpora,
+                    )
+
                 return StepResult(
                     step_id=step_id,
                     status=StepStatus.succeeded,
-                    outputs=output.outputs,
+                    outputs=validated.model_dump(),
                     evidence_ids=output.evidence_ids,
                     attempts=attempts,
                     tool_calls_consumed=attempts * n_corpora,
@@ -313,6 +339,8 @@ class PlanExecutor:
                 # Retryable error — will retry if attempts remain.
                 last_exception = exc
                 continue  # while loop retries
+            except PlanExecutionError:
+                raise  # output schema not registered (fail-closed)
             except TimeoutError as exc:
                 # Step-level timeout (from _run_tool_with_timeout).
                 if attempts < max_attempts and type(exc) in spec.retryable_errors:
@@ -364,15 +392,22 @@ class PlanExecutor:
         ctx: SecurityContext,
         spec: ToolSpec,
     ) -> Any:
-        """Run ``tool.execute_step`` with a timeout.  Returns ``TypedStepOutput``."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(tool.execute_step, step, resolved_inputs, ctx)
-            try:
-                return future.result(timeout=step.timeout_seconds)
-            except concurrent.futures.TimeoutError:
-                raise TimeoutError(
-                    f"step {step.step_id} timed out after {step.timeout_seconds}s"
-                ) from None
+        """Run ``tool.execute_step`` with a timeout.
+
+        Returns ``TypedStepOutput``.  On timeout the underlying worker thread is
+        **not** waited for — the future is abandoned so a slow Tool does not
+        block the executor beyond the deadline.
+        """
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(tool.execute_step, step, resolved_inputs, ctx)
+        try:
+            return future.result(timeout=step.timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            # Discard the late result: do NOT wait for the worker.
+            pool.shutdown(wait=False)
+            raise TimeoutError(
+                f"step {step.step_id} timed out after {step.timeout_seconds}s"
+            ) from None
 
     # ------------------------------------------------------------------
     # Result building
