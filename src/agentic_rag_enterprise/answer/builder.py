@@ -197,6 +197,8 @@ def build_multi_corpus_envelope(
     iterations: int = 1,
     tool_calls: int = 1,
     missing_aspects: tuple[str, ...] | None = None,
+    limitations: tuple[str, ...] = (),
+    partial_retrieval: bool = False,
     stop_reason: str | None = None,
 ) -> AnswerEnvelope:
     """Build a validated envelope from merged multi-corpus Evidence (E-016).
@@ -242,6 +244,8 @@ def build_multi_corpus_envelope(
         iterations=iterations,
         tool_calls=tool_calls,
         missing_aspects=missing_aspects,
+        limitations=limitations,
+        partial_retrieval=partial_retrieval,
         stop_reason=stop_reason,
         # Multi-corpus abstain lock always uses the canonical no_evidence reason.
         abstain_stop_reason="no_evidence",
@@ -265,6 +269,8 @@ def _build_envelope_from_evidence(
     abstain_stop_reason: str,
     corpora_used: tuple[str, ...],
     answer_markdown: str,
+    limitations: tuple[str, ...] = (),
+    partial_retrieval: bool = False,
 ) -> AnswerEnvelope:
     """Shared synthesis core for the single- and multi-corpus envelope builders."""
     evidence_ids = {ev.evidence_id for ev in evidence}
@@ -307,6 +313,13 @@ def _build_envelope_from_evidence(
             tool_calls=tool_calls,
         )
 
+    # Partial retrieval (E-016 degraded mode, P1-4.3): some routed corpus backend
+    # faulted but a sibling returned evidence. The answer may be built from the
+    # available evidence, but it must NOT be reported as unconditionally
+    # complete/high, and the limitation is surfaced explicitly on the envelope.
+    if partial_retrieval and completeness == "complete":
+        completeness, confidence = "partial", "medium"
+
     # Always derive the final answer from verified claims. Missing/empty claims
     # fail closed to the generic partial response returned by the renderer.
     final_answer = _render_answer_from_claims(verification.kept_claims)
@@ -327,6 +340,7 @@ def _build_envelope_from_evidence(
         completeness=completeness,
         confidence=confidence,
         missing_aspects=missing_aspects or (),
+        limitations=limitations,
         corpora_used=corpora_used,
         iterations=iterations,
         tool_calls=tool_calls,

@@ -55,6 +55,7 @@ from agentic_rag_enterprise.retrieval.fast_path import (
 )
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
 from agentic_rag_enterprise.retrieval.multi_corpus import (
+    CorpusRetrievalFault,
     MultiCorpusRetrieval,
     MultiCorpusResult,
 )
@@ -88,6 +89,21 @@ _SYSTEM_PROMPT = (
     "evidence ids, and do not add facts that are not supported by the evidence. "
     "Output a short draft answer and the list of claims."
 )
+
+
+def _partial_retrieval_limitations(
+    faults: tuple[CorpusRetrievalFault, ...],
+) -> tuple[str, ...]:
+    """Render an explicit partial-retrieval limitation per faulted corpus (P1-4.3).
+
+    The message names only the faulted ``corpus_id`` (already in the caller's
+    authorized route) and never leaks internal error detail beyond the fault type.
+    """
+    return tuple(
+        f"Partial retrieval: corpus {f.corpus_id!r} was unavailable "
+        f"({f.error_type}); the answer may be incomplete."
+        for f in sorted(faults, key=lambda x: x.corpus_id)
+    )
 
 
 def _evidence_block(evidence: tuple[SnapshotEvidence, ...]) -> str:
@@ -187,28 +203,24 @@ class ChatService:
                 ``None`` (default 2).
         """
         # 1) Select the corpora to query (router or explicit), all discoverable.
+        #    The Registry is the single source of truth for the CorpusConfig that
+        #    enters retrieval (P1-2): we use exactly the authorized config
+        #    ``registry.get`` returns — never a separate ``resolve_corpus`` result
+        #    that could carry a stale/divergent collection, tenant, ACL or authority.
+        if self._registry is None:
+            raise ChatServiceError("multi-corpus mode requires a CorpusRegistry on the ChatService")
         if corpus_ids is not None:
-            if self._registry is None:
-                raise ChatServiceError(
-                    "explicit corpus_ids require a CorpusRegistry on the ChatService"
-                )
-            selected = []
-            for cid in corpus_ids:
-                # resolve_corpus fails closed for unknown ids; the registry gate
-                # (get) fails closed for non-discoverable ones.
-                cfg = self._resolve_corpus(cid)
-                self._registry.get(cid, ctx)  # raises CorpusNotDiscoverableError
-                selected.append(cfg)
+            # registry.get fails closed for unknown / non-discoverable ids.
+            selected = [self._registry.get(cid, ctx) for cid in corpus_ids]
         else:
-            if self._registry is None:
-                raise ChatServiceError(
-                    "multi-corpus routing requires a CorpusRegistry on the ChatService"
-                )
             route = self._router.route(query, ctx, self._registry, limit=router_limit)
-            selected = [self._resolve_corpus(c.corpus_id) for c in route.candidates]
+            # Re-fetch each routed candidate's authorized config from the registry
+            # so the data-plane config matches the control-plane approval exactly.
+            selected = [self._registry.get(c.corpus_id, ctx) for c in route.candidates]
 
         if not selected:
             # Nothing discoverable to query → abstain (no evidence, fail-closed).
+            # Zero corpora were queried, so tool_calls is 0 (P2-2).
             return build_multi_corpus_envelope(
                 ctx,
                 query=query,
@@ -217,6 +229,7 @@ class ChatService:
                 answer_markdown="",
                 claims=[],
                 coverage=None,
+                tool_calls=0,
                 stop_reason="no_evidence",
             )
 
@@ -233,8 +246,17 @@ class ChatService:
         except Exception as exc:  # noqa: BLE001 - total retrieval outage surfaces as 5xx
             raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
 
+        # Partial-fault (P1-4.3, frozen semantics = degrade + explicit limitation):
+        # a routed corpus backend faulted but a sibling returned evidence. We may
+        # answer from the available evidence, but the envelope must carry an
+        # explicit partial-retrieval limitation and must not be reported as
+        # unconditionally complete/high.
+        partial_retrieval = bool(result.faults)
+        limitations = _partial_retrieval_limitations(result.faults)
+
         if not result.evidence:
             # No evidence and no fault → conservative refusal (abstain lock).
+            # (A total fault would already have raised inside ``retrieve``.)
             return build_multi_corpus_envelope(
                 ctx,
                 query=query,
@@ -243,17 +265,27 @@ class ChatService:
                 answer_markdown="",
                 claims=[],
                 coverage=None,
+                tool_calls=result.retrieval_calls,
                 stop_reason="no_evidence",
             )
 
         # 3) Single-pass synthesis from the merged, verified claims.
-        return self._synthesize_multi_corpus(query, ctx, result)
+        return self._synthesize_multi_corpus(
+            query,
+            ctx,
+            result,
+            partial_retrieval=partial_retrieval,
+            limitations=limitations,
+        )
 
     def _synthesize_multi_corpus(
         self,
         query: str,
         ctx: SecurityContext,
         result: MultiCorpusResult,
+        *,
+        partial_retrieval: bool = False,
+        limitations: tuple[str, ...] = (),
     ) -> AnswerEnvelope:
         """Run LLM claim extraction over merged evidence, then build the envelope."""
         messages = _build_messages(query, result.evidence)
@@ -275,6 +307,9 @@ class ChatService:
             answer_markdown=extraction.draft_answer,
             claims=list(extraction.claims),
             coverage=None,
+            tool_calls=result.retrieval_calls,
+            limitations=limitations,
+            partial_retrieval=partial_retrieval,
             stop_reason="evidence_found",
         )
 

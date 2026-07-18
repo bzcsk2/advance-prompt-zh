@@ -256,3 +256,159 @@ def test_retrieve_insufficient_corpus_recorded_not_used() -> None:
     assert result.corpora_used == ()
     assert set(result.insufficient_corpora) == {"product_docs", "tickets"}
     assert result.faults == ()
+
+
+# -- P1-3: stable evidence_id dedup precedes content folding ----------------------
+
+
+def test_merge_same_id_diff_hash_first_occurrence_wins() -> None:
+    # A single evidence_id must map to exactly ONE snapshot. First occurrence
+    # (corpus_id asc: c1 before c2) wins; the later differing snapshot is dropped.
+    a = _evidence("e1", "old", corpus_id="c1", text_hash="old", document_version="v1")
+    b = _evidence("e1", "new", corpus_id="c2", text_hash="new", document_version="v2")
+    merged = merge_evidence({"c1": [a], "c2": [b]})
+    assert len(merged) == 1
+    assert merged[0].text_hash == "old"
+    assert merged[0].document_version == "v1"
+
+
+def test_merge_same_id_diff_version_not_duplicated() -> None:
+    a = _evidence("e1", "t", corpus_id="c1", text_hash="h1", document_version="v1")
+    b = _evidence("e1", "t", corpus_id="c2", text_hash="h2", document_version="v2")
+    merged = merge_evidence({"c1": [a], "c2": [b]})
+    # Same id → never two survivors, even across versions.
+    assert len(merged) == 1
+    ids = [e.evidence_id for e in merged]
+    assert ids == ["e1"]
+
+
+def test_merge_same_id_diff_corpus_first_wins() -> None:
+    a = _evidence("e1", "t", corpus_id="c1", text_hash="h1")
+    b = _evidence("e1", "t", corpus_id="c2", text_hash="h1")
+    merged = merge_evidence({"c1": [a], "c2": [b]})
+    assert len(merged) == 1
+    assert merged[0].corpus_id == "c1"
+
+
+# -- P1-4.1: one fault + one legitimately-empty is NOT a total outage -------------
+
+
+def test_retrieve_one_fault_one_empty_is_not_total() -> None:
+    retriever = _FaultyRetriever(raise_for={"product_docs"}, ok={"engineering_wiki": []})
+    mc = MultiCorpusRetrieval(retriever)  # type: ignore[arg-type]
+    de, se = _encoders()
+    result = mc.retrieve(
+        _ctx(),
+        "q",
+        [_corpus("product_docs"), _corpus("engineering_wiki")],
+        dense_encoder=de,
+        sparse_encoder=se,
+    )
+    # Not all corpora faulted → no raise. The fault is reported; the empty sibling
+    # is recorded as insufficient.
+    assert result.evidence == ()
+    assert len(result.faults) == 1
+    assert result.faults[0].corpus_id == "product_docs"
+    assert result.insufficient_corpora == ("engineering_wiki",)
+
+
+def test_retrieve_records_truthful_call_count() -> None:
+    retriever = _FakeRetriever({"product_docs": [_evidence("e", "t", corpus_id="product_docs")]})
+    mc = MultiCorpusRetrieval(retriever)  # type: ignore[arg-type]
+    de, se = _encoders()
+    result = mc.retrieve(
+        _ctx(),
+        "q",
+        [_corpus("product_docs"), _corpus("engineering_wiki")],
+        dense_encoder=de,
+        sparse_encoder=se,
+    )
+    # Two corpora were queried → two retrieval calls (P2-2).
+    assert result.retrieval_calls == 2
+
+
+# -- P1-4.2 / P2-3: security & binding errors propagate; never become a fault -----
+
+
+class _SecurityFaultRetriever:
+    """Raises a security/authorization error for a configured corpus id."""
+
+    def __init__(self, deny: str, exc: Exception, ok: dict[str, list[SnapshotEvidence]]) -> None:
+        self._deny = deny
+        self._exc = exc
+        self._ok = ok
+
+    def retrieve_evidence(
+        self,
+        ctx: SecurityContext,
+        query: str,
+        corpus: CorpusConfig,
+        top_k: object = None,
+        *,
+        dense_encoder: DenseEncoder,
+        sparse_encoder: SparseEncoder,
+        iteration: int = 0,
+        plan_step_id: object = None,
+    ) -> list[SnapshotEvidence]:
+        if corpus.corpus_id == self._deny:
+            raise self._exc
+        return list(self._ok.get(corpus.corpus_id, []))
+
+
+def test_security_error_propagates_not_downgraded_to_fault() -> None:
+    from agentic_rag_enterprise.retrieval.models import CorpusNotDiscoverableError
+
+    ok = {"engineering_wiki": [_evidence("eb", "b", corpus_id="engineering_wiki")]}
+    retriever = _SecurityFaultRetriever(
+        deny="product_docs",
+        exc=CorpusNotDiscoverableError("denied"),
+        ok=ok,
+    )
+    mc = MultiCorpusRetrieval(retriever)  # type: ignore[arg-type]
+    de, se = _encoders()
+    try:
+        mc.retrieve(
+            _ctx(),
+            "q",
+            [_corpus("product_docs"), _corpus("engineering_wiki")],
+            dense_encoder=de,
+            sparse_encoder=se,
+        )
+        raise AssertionError("expected CorpusNotDiscoverableError to propagate")
+    except CorpusNotDiscoverableError:
+        pass
+
+
+def test_evidence_claiming_wrong_corpus_raises() -> None:
+    from agentic_rag_enterprise.answer.envelope import TenantBindingError
+
+    # Corpus product_docs' retriever returns Evidence tagged corpus_id=tickets.
+    rogue = _evidence("er", "t", corpus_id="tickets")
+    retriever = _FakeRetriever({"product_docs": [rogue]})
+    mc = MultiCorpusRetrieval(retriever)  # type: ignore[arg-type]
+    de, se = _encoders()
+    try:
+        mc.retrieve(_ctx(), "q", [_corpus("product_docs")], dense_encoder=de, sparse_encoder=se)
+        raise AssertionError("expected TenantBindingError for cross-corpus evidence")
+    except TenantBindingError:
+        pass
+
+
+def test_evidence_claiming_wrong_tenant_raises() -> None:
+    from agentic_rag_enterprise.answer.envelope import TenantBindingError
+
+    rogue = _evidence("er", "t", tenant_id="other", corpus_id="product_docs")
+    retriever = _FakeRetriever({"product_docs": [rogue]})
+    mc = MultiCorpusRetrieval(retriever)  # type: ignore[arg-type]
+    de, se = _encoders()
+    try:
+        mc.retrieve(
+            _ctx(tenant_id="local"),
+            "q",
+            [_corpus("product_docs")],
+            dense_encoder=de,
+            sparse_encoder=se,
+        )
+        raise AssertionError("expected TenantBindingError for cross-tenant evidence")
+    except TenantBindingError:
+        pass

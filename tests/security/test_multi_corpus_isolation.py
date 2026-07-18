@@ -156,3 +156,68 @@ class _NullModel:
         from agentic_rag_enterprise.services.claims_schema import ClaimExtraction
 
         return ClaimExtraction(draft_answer="ok", claims=[])
+
+
+def test_rogue_cross_corpus_evidence_fails_closed_not_mixed() -> None:
+    # product_docs' retriever returns Evidence tagged with a DIFFERENT corpus id.
+    # This must fail closed (TenantBindingError), never be silently merged.
+    from agentic_rag_enterprise.answer.envelope import TenantBindingError
+
+    ctx = _ctx(allowed_corpus_ids=["product_docs", "engineering_wiki"])
+    retriever = _FakeRetriever(
+        {
+            "product_docs": [_evidence("er", "tickets")],  # wrong corpus tag
+            "engineering_wiki": [_evidence("ee", "engineering_wiki")],
+        }
+    )
+    mc = MultiCorpusRetrieval(retriever)  # type: ignore[arg-type]
+    de, se = _encoders()
+    try:
+        mc.retrieve(
+            ctx,
+            "q",
+            [_corpus("product_docs", 80), _corpus("engineering_wiki", 70)],
+            dense_encoder=de,
+            sparse_encoder=se,
+        )
+        raise AssertionError("expected TenantBindingError for cross-corpus evidence")
+    except TenantBindingError:
+        pass
+
+
+def test_security_denial_not_masked_by_healthy_sibling() -> None:
+    # One corpus raises a security denial; a sibling returns evidence. The denial
+    # must propagate (fail closed), never be downgraded to a partial fault and
+    # masked behind the sibling's answer.
+    ctx = _ctx(allowed_corpus_ids=["product_docs", "engineering_wiki"])
+
+    class _MixedRetriever:
+        def retrieve_evidence(
+            self,
+            ctx: SecurityContext,
+            query: str,
+            corpus: CorpusConfig,
+            top_k: object = None,
+            *,
+            dense_encoder: DenseEncoder,
+            sparse_encoder: SparseEncoder,
+            iteration: int = 0,
+            plan_step_id: object = None,
+        ) -> list[SnapshotEvidence]:
+            if corpus.corpus_id == "product_docs":
+                raise CorpusNotDiscoverableError("denied at retrieval")
+            return [_evidence("ee", "engineering_wiki")]
+
+    mc = MultiCorpusRetrieval(_MixedRetriever())  # type: ignore[arg-type]
+    de, se = _encoders()
+    try:
+        mc.retrieve(
+            ctx,
+            "q",
+            [_corpus("product_docs", 80), _corpus("engineering_wiki", 70)],
+            dense_encoder=de,
+            sparse_encoder=se,
+        )
+        raise AssertionError("expected CorpusNotDiscoverableError to propagate")
+    except CorpusNotDiscoverableError:
+        pass

@@ -87,6 +87,7 @@ class _FakeRetriever:
     def __init__(self, per_corpus: dict[str, list[SnapshotEvidence]]) -> None:
         self._per_corpus = per_corpus
         self.calls: list[str] = []
+        self.received_configs: list[CorpusConfig] = []
 
     def retrieve_evidence(
         self,
@@ -101,6 +102,7 @@ class _FakeRetriever:
         plan_step_id: object = None,
     ) -> list[SnapshotEvidence]:
         self.calls.append(corpus.corpus_id)
+        self.received_configs.append(corpus)
         return list(self._per_corpus.get(corpus.corpus_id, []))
 
 
@@ -118,6 +120,30 @@ class _FaultyRetriever:
         plan_step_id: object = None,
     ) -> list[SnapshotEvidence]:
         raise RuntimeError(f"backend down for {corpus.corpus_id}")
+
+
+class _PartialFaultRetriever:
+    """Faults for `fault_for`; returns seeded evidence for the rest."""
+
+    def __init__(self, fault_for: set[str], ok: dict[str, list[SnapshotEvidence]]) -> None:
+        self._fault_for = fault_for
+        self._ok = ok
+
+    def retrieve_evidence(
+        self,
+        ctx: SecurityContext,
+        query: str,
+        corpus: CorpusConfig,
+        top_k: object = None,
+        *,
+        dense_encoder: object,
+        sparse_encoder: object,
+        iteration: int = 0,
+        plan_step_id: object = None,
+    ) -> list[SnapshotEvidence]:
+        if corpus.corpus_id in self._fault_for:
+            raise RuntimeError(f"backend down for {corpus.corpus_id}")
+        return list(self._ok.get(corpus.corpus_id, []))
 
 
 class _SynthesisModel:
@@ -213,3 +239,78 @@ def test_empty_evidence_abstains() -> None:
     assert env.abstained
     assert env.completeness == "insufficient"
     assert env.stop_reason == "no_evidence"
+
+
+# -- P1-2: the Registry config (not a stale resolver) enters retrieval ------------
+
+
+def test_retrieval_uses_registry_config_not_stale_resolver() -> None:
+    # The resolver returns a DIVERGENT config (different vector_collection). The
+    # registry is the single source of truth, so the retriever must receive the
+    # registry's authorized fixture config, never the resolver's stale one.
+    def stale_resolver(cid: str) -> CorpusConfig:
+        cfg = _corpus(cid)
+        return cfg.model_copy(update={"vector_collection": "STALE_WRONG"})
+
+    retriever = _FakeRetriever({"product_docs": [_evidence("ep", "e", "product_docs")]})
+    svc = ChatService(
+        retriever=retriever,  # type: ignore[arg-type]
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        model=_SynthesisModel(),
+        resolve_corpus=stale_resolver,
+        registry=InMemoryCorpusRegistry(),
+    )
+    svc.answer_multi_corpus("q", _ctx(), corpus_ids=["product_docs"])
+    assert retriever.received_configs, "retriever was not called"
+    received = retriever.received_configs[0]
+    # The fixture's real collection, not the resolver's stale "STALE_WRONG".
+    assert received.vector_collection != "STALE_WRONG"
+    assert received.name == "Product Documentation"
+
+
+# -- P1-4.3: partial fault degrades + surfaces an explicit limitation -------------
+
+
+def test_partial_fault_degrades_and_surfaces_limitation() -> None:
+    retriever = _PartialFaultRetriever(
+        fault_for={"product_docs"},
+        ok={"engineering_wiki": [_evidence("ee", "eng evidence", "engineering_wiki")]},
+    )
+    svc = _service(retriever, InMemoryCorpusRegistry())
+    env = svc.answer_multi_corpus(
+        "compare", _ctx(), corpus_ids=["product_docs", "engineering_wiki"]
+    )
+    # Degraded, not silently complete; the faulted corpus is named in limitations.
+    assert not env.abstained
+    assert env.completeness != "complete"
+    assert env.confidence != "high"
+    assert any("product_docs" in lim for lim in env.limitations)
+    # Only the contributing corpus is recorded.
+    assert env.corpora_used == ("engineering_wiki",)
+
+
+# -- P2-2: tool_calls reflects the true retrieval call count ----------------------
+
+
+def test_tool_calls_reflects_real_retrieval_count() -> None:
+    retriever = _FakeRetriever(
+        {
+            "product_docs": [_evidence("ep", "e", "product_docs")],
+            "engineering_wiki": [_evidence("ee", "e", "engineering_wiki")],
+        }
+    )
+    svc = _service(retriever, InMemoryCorpusRegistry())
+    env = svc.answer_multi_corpus(
+        "compare", _ctx(), corpus_ids=["product_docs", "engineering_wiki"]
+    )
+    assert env.tool_calls == 2
+
+
+def test_tool_calls_zero_when_no_corpus_discoverable() -> None:
+    # ctx restricted to a corpus id the router won't surface; no corpus discoverable.
+    retriever = _FakeRetriever({})
+    svc = _service(retriever, InMemoryCorpusRegistry())
+    env = svc.answer_multi_corpus("q", _ctx(allowed_corpus_ids=["nonexistent"]))
+    assert env.abstained
+    assert env.tool_calls == 0
