@@ -29,6 +29,7 @@ def _fresh_default_container():
     yield
     _container_mod._CONTAINER = saved
 
+
 _TENANT = "t1"
 _CORPUS = "eng"
 _DOC = "doc-1"

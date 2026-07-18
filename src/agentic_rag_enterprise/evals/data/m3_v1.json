@@ -1,0 +1,70 @@
+{
+  "version": "m3_v1",
+  "cases": [
+    {
+      "id": "case-sufficient",
+      "query": "what is the vacation policy?",
+      "corpus_id": "eng",
+      "required_facts": ["vacation policy"],
+      "evidence": {
+        "what is the vacation policy?": [
+          "The vacation policy grants 20 days paid leave per year."
+        ]
+      },
+      "expected_overall": "sufficient",
+      "gold_missing_fact_ids": []
+    },
+    {
+      "id": "case-insufficient",
+      "query": "what is the secret project codename?",
+      "corpus_id": "eng",
+      "required_facts": ["secret project codename"],
+      "evidence": {},
+      "expected_overall": "insufficient",
+      "gold_missing_fact_ids": ["secret project codename"]
+    },
+    {
+      "id": "case-gap-retrieval",
+      "query": "what is the vacation policy and how do i request time off?",
+      "corpus_id": "eng",
+      "required_facts": ["vacation policy", "request time off"],
+      "evidence": {
+        "what is the vacation policy and how do i request time off?": [
+          "The vacation policy grants 20 days paid leave per year."
+        ],
+        "request time off": [
+          "Employees request time off via the HR portal."
+        ]
+      },
+      "expected_overall": "sufficient",
+      "gold_missing_fact_ids": []
+    },
+    {
+      "id": "case-partial-exhausted",
+      "query": "what is the vacation policy and the bonus structure?",
+      "corpus_id": "eng",
+      "required_facts": ["vacation policy", "bonus structure"],
+      "evidence": {
+        "what is the vacation policy and the bonus structure?": [
+          "The vacation policy grants 20 days paid leave per year."
+        ],
+        "bonus structure": []
+      },
+      "expected_overall": "partially_sufficient",
+      "gold_missing_fact_ids": ["bonus structure"]
+    },
+    {
+      "id": "case-contradicted",
+      "query": "is the office in new york?",
+      "corpus_id": "eng",
+      "required_facts": ["office in new york"],
+      "evidence": {
+        "is the office in new york?": [
+          "The office is not in new york; it is in boston."
+        ]
+      },
+      "expected_overall": "contradicted",
+      "gold_missing_fact_ids": []
+    }
+  ]
+}

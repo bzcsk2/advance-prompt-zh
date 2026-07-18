@@ -22,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
+from agentic_rag_enterprise.judge.models import SufficiencyResult
 
 ClaimImportance = Literal["critical", "supporting", "minor"]
 ClaimSupport = Literal["entailed", "partially_entailed", "contradicted", "unsupported"]
@@ -118,6 +119,12 @@ class AnswerEnvelope(BaseModel):
     corpora_used: tuple[str, ...] = Field(default_factory=tuple)
     iterations: int = 1
     tool_calls: int = 1
+
+    # M3 quality-iteration metadata (build plan §7.8 / §14). Optional: the E-013
+    # envelope is still valid without it. Does not affect the abstain/insufficient
+    # lock in `_lock_state`.
+    gap_rounds: int = 1
+    coverage: SufficiencyResult | None = None
 
     stop_reason: str
     abstained: bool

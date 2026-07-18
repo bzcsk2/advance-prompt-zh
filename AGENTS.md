@@ -4,7 +4,7 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M2** — Single-corpus Internal MVP (`E-011 -> E-014`)
+- Milestone: **M3** — Single-corpus quality iteration (`E-019 -> E-020`)
 - Issue: **E-011** — Evidence snapshot store and required deduplication — merged at
   `4b32b34`; acceptance remediation completed in the current change set (current-policy
   reauthorization after ACL tightening/delete, per-owner ACL persistence, fuzzy-dedup
@@ -34,7 +34,8 @@
   verified claims, caller prose never returned) + `b7ed855` (whole-tree format gate clean).
   Full contract at `docs/issue-e013-contract.md`.
 - Issue: **E-014** — shared chat application service, synchronous `/v1/chat` contract, and a
-  minimal Gradio adapter — **acceptance remediation (current change set)**: the original
+  minimal Gradio adapter — **CLOSED** (acceptance remediation committed at `5084b2f`; run-chain
+  verified end-to-end against the real default app). The original
   implementation passed unit tests but failed acceptance on 4 P1 + 1 P2 findings. Fixed:
   (P1-1) the default `/v1/chat` is now runnable — `get_chat_service` returns a shared, in-process
   `DefaultServiceContainer` (in-memory Qdrant, deterministic encoders, a hermetic synthesis model
@@ -52,11 +53,27 @@
   `api/routes/chat.py` `POST /v1/chat` is an adapter that injects the runtime `SecurityContext`
   and returns the `AnswerEnvelope` (no SSE, no `denied_reasons` leak); `ui/gradio_app.py` is
   import-safe (lazy gradio). Backend / model faults propagate as typed errors, never as a refusal.
-  **Internal MVP (E-011 → E-014) run-chain complete (pending re-verification).** Full contract at
+  **Internal MVP (E-011 → E-014) run-chain complete (verified end-to-end).** Full contract at
   `docs/issue-e014-contract.md`.
+- Issue: **E-019** — Required-Fact Coverage judge + explicit state transitions — **implemented**
+  (current change set). Adds the Stage A `DeterministicCoverageJudge` (lexical overlap + negation
+  heuristic) and Stage B `DeterministicClaimEvidenceVerifier` behind a pluggable `Judge` protocol,
+  exposing per-fact `FactStatus` and a `SufficiencyResult` on `AnswerEnvelope`; maps coverage →
+  explicit state transitions (`sufficient`→complete, `partially_sufficient`→partial + missing list,
+  `contradicted`→conflicted, `insufficient`/`policy_blocked`→abstain). `answer()` stays single-pass
+  (delegates to `answer_with_iteration(max_rounds=1, judge=None)`) so E-014 behaviour is unchanged.
+  Full contract at `docs/issue-e019-contract.md`.
+- Issue: **E-020** — Bounded gap retrieval + no-new-evidence stop policy — **implemented**
+  (current change set). Reuses the E-019 `Judge`; adds `GapPlanner` (queries only for
+  `missing`/`partially_supported`/`not_retrievable`) and `StopPolicy` (`sufficient` / `no_new_evidence`
+  / `max_rounds` / `budget_exhausted` / `tool_unavailable`) driving a bounded 2–3 round loop in
+  `ChatService.answer_with_iteration` (accumulates Evidence, re-judges, synthesizes only after the
+  loop). A judge fault degrades conservatively to an abstain (never a fabricated complete answer).
+  Adds a deterministic eval harness (`evals/dataset.py`, `evals/runner.py`, `false_sufficient`,
+  `judge_timeout_degradation`, `evals/data/m3_v1.json`). Full contract at `docs/issue-e020-contract.md`.
 - Next milestones (after the Internal MVP):
-  - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP (E-019 grounding/eval harness,
-    E-020 Required-Fact Judge + sufficiency refine). Not started.
+  - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP — **implemented** (current change set);
+    pending local commit + push.
   - **M4 / E-015 → E-016** — Research MVP (multi-Corpus Registry, Planner DAG, Required-Fact
     Judge, iteration). Not started.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
@@ -488,6 +505,26 @@ from `026190f`.
   real upgrade → backfill → takeover → publish cleans old data plane).
 - `tests/baseline/` MUST remain green.
 - `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (incl. `tests/baseline/`) all green.
+
+## E-019 Allowed Changes (M3 only)
+- `src/agentic_rag_enterprise/judge/` (new): `models.py` (`FactStatus`, `RequiredFact`, `FactCoverage`, `CoverageJudgeResult`, `SufficiencyResult`, `GapRetrievalPlan`, `StopDecision`), `protocol.py` (`Judge`, `JudgeError`, `JudgeTimeoutError`), `deterministic_coverage_judge.py` (`DeterministicCoverageJudge`), `query_fact_extractor.py` (`DeterministicQueryFactExtractor`), `claim_evidence_verifier.py` (`DeterministicClaimEvidenceVerifier`).
+- `src/agentic_rag_enterprise/answer/envelope.py` — add `coverage: SufficiencyResult | None`, `gap_rounds: int`; preserve the abstain/insufficient lock.
+- `src/agentic_rag_enterprise/answer/verification.py` — extend `ClaimVerificationResult` with per-claim `support_status`.
+- `src/agentic_rag_enterprise/answer/builder.py` — extend `build_answer_envelope(..., coverage=, claim_verification=)`.
+- `src/agentic_rag_enterprise/services/chat_service.py` — add `answer_with_iteration`; `answer()` unchanged in behaviour.
+- `tests/unit/judge/`, `tests/unit/test_chat_service_iteration.py`, `tests/integration/test_e019_e020_pipeline.py`.
+- `docs/issue-e019-contract.md`, `docs/issue-e020-contract.md`, `AGENTS.md`.
+- **Reuse, no change:** `retrieval/fast_path.py`, `retrieval/retriever.py`, `domain/evidence.py`, `domain/security.py`, `providers.py`, `config.py`.
+- **Forbidden:** no `agents/`/`graph/` M0 runtime extension; no second retrieval pass (E-020); no real LLM judge; no change to E-011/E-012/E-013 behaviour beyond the agreed `AnswerEnvelope`/`verify_claims` extensions.
+
+## E-020 Allowed Changes (M3 only)
+- `src/agentic_rag_enterprise/judge/gap_planner.py` (`GapPlanner`), `src/agentic_rag_enterprise/judge/stop_policy.py` (`StopPolicy`) — reuse `models.py`/`protocol.py`/`deterministic_coverage_judge.py`.
+- `src/agentic_rag_enterprise/services/chat_service.py` — `answer_with_iteration` bounded loop (reuses `retriever.retrieve_evidence(..., iteration=round)`); `answer()` unchanged.
+- `src/agentic_rag_enterprise/answer/builder.py` — `coverage`/`claim_verification`/`gap_rounds`/`iterations`/`tool_calls`/`missing_aspects`.
+- `src/agentic_rag_enterprise/evals/` — `dataset.py`, `runner.py`, `metrics.py` extend (`false_sufficient`, `judge_timeout_degradation`), `evals/data/m3_v1.json`.
+- `tests/unit/judge/test_gap_planner.py`, `tests/unit/judge/test_stop_policy.py`, `tests/evals/test_evals_harness.py`.
+- **Reuse, no change:** `retrieval/fast_path.py`, `retrieval/retriever.py`, `domain/evidence.py`, `domain/security.py`, `providers.py`, `config.py`.
+- **Forbidden:** no `agents/`/`graph/` M0 runtime extension; no Planner/DAG, no multi-corpus, no unbounded loop (`max_rounds` default 3 + `no_new_evidence` are hard stops); faults never relabelled as answers; no real LLM judge.
 
 ## Standard Checks
 ```bash
