@@ -4,7 +4,22 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M3** — Single-corpus quality iteration (`E-019 -> E-020`)
+- Milestone: **M5** — Controlled Planner and dependent multi-hop (`E-017 -> E-018`)
+- Issue: **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator — **in
+  progress** (current change set). Pure control-plane: frozen `QueryPlan` / `PlanStep` /
+  `StepDependency` / `BindingExpression` / `PlanValidationResult` types,
+  DAG cycle detection, corpus/capability authorization validation, budget pre-validation,
+  and planner structured-output repair (at most one `REPAIR`). No execution, no real
+  `SecureRetriever` call. Full contract at `docs/issue-e017-contract.md`.
+- Issue: **E-018** — Controlled Executor + dependent multi-hop — **next**, not started.
+  Consumes an accepted `QueryPlan`: `StepResult`, parallel-ready scheduling, dependency
+  binding, per-step timeout, atomic shared budget, exactly one retry, failure
+  degradation. Out of scope for E-017.
+- Prior milestone **M4 / E-015 -> E-016** — Multi-Corpus retrieval — **CLOSED / ACCEPTED**
+  at `033c8e2` (E-016 second re-audit passed). E-015 (Corpus/Capability Registry
+  + three Corpus fixtures + permission-safe discoverability) CLOSED; E-016
+  (permission-aware soft router + cross-Corpus retrieval merge + dedup) CLOSED. Detailed
+  E-016 closure notes retained in the issue history below.
 - Issue: **E-011** — Evidence snapshot store and required deduplication — merged at
   `4b32b34`; acceptance remediation completed in the current change set (current-policy
   reauthorization after ACL tightening/delete, per-owner ACL persistence, fuzzy-dedup
@@ -583,6 +598,37 @@ from `026190f`.
 - `tests/unit/judge/test_gap_planner.py`, `tests/unit/judge/test_stop_policy.py`, `tests/evals/test_evals_harness.py`.
 - **Reuse, no change:** `retrieval/fast_path.py`, `retrieval/retriever.py`, `domain/evidence.py`, `domain/security.py`, `providers.py`, `config.py`.
 - **Forbidden:** no `agents/`/`graph/` M0 runtime extension; no Planner/DAG, no multi-corpus, no unbounded loop (`max_rounds` default 3 + `no_new_evidence` are hard stops); faults never relabelled as answers; no real LLM judge.
+
+## E-017 Allowed Changes (M5 only) — in progress
+Typed `QueryPlan` / `PlanStep` contract + DAG Validator. **Pure control plane; no
+execution, no `SecureRetriever` call, no Tool.** Full contract at
+`docs/issue-e017-contract.md`.
+- `src/agentic_rag_enterprise/planner/` (new): `models.py` (`PlanStep`, `QueryPlan`,
+  `StepDependency`, `PlanViolation`, `PlanViolationCode`, `PlanValidationResult` — all
+  frozen + validated; `PlanStep` adds `optional_depends_on_step_ids` for §13.2 optional
+  deps), `binding.py` (`BindingExpression` + `parse` for the §13.2 grammar
+  `steps.<step_id>.outputs.<field>` / `facts.<fact_id>.value`; `BindingSyntaxError`),
+  `validator.py` (`PlanValidator.validate(plan, ctx, registry)` — step_id uniqueness,
+  dependency existence, DAG cycle detection, corpus authorization via
+  `registry.get(...)` fail-closed, capability allowlist via `CapabilityCatalog.supports`,
+  static budget pre-validation — each step ≤ global **AND** `sum(steps) ≤ global` — query
+  non-empty, `input_bindings` reference legal upstream steps/facts, no write operation),
+  `repair.py` (`parse_plan` structured-output parse with **at most one** injected
+  `repair_fn`; `PlanRepairExhaustedError`), `__init__.py`.
+- `tests/unit/planner/` (new): `test_binding.py`, `test_plan_models.py`,
+  `test_plan_validator.py`, `test_plan_repair.py`.
+- `tests/integration/test_e017_planner_contract.py` (new): illegal DAG → zero Tool
+  (structurally — no executor exists), cycle rejected, missing/undeclared binding
+  rejected, unauthorized Corpus never in an accepted plan (name not leaked to user),
+  total budget statically rejected, malformed planner output repaired at most once.
+- `docs/issue-e017-contract.md`, `AGENTS.md`.
+- **Reuse, no change:** `judge/models.py` (`RequiredFact`), `corpus/registry.py`,
+  `corpus/capability_registry.py`, `domain/security.py`, `retrieval/models.py`
+  (`CorpusNotDiscoverableError`).
+- **Forbidden:** no Executor / `StepResult` / scheduling / step timeout / retry / budget
+  allocator (all E-018); no real `SecureRetriever` / Tool call; no LLM Planner (repair_fn
+  is injected); no temporal-conflict arbitration; no `agents/`/`graph/` runtime change; no
+  change to E-011→E-016 behaviour.
 
 ## Standard Checks
 ```bash
