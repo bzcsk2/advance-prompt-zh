@@ -5,16 +5,18 @@
 
 ## Current Milestone & Issue
 - Milestone: **M5** — Controlled Planner and dependent multi-hop (`E-017 -> E-018`)
-- Issue: **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator — **in
-  progress** (current change set). Pure control-plane: frozen `QueryPlan` / `PlanStep` /
-  `StepDependency` / `BindingExpression` / `PlanValidationResult` types,
-  DAG cycle detection, corpus/capability authorization validation, budget pre-validation,
-  and planner structured-output repair (at most one `REPAIR`). No execution, no real
-  `SecureRetriever` call. Full contract at `docs/issue-e017-contract.md`.
-- Issue: **E-018** — Controlled Executor + dependent multi-hop — **next**, not started.
-  Consumes an accepted `QueryPlan`: `StepResult`, parallel-ready scheduling, dependency
-  binding, per-step timeout, atomic shared budget, exactly one retry, failure
-  degradation. Out of scope for E-017.
+- Issue: **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator — **CLOSED /
+  ACCEPTED at `398f059`** (acceptance re-audit `33c...` passed: 10-check independent
+  re-verification — schema invariants, DAG integrity for required+optional edges, binding
+  semantics, permission redaction, registry-as-truth-source, capability/read-only
+  boundary, budget math, repair limit, pure control-plane boundary, E-018 readiness). The
+  re-audit also hardened `PlanViolation.detail` to `Field(exclude=True, repr=False)` so
+  the unauthorized Corpus name cannot leak via `str()`/`repr()` into logs. Full contract
+  at `docs/issue-e017-contract.md`.
+- Issue: **E-018** — Controlled Executor + dependent multi-hop — **in progress** (current
+  change set). Consumes an accepted `QueryPlan`: `StepResult`, parallel-ready scheduling,
+  dependency binding, per-step timeout, atomic shared budget, exactly one retry, failure
+  degradation. Full contract at `docs/issue-e018-contract.md`.
 - Prior milestone **M4 / E-015 -> E-016** — Multi-Corpus retrieval — **CLOSED / ACCEPTED**
   at `033c8e2` (E-016 second re-audit passed). E-015 (Corpus/Capability Registry
   + three Corpus fixtures + permission-safe discoverability) CLOSED; E-016
@@ -599,7 +601,7 @@ from `026190f`.
 - **Reuse, no change:** `retrieval/fast_path.py`, `retrieval/retriever.py`, `domain/evidence.py`, `domain/security.py`, `providers.py`, `config.py`.
 - **Forbidden:** no `agents/`/`graph/` M0 runtime extension; no Planner/DAG, no multi-corpus, no unbounded loop (`max_rounds` default 3 + `no_new_evidence` are hard stops); faults never relabelled as answers; no real LLM judge.
 
-## E-017 Allowed Changes (M5 only) — in progress
+## E-017 Allowed Changes (M5 only) — CLOSED / ACCEPTED at `398f059`
 Typed `QueryPlan` / `PlanStep` contract + DAG Validator. **Pure control plane; no
 execution, no `SecureRetriever` call, no Tool.** Full contract at
 `docs/issue-e017-contract.md`.

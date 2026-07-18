@@ -132,7 +132,7 @@ class PlanViolation(BaseModel):
 
     code: PlanViolationCode
     message: str
-    detail: str = Field(default="", exclude=True)
+    detail: str = Field(default="", exclude=True, repr=False)
     step_id: str | None = None
 
     @classmethod
