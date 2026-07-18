@@ -90,6 +90,32 @@ def test_medium_confidence_routes_top2() -> None:
     assert route.fallback_search is False
 
 
+def test_fallback_candidate_only_for_high_no_limit() -> None:
+    # §9.3 single-step fallback is exposed ONLY for a high-confidence Top-1 route
+    # that was not narrowed by an explicit limit. medium/low routes and a truncated
+    # route must NOT smuggle a second corpus in via fallback_candidates.
+    router = CorpusRouter()
+    reg = InMemoryCorpusRegistry()
+
+    high = router.route("troubleshooting workarounds resolution notes", _ctx(), reg)
+    assert high.route_confidence == "high"
+    assert len(high.candidates) == 1
+    assert len(high.fallback_candidates) == 1  # Top-2 expansion available
+
+    medium = router.route("product documentation and engineering notes", _ctx(), reg)
+    assert medium.route_confidence == "medium"
+    assert medium.fallback_candidates == ()  # Top-2 already broad enough
+
+    low = router.route("zzzz qqqq wxyz", _ctx(), reg)
+    assert low.route_confidence == "low"
+    assert low.fallback_candidates == ()  # broaden via fallback_search, not a ranked candidate
+
+    # Explicit hard limit=1 on a high route must NOT expose a fallback candidate.
+    truncated = router.route("troubleshooting workarounds resolution notes", _ctx(), reg, limit=1)
+    assert len(truncated.candidates) == 1
+    assert truncated.fallback_candidates == ()
+
+
 def test_route_excludes_undiscoverable_corpus_and_rationale_non_leaky() -> None:
     router = CorpusRouter()
     ctx = _ctx(allowed_corpus_ids=["product_docs"])

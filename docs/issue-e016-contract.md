@@ -214,12 +214,16 @@ ChatService.answer_multi_corpus(
   `candidates`. Otherwise restrict to the explicitly requested (and still
   discoverable) `corpus_ids`. A requested-but-undiscoverable corpus fails closed
   (never silently dropped into retrieval).
-- **§9.3 fallback expansion** — the `CorpusRoute` exposes a `fallback_candidates`
-  entry (the next-ranked corpus beyond the primary policy count, e.g. Top-2 for a
-  `high` route). `answer_multi_corpus` keeps the full ranked + fallback set; when a
-  `high`-confidence Top-1 primary returns **empty** Evidence, it *expands* to include
-  the fallback candidate (Top-2) and retries retrieval **once** before abstaining —
-  §9.3 forbids hard-routing a miss straight to "no answer".
+- **§9.3 fallback expansion (strictly scoped)** — the `CorpusRoute` exposes a
+  `fallback_candidates` entry **only for a `high`-confidence Top-1 route with no
+  explicit `limit`**; `medium` / `low` routes and any `limit`-truncated route leave
+  it empty, so a hard `router_limit` cap can never be bypassed by smuggling a second
+  corpus in via fallback. `answer_multi_corpus` only expands when ALL of
+  (`corpus_ids is None` AND `router_limit is None` AND `route_confidence == "high"` AND
+  primary Evidence is empty); on expansion it queries **only the new fallback corpus**
+  and merges the result with the primary (the primary is never re-queried), so
+  `retrieval_calls` / `tool_calls` equals the true call count (primary × 1 +
+  fallback × 1). §9.3 forbids hard-routing a miss straight to "no answer".
 - **Registry is the config source of truth** — the `CorpusConfig` handed to
   retrieval comes ONLY from `registry.get(corpus_id, ctx)` (for both routed and
   explicit ids, including fallback candidates); the legacy single-corpus

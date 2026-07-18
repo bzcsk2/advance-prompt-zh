@@ -112,6 +112,25 @@ def _partial_retrieval_limitations(
     )
 
 
+def _merge_results(primary: MultiCorpusResult, extra: MultiCorpusResult) -> MultiCorpusResult:
+    """Combine the primary retrieval with a §9.3 fallback expansion (P1-2).
+
+    The fallback corpus was queried *in addition* to (never instead of) the primary,
+    so every field is concatenated and ``retrieval_calls`` is summed — giving a
+    truthful total call count for ``tool_calls``.
+    """
+    return MultiCorpusResult(
+        evidence=primary.evidence + extra.evidence,
+        corpora_used=tuple(sorted(set(primary.corpora_used) | set(extra.corpora_used))),
+        routed=tuple(sorted(set(primary.routed) | set(extra.routed))),
+        faults=primary.faults + extra.faults,
+        insufficient_corpora=tuple(
+            sorted(set(primary.insufficient_corpora) | set(extra.insufficient_corpora))
+        ),
+        retrieval_calls=primary.retrieval_calls + extra.retrieval_calls,
+    )
+
+
 def _evidence_block(evidence: tuple[SnapshotEvidence, ...]) -> str:
     parts: list[str] = []
     for ev in evidence:
@@ -229,13 +248,21 @@ class ChatService:
             # registry.get fails closed for unknown / non-discoverable ids.
             selected = [self._registry.get(cid, ctx) for cid in corpus_ids]
             fallback: list[CorpusConfig] = []
+            allow_fallback = False
         else:
             route = self._router.route(query, ctx, self._registry, limit=router_limit)
             # Re-fetch each routed candidate's authorized config from the registry
             # so the data-plane config matches the control-plane approval exactly.
             selected = [self._registry.get(c.corpus_id, ctx) for c in route.candidates]
-            # The router's §9.3 fallback candidate (e.g. Top-2 for a high route).
-            fallback = [self._registry.get(c.corpus_id, ctx) for c in route.fallback_candidates]
+            # §9.3 fallback (Top-2 expansion) is ONLY a high-confidence Top-1 route
+            # with no explicit hard limit — medium/low are already broad, and a
+            # caller's ``router_limit`` must be a hard cap (P1-1).
+            allow_fallback = router_limit is None and route.route_confidence == "high"
+            fallback = (
+                [self._registry.get(c.corpus_id, ctx) for c in route.fallback_candidates]
+                if allow_fallback
+                else []
+            )
 
         if not selected and not fallback:
             # Nothing discoverable to query → abstain (no evidence, fail-closed).
@@ -254,7 +281,9 @@ class ChatService:
 
         # 2) Cross-corpus retrieval + merge/dedup (raises on total fault or on a
         #    partial fault that left no evidence — never an ordinary abstain).
-        result = self._retrieve_or_expand(query, ctx, selected, fallback)
+        result = self._retrieve_or_expand(
+            query, ctx, selected, fallback, allow_fallback=allow_fallback
+        )
 
         # Partial-fault (P1-4.3, frozen semantics = degrade + explicit limitation):
         # a routed corpus backend faulted but at least one sibling returned
@@ -279,14 +308,22 @@ class ChatService:
         ctx: SecurityContext,
         selected: list[CorpusConfig],
         fallback: list[CorpusConfig],
+        *,
+        allow_fallback: bool,
     ) -> MultiCorpusResult:
         """Retrieve across ``selected``; on a high-confidence empty primary, expand.
 
-        Passes security / authorization / binding errors through unchanged (P1-2):
-        only a genuine ``RetrievalBackendError`` from the retrieval layer is wrapped
-        as a ``FastPathBackendError`` (total outage → 5xx). A partial backend fault
-        that leaves no surviving evidence raises — it is never relabelled as a plain
-        ``no_evidence`` abstain (P1-4).
+        Fallback is gated by ``allow_fallback`` (computed by the caller as
+        ``corpus_ids is None AND router_limit is None AND route_confidence == high``)
+        so medium/low routes and explicit ``router_limit`` caps are never bypassed
+        (P1-1). When expanding, ONLY the new fallback corpus is retrieved and its
+        result is merged with the primary result — the primary is never re-queried,
+        so ``retrieval_calls`` / ``tool_calls`` reflects the true call count (P1-2).
+
+        Security / authorization / binding errors propagate in their original type
+        (P1-2): only a genuine ``RetrievalBackendError`` is wrapped as a
+        ``FastPathBackendError`` (total outage → 5xx). A partial backend fault that
+        leaves no surviving evidence raises — never an ordinary ``no_evidence`` (P1-4).
         """
         try:
             result = self._multi.retrieve(
@@ -309,32 +346,35 @@ class ChatService:
         except RetrievalBackendError as exc:
             raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
 
-        if not result.evidence:
-            # Primary returned nothing. If this was a high-confidence Top-1 route,
-            # the router supplied a §9.3 fallback candidate (Top-2) — expand and
-            # retry once before giving up (P1-1).
-            if fallback and set(c.corpus_id for c in fallback) - set(result.routed):
-                expanded = list(selected) + [
-                    c for c in fallback if c.corpus_id not in result.routed
-                ]
-                try:
-                    result = self._multi.retrieve(
-                        ctx,
-                        query,
-                        expanded,
-                        top_k=self._top_k,
-                        dense_encoder=self._dense_encoder,
-                        sparse_encoder=self._sparse_encoder,
-                    )
-                except (
-                    CorpusNotDiscoverableError,
-                    ParentAuthorizationError,
-                    EmptyAuthorizationScopeError,
-                    TenantBindingError,
-                ):
-                    raise
-                except RetrievalBackendError as exc:
-                    raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
+        if (
+            not result.evidence
+            and allow_fallback
+            and fallback
+            and set(c.corpus_id for c in fallback) - set(result.routed)
+        ):
+            # §9.3 single-step expansion: query ONLY the new fallback corpus (Top-2)
+            # and merge with the primary result. The primary is not re-queried, so the
+            # call count stays truthful (primary × 1 + fallback × 1).
+            new_corpus = [c for c in fallback if c.corpus_id not in result.routed]
+            try:
+                extra = self._multi.retrieve(
+                    ctx,
+                    query,
+                    new_corpus,
+                    top_k=self._top_k,
+                    dense_encoder=self._dense_encoder,
+                    sparse_encoder=self._sparse_encoder,
+                )
+            except (
+                CorpusNotDiscoverableError,
+                ParentAuthorizationError,
+                EmptyAuthorizationScopeError,
+                TenantBindingError,
+            ):
+                raise
+            except RetrievalBackendError as exc:
+                raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
+            result = _merge_results(result, extra)
 
         if not result.evidence and result.faults:
             # Partial fault with no surviving evidence: this is a backend outage,

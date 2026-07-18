@@ -87,12 +87,14 @@
     original implementation CLOSED at `67280a1`; a code-level audit returned **FAIL**
     (4 P1 + 3 P2), remediated and a **second** re-audit also returned **FAIL** (4 P1
     residual, focus on fallback + fault classification), now CLOSED at the current
-    commit. Adds `corpus/router.py` (`CorpusRouter` — deterministic, model-free,
+    commit. Adds     `corpus/router.py` (`CorpusRouter` — deterministic, model-free,
     **query-sensitive** ranking per build plan §9.3: `score = 0.7*relevance +
     0.3*(authority/100)` clamped `[0,1]`, `relevance` = normalized stopword-filtered
     token overlap of the query vs the corpus name/description/domain/id/capabilities;
-    emits `route_confidence` (high/medium/low) + `fallback_search` + `fallback_candidates`
-    and applies high→Top-1 / medium→Top-2 / low→Top-3+fallback; input is ONLY
+    emits `route_confidence` (high/medium/low) + `fallback_search`; `fallback_candidates`
+    is exposed ONLY for a high-confidence Top-1 route with no explicit `limit`
+    (medium/low/truncated routes stay empty, so a hard `router_limit` cap cannot be
+    bypassed); applies high→Top-1 / medium→Top-2 / low→Top-3+fallback; input is ONLY
     `registry.resolve_candidates`, never the full corpus map) and
     `retrieval/multi_corpus.py` (`MultiCorpusRetrieval` runs the existing
     `SecureRetriever.retrieve_evidence` once per selected corpus with the shared
@@ -114,9 +116,11 @@
     (`TenantBindingError` on mismatch); `retrieval_calls` tracks the true call count.
     `services/chat_service.py` `answer_multi_corpus(query, ctx, *, corpus_ids=None,
     router_limit=None)` sources the retrieval `CorpusConfig` ONLY from `registry.get(...)`
-    (routed + explicit + fallback; legacy `_resolve_corpus` never on this path); on a
-    **high-confidence Top-1 empty it expands to the Top-2 fallback candidate and retries
-    once** (§9.3 — never hard-route a miss to "no answer"); security/binding errors are
+    (routed + explicit + fallback; legacy `_resolve_corpus` never on this path); fallback
+    expansion is strictly scoped to **`corpus_ids is None` AND `router_limit is None` AND
+    `route_confidence == high` AND primary empty** — on which it queries ONLY the new
+    Top-2 fallback corpus (never re-queries the primary) and merges results so
+    `tool_calls` equals the true call count (P1-1/P1-2); security/binding errors are
     re-raised in their original type before any wrapping (never relabelled as
     `FastPathBackendError`); a partial fault *with no surviving evidence* raises rather
     than emitting a plain `no_evidence` abstain (P1-4); otherwise it routes → retrieves →

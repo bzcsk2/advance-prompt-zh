@@ -186,10 +186,17 @@ class CorpusRouter:
         confidence, policy_count, fallback = self._classify(scored)
         take = policy_count if limit is None else min(policy_count, limit)
         selected = scored[:take]
-        # The next-ranked corpora beyond the primary policy count are offered as
-        # fallback expansion candidates (Top-1 → Top-2 etc.) when the primary is
-        # empty. Capped to one extra corpus for the §9.3 single-step expansion.
-        fallback_cands = tuple(scored[take : take + 1]) if take < len(scored) else ()
+        # §9.3 single-step fallback expansion: only a *high*-confidence Top-1 route
+        # may expose the next-ranked corpus (Top-2) as a fallback candidate, and only
+        # when the policy was not narrowed by an explicit ``limit``. medium (Top-2)
+        # and low (Top-3) routes are already sufficiently broad; a truncated route
+        # must respect the caller's hard cap and must NOT smuggle a second corpus in
+        # via fallback. `fallback_search` (low-confidence probe) is a separate signal
+        # and does not imply a ranked fallback candidate here.
+        if confidence == "high" and limit is None and take < len(scored):
+            fallback_cands = tuple(scored[take : take + 1])
+        else:
+            fallback_cands = ()
 
         return CorpusRoute(
             query=query,

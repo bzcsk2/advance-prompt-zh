@@ -354,10 +354,42 @@ def test_high_confidence_top1_empty_expands_to_top2() -> None:
     )
     svc = _service(retriever, _routed_registry())
     env = svc.answer_multi_corpus("product release notes", _ctx())
-    # Both primary and fallback candidate were queried (one retrieval call each).
-    assert set(retriever.calls) == {"product_docs", "engineering_wiki"}
+    # Exactly two retrieval calls: primary once, then ONLY the new fallback corpus.
+    # The primary must NOT be re-queried (P1-2).
+    assert retriever.calls == ["product_docs", "engineering_wiki"]
+    assert env.tool_calls == 2
     assert not env.abstained
     assert env.corpora_used == ("engineering_wiki",)
+
+
+def test_medium_confidence_empty_does_not_expand() -> None:
+    # A query that yields medium confidence (some relevance, no dominant winner)
+    # must NOT expand to a third corpus even if both Top-2 are empty. §9.3: medium
+    # → Top-2, no fallback.
+    retriever = _FakeRetriever({"product_docs": [], "engineering_wiki": []})
+    svc = _service(retriever, _routed_registry())
+    env = svc.answer_multi_corpus("release notes", _ctx())
+    # Only the two Top-2 corpora were queried; no third corpus was smuggled in.
+    assert sorted(retriever.calls) == ["engineering_wiki", "product_docs"]
+    assert env.tool_calls == 2
+    assert env.abstained
+
+
+def test_router_limit_is_a_hard_cap_no_fallback() -> None:
+    # An explicit router_limit=1 truncates the route to a single corpus; the §9.3
+    # fallback must NOT bypass that hard cap (P1-1).
+    retriever = _FakeRetriever(
+        {
+            "product_docs": [],
+            "engineering_wiki": [_evidence("ee", "eng", "engineering_wiki")],
+        }
+    )
+    svc = _service(retriever, _routed_registry())
+    env = svc.answer_multi_corpus("product release notes", _ctx(), router_limit=1)
+    # With a hard cap of 1, only the primary is queried; the fallback is suppressed.
+    assert retriever.calls == ["product_docs"]
+    assert env.tool_calls == 1
+    assert env.abstained
 
 
 # -- P1-2: security / binding errors propagate in their original type -----------
