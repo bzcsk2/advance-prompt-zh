@@ -1,7 +1,7 @@
 # Issue E-018 — Controlled DAG Executor + dependent multi-hop
 
 **Milestone:** M5 — Controlled Planner and dependent multi-hop (`E-017 -> E-018`)
-**Status:** contract frozen / implementation pending (acceptance of this doc unlocks `executor.py`, result models, budget, tool registry, and tests)
+**Status:** contract amended (P1-1..P1-5 + P2 from the `5d02d99` re-audit) / implementation still pending — acceptance of this amended doc unlocks `executor.py`, result models, budget, tool registry, and tests
 **Baseline:** `0e81ac0` (M5 / E-017 CLOSED / ACCEPTED)
 **Build plan refs:** §13.2 (Planner DAG), §13.4 (DAG execution), §13.5 (Planner 不得决定权限), §9.1 / §9.2 (Capability + Corpus Registry), §12.x (retrieval security envelope).
 **Depends on:** E-017 `QueryPlan` / `PlanStep` / `StepDependency` / `BindingExpression` / `PlanValidator` (frozen, ACCEPTED at `398f059`/`0e81ac0`).
@@ -87,6 +87,53 @@ class StepResult(BaseModel):
     tool_calls_consumed: int = 0         # attempts that actually launched a Tool
 ```
 
+### 2a. `PlanExecutionResult` and the "usable result" definition (P1-4 amendment)
+
+The final report is frozen as:
+
+```python
+class PlanExecutionResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    plan_id: str
+    accepted: bool                       # plan passed pre-execution validation
+    executed: bool                      # at least one Tool launch was attempted
+    degraded: bool                      # partial success -> True (see usable-result rule)
+    steps: tuple[StepResult, ...]       # in deterministic plan / topological order
+    tool_calls_used: int                # == sum of StepResult.tool_calls_consumed
+    evidence_ids: tuple[str, ...]       # union of all succeeded steps' evidence_ids
+    limitations: tuple[str, ...] = ()   # human-readable degradation notes (user-safe)
+    error_code: str | None = None       # set when the whole execution fails closed
+    message: str = ""                   # USER-SAFE (never corpus/tenant/user names)
+    detail: str = Field(default="", exclude=True, repr=False)  # internal only
+```
+
+Invariants:
+
+- `tool_calls_used` == `sum(s.tool_calls_consumed for s in steps)` (single source of truth =
+  the `AtomicToolBudget` used count).
+- `steps` ordering is deterministic (§5): original plan step order with topological tie-break.
+- `evidence_ids` = the union of `evidence_ids` across `succeeded` steps only.
+- `limitations` entries are **user-safe** (no corpus/tenant name); internal specifics live in
+  `detail`.
+
+**"Usable result" definition (frozen):**
+
+- A result is **usable** iff **at least one `succeeded` step produced Evidence**
+  (`evidence_ids` non-empty). Intermediate-only success with no Evidence is *not* usable on
+  its own for the answer path.
+- **Degraded** (`degraded=True`) iff: not all steps succeeded, yet at least one `succeeded`
+  step produced Evidence. The report is returned with `limitations` listing the failed/
+  skipped steps (user-safe). Example: the first hop succeeds (Entity found) but the second
+  hop fails or is skipped → **degraded**, not raised.
+- **Fail closed (raise `PlanExecutionError`)** iff **zero** steps produced usable Evidence
+  (no `succeeded` step with Evidence). This includes: all steps failed/timed_out/skipped,
+  or only non-Evidence intermediate steps succeeded. A fabricated complete answer is never
+  returned.
+- **Sink-step rule:** there is no special "only the sink step counts" exception — usability
+  is Evidence-based, so any hop that yields Evidence makes the overall result usable; the
+  final merge (in the caller, e.g. `answer_multi_corpus` / answer builder) decides which
+  Evidence feeds the answer. The Executor only reports `evidence_ids` + `degraded`.
+
 ## 3. Required vs optional dependency
 
 E-017 `PlanStep` already carries `depends_on_step_ids` (hard) and
@@ -117,9 +164,16 @@ E-017 `PlanStep` already carries `depends_on_step_ids` (hard) and
 - Binding reads **only** registered outputs of **completed** (terminal, `succeeded`)
   upstream steps. No attribute access beyond the declared `output_field`, no index
   expressions, no function calls, no string evaluation / `eval` / Jinja / Python.
-- `facts.<id>.value` source & lifecycle: the value comes from `QueryPlan.required_facts`
-  (a planning-time constant), resolved by the Executor before launch; it is a static
-  literal, never recomputed at runtime and never merged with retrieval output.
+- **`facts.<id>.value` source & lifecycle (P1-1 amendment).** The E-017 `RequiredFact`
+  model has only `fact_id` / `description` / `required` / `depends_on_fact_ids` — there is
+  **no** `value` field. To keep E-018 within E-017's frozen contract (no silent E-017
+  amendment), `facts.<id>.value` is **frozen to mean `RequiredFact.description`**: the
+  planning-time textual statement of the fact. The Executor resolves it from
+  `QueryPlan.required_facts` before launch; it is a static literal, never recomputed at
+  runtime and never merged with retrieval output. The binding value is the `description`
+  string (plain text, length-limited). No separate `fact_values` map and no new E-017 field
+  are introduced. (If a future milestone needs richer fact values, that is an E-017 contract
+  amendment, not an E-018 executor concern.)
 - Template substitution (`{{step_id.field}}`) happens **before** the Tool call, producing a
   plain-text `query`. Bound values are text-escaped and length-limited.
 - Missing **required** binding → step does not execute (see §3).
@@ -127,12 +181,59 @@ E-017 `PlanStep` already carries `depends_on_step_ids` (hard) and
 - Step output must pass the code-side schema registered under `output_schema_id`
   (`entity` / `spec` / `comparison` / `intermediate`). A mismatch is a **non-retryable
   plan / programming error**, not a backend fault.
-- Binding failure or output-schema validation failure → `failed` with
-  `error_code="binding_error"` / `"output_schema_error"`; **not** retried.
+- **Data binding failure** (Planner-data problem, NOT a security event) → `failed` with
+  `error_code="binding_error"` / `"output_schema_error"`; **not** retried. Per §3/§4a a
+  missing *required* input field blocks that single step (which may cascade as
+  `skipped_dependency` to its required downstream), but **other independent steps continue**
+  — this is a local step failure, not a whole-execution abort.
+- **Security / corpus binding failure** is a distinct class: `TenantBindingError`,
+  `CorpusNotDiscoverableError`, `ParentAuthorizationError`, `EmptyAuthorizationScopeError`
+  raised while resolving a corpus / tenant / evidence binding. This is a **security event**
+  (§9) and triggers immediate whole-execution fail-closed — never a partial result. The two
+  classes share the word "binding" only incidentally; their handling is mutually exclusive
+  and determined by exception **type**, not by the `binding_error` code.
 
 The existing `planner/binding.py` (`BindingExpression.parse`,
 `BindingExpression.parse_template_placeholder`) is reused; the Executor adds the
 *safe-substitution* + *type/ schema validation* layer on top.
+
+### 4a. `ToolSpec` and input-schema-driven optional binding (P1-2 amendment)
+
+To decide whether a **missing optional binding** blocks or allows a step, the Executor
+needs per-field input typing. This is supplied by a `ToolSpec` returned alongside the
+`Tool` from the `ToolRegistry` — it is an **execution-plane** concept (E-018), not part of
+the E-017 `QueryPlan`, so it requires no E-017 model change:
+
+```python
+from pydantic import BaseModel
+
+class ToolSpec(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    step_type: str
+    capability_id: str
+    input_model: type[BaseModel]        # validates resolved_inputs; fields carry
+                                         # Optional[...] / required to decide missingness
+    output_model: type[BaseModel]       # validates TypedStepOutput against output_schema_id
+    retryable_errors: frozenset[type[Exception]]  # e.g. {RetrievalBackendError,
+                                                  #        ConnectionError, TimeoutError}
+```
+
+- The `ToolRegistry.get(step_type, capability_id)` returns `(Tool, ToolSpec)` (or a
+  `ToolRegistration` carrying both).
+- **Optional-binding missingness rule (frozen):** before launch the Executor builds
+  `resolved_inputs` from completed-upstream outputs + `facts.<id>.value`. It then validates
+  `resolved_inputs` against `ToolSpec.input_model`. A field declared `Optional[...]` (or
+  explicitly nullable) **tolerates absence** → the step runs with that field `None` /
+  omitted. A **required** input field that is missing (because a required upstream did not
+  succeed, or a required `input_binding` resolved to nothing) → the step **does not execute**
+  and is `skipped_dependency` / `failed` per §3/§4. The Tool never guesses; the decision is
+  driven entirely by `ToolSpec.input_model`.
+- `output_model` is the code-side schema registered under `output_schema_id`
+  (`entity` / `spec` / `comparison` / `intermediate`); a mismatch → non-retryable
+  `failed` (`error_code="output_schema_error"`).
+
+This removes the earlier undefined "field-level schema" reference: the deciding schema is
+now the explicit `ToolSpec.input_model`.
 
 ## 5. Parallel scheduling & determinism
 
@@ -155,24 +256,31 @@ The global budget is `QueryPlan.max_tool_calls`; each step bids `PlanStep.max_to
 ```python
 class AtomicToolBudget:
     def __init__(self, total: int) -> None: ...
-    def reserve(self, n: int = 1) -> bool:
-        """Atomically decrement if `n` available; return False (no launch) otherwise.
-        Thread-safe; no read-then-write race that would let two parallel steps overspend."""
-    def consume(self, n: int = 1) -> None: ...   # record actual attempt count
+    def try_reserve(self, n: int = 1) -> bool:
+        """Atomically attempt to spend `n` units. On success: remaining -= n AND
+        used += n in ONE locked operation, return True. If insufficient: return False
+        and change nothing. No separate `consume` step exists, so there is a single
+        accounting transition and no double-count / leak path."""
+    def used(self) -> int: ...          # == sum of all successful reservations
+    def remaining(self) -> int: ...     # == total - used
 ```
 
-Frozen rules (the §6 race surface):
+Frozen rules (the §6 race surface) — **single, unambiguous API:**
 
-- **Every actual Tool call, including a retry, consumes exactly one budget unit** via
-  `reserve(1)` *before* launch.
-- Reserve is **atomic**; a parallel sibling cannot read a stale balance and both overspend.
-- Reserve failure → the Tool MUST NOT start; the step is `budget_exhausted`.
-- A call that **timed out but already launched** still counts (reserve happened pre-launch).
+- **Every actual Tool call, including a retry, spends exactly one budget unit** via
+  `try_reserve(1)` *before* launch. `try_reserve` atomically does `remaining -= 1;
+  used += 1` in one lock; there is **no separate `reserve` + `consume`** (that dual API was
+  ambiguous and is removed — P2 amendment).
+- `try_reserve` returns `False` → the Tool MUST NOT start; the step is `budget_exhausted`.
+- A call that **timed out but already launched** still counts (the unit was spent at
+  `try_reserve` pre-launch, never refunded).
 - A call that was **cancelled but already launched** a Tool still counts.
-- `validation`, `binding`, and `scheduling` are **not** Tool Calls.
-- `tool_calls_used` in the final report == the sum of all actual launched attempts across
-  all steps (initial + retries that actually ran).
-- **No refunds** — a retry consumes a fresh unit; refunding would enable double-spend under
+- `validation`, `binding`, and `scheduling` are **not** Tool Calls and never call
+  `try_reserve`.
+- `tool_calls_used` in the final report == `AtomicToolBudget.used()` == the sum of all
+  actual launched attempts across all steps (initial + retries that actually ran). Single
+  source of truth.
+- **No refunds** — a retry spends a fresh unit; refunding would enable double-spend under
   concurrency.
 - Steps MUST NOT keep their own counters; all accounting goes through `AtomicToolBudget`.
 
@@ -236,7 +344,7 @@ Retry mechanics:
 | required dependency `timed_out` | downstream `skipped_dependency` |
 | optional dependency `failed` / `timed_out` | downstream continues per §3 (binding delivered as missing sentinel) |
 | independent parallel step `failed` | other independent steps continue |
-| security / binding failure | **entire execution fails closed immediately** (no partial result) |
+| security / corpus binding failure (`TenantBindingError` / `CorpusNotDiscoverableError` / `ParentAuthorizationError` / `EmptyAuthorizationScopeError`) | **entire execution fails closed immediately** (no partial result) — distinct from the local `binding_error` data failure in §4 |
 | partial backend failure with usable results | return a **degraded** `PlanExecutionResult` (`degraded=True`, `limitations` listed) |
 | no usable result at all | raise a typed `PlanExecutionError` (never a fabricated complete answer) |
 | budget exhausted | no new Tool launches; un-started steps marked `budget_exhausted` |
@@ -287,6 +395,33 @@ Rules:
   `TypedStepOutput` with `evidence_ids`; a `RetrievalBackendError` is the only fault it
   surfaces as retryable — all security/binding faults propagate in their original type.
 
+### 10a. `RetrieverTool` Evidence → `entity`/`spec` projection (P1-5 amendment)
+
+`retrieve_evidence` returns `list[SnapshotEvidence]` (rich metadata: `text`,
+`corpus_id`, `document_id`, `section_path`, `authority_level`, `retrieval_score`, …). M5
+does **not** add an LLM `ExtractTool` — projection is **deterministic and model-free**,
+driven by `PlanStep.output_schema_id`:
+
+- **`entity`** → `{"entity_text": <top evidence text>, "corpus_id": <corpus_id>,
+  "document_id": <document_id>, "section_path": <section_path>, "authority_level": <int>}`.
+  When multiple Evidence exist, the one with the highest `retrieval_score` (tie-break:
+  highest `authority_level`, then `evidence_id`) is selected as `entity_text`; all
+  `evidence_ids` are still returned.
+- **`spec`** → `{"spec_text": <top evidence text>, "corpus_id": <corpus_id>,
+  "document_id": <document_id>, "metadata": {authority_level, retrieval_score,
+  section_path}}` — same selection rule.
+- **`comparison`** → `{"items": [per-evidence {corpus_id, text, authority_level}],
+  "evidence_ids": [...]}`.
+- **`intermediate`** → `{"texts": [evidence text per hit], "evidence_ids": [...]}`.
+
+The projection is pure mapping over the returned Evidence fields (no generation, no call
+into the synthesis model). This is what makes the dependent two-hop real end-to-end:
+Step 1 (`output_schema_id="entity"`) yields `entity_text`; the binding
+`steps.step1.outputs.entity_text` is substituted into Step 2's `query_template`; Step 2
+retrieves against the bound value. No Fake Tool is required for the main path. The soft
+binding field name (`entity_text` / `spec_text`) is part of the frozen `ToolSpec.output_model`
+so the grammar's `output_field` (`steps.<id>.outputs.<field>`) resolves against a real key.
+
 ## 11. Acceptance matrix (execution test plan)
 
 1. Two independent steps execute **truly in parallel** (shared wall-clock < sequential).
@@ -295,20 +430,36 @@ Rules:
 4. A `failed` required upstream → downstream runs **zero Tool calls**.
 5. A `failed` optional upstream → downstream **still executes** (binding missing sentinel).
 6. A `timed_out` step's result is **not overwritten** by a late completion.
-7. Retry happens **exactly once** on a retryable fault, and **consumes two budget units**.
+7. Retry happens **exactly once** on a retryable fault, and **spends two units** via two
+   `try_reserve(1)` calls (used count == 2).
 8. A programming error (`ValueError`/`TypeError`/`KeyError`) is **not retried**.
 9. With concurrency limit / budget = 1, **at most one Tool** is ever in flight.
-10. Retry **and** parallelism together still **never overspend** the budget.
+10. Retry **and** parallelism together still **never overspend** the budget (single
+    `try_reserve` transition, no `reserve`+`consume` double-count).
 11. An unauthorized Corpus fails closed **before or during** execution (no Tool call against it).
 12. A security error is **not** downgraded to a partial `StepResult`.
 13. An illegal plan executes **zero Tools** (re-validated, rejected pre-launch).
 14. Final `StepResult` ordering is **deterministic** (plan / topological order).
-15. `PlanExecutionResult.tool_calls_used` **equals** the real launched-attempt count.
+15. `PlanExecutionResult.tool_calls_used` **equals** `AtomicToolBudget.used()` (real launched
+    attempts).
 16. User-visible errors, `str()` / `repr()` and serialized report **never leak** corpus /
     tenant / user names (`detail` is `exclude=True, repr=False`).
 17. The Executor **never dynamically creates** a new step.
 18. Single-corpus Fast Path (E-012), M3 iteration (E-019/E-020) and M4 multi-corpus
     (E-015/E-016) full regressions are **unaffected**.
+19. `facts.<id>.value` binding resolves to `RequiredFact.description` (no value field exists
+    in E-017 `RequiredFact`); the resolved text is plain-text and length-limited.
+20. A data `binding_error` (missing required input per `ToolSpec.input_model`) fails only
+    that step and lets independent steps continue; a `TenantBindingError` /
+    `CorpusNotDiscoverableError` raised mid-execution aborts the **whole** execution.
+21. `PlanExecutionResult` is emitted with `degraded=True` + `limitations` when ≥1 step
+    produced Evidence but not all succeeded; raises `PlanExecutionError` when **zero** steps
+    produced Evidence (no fabricated answer).
+22. A two-hop plan whose Step-1 (`entity`) succeeds and Step-2 fails returns a **degraded**
+    report carrying Step-1 `evidence_ids` — not a raised error and not a complete answer.
+23. `RetrieverTool` projects `list[SnapshotEvidence]` into `entity_text` / `spec_text` via the
+    frozen deterministic rule (no LLM), so Step-1 output binds into Step-2 `query_template`
+    on the real main path (no Fake Tool).
 
 ## 12. Quality gates (implementation)
 
