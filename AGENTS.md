@@ -82,11 +82,23 @@
     (latest acceptance remediation `325dad0` → follow-up remediation). `no_new_evidence` is reachable
     end-to-end via one-new-gap-query-per-round; `gap_rounds`/`iterations` equal executed rounds.
   - **M4 / E-015 → E-016** — Multi-Corpus retrieval (build plan §9 / Milestone 4). **E-015
-    (Corpus/Capability Registry + three Corpus fixtures + permission-safe discoverability)
-    implemented** (current change set). **E-016** (permission-aware soft router + cross-Corpus
-    retrieval merge + dedup) not started. Explicitly **excludes** Planner DAG, Required-Fact
-    Judge and iteration (those are M5 / E-017 → E-018 and M3 / E-019 → E-020 respectively);
-    the build-plan M4 description that listed them is corrected to match §9 / Milestone 4.
+    (Corpus/Capability Registry + three Corpus fixtures + permission-safe discoverability) CLOSED.**
+    **E-016** (permission-aware soft router + cross-Corpus retrieval merge + dedup) **CLOSED**
+    at the current commit. Adds `corpus/router.py` (`CorpusRouter` — deterministic,
+    model-free ranking from `registry.resolve_candidates` only; top-1/top-2; never hands the
+    full corpus map to a model) and `retrieval/multi_corpus.py` (`MultiCorpusRetrieval` runs the
+    existing `SecureRetriever.retrieve_evidence` once per selected corpus with the shared
+    `SecurityContext`; `merge_evidence` dedups by stable Evidence id / text hash / document
+    version, folds same-text-same-version to the higher authority while preserving both source
+    corpora in `corpora_used`, and is fully deterministic; a single-corpus backend fault is
+    captured as `CorpusRetrievalFault` and never relabelled as "no Evidence", while a *total*
+    fault raises). `services/chat_service.py` gains an explicit `answer_multi_corpus(query, ctx,
+    *, corpus_ids=None)` that routes → retrieves → single-pass synthesizes; the single-corpus
+    `answer()` / `answer_with_iteration`, the E-012 Fast Path and the E-013/E-019/E-020 envelope
+    are unchanged. `AnswerEnvelope.corpora_used` reflects only corpora that actually contributed
+    Evidence. Full contract at `docs/issue-e016-contract.md`. Explicitly **excludes** Planner
+    DAG, Required-Fact Judge, iteration, authority/freshness conflict arbitration, and SQL/API/
+    graph capability (those are M5 / E-017 → E-018); the M4 description is corrected to match §9.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

@@ -165,9 +165,111 @@ def build_answer_envelope(
     _check_evidence_binding(ctx, effective_evidence, fast_path_result.corpus_id)
 
     evidence = effective_evidence
+
+    return _build_envelope_from_evidence(
+        ctx,
+        evidence,
+        claims or [],
+        claim_verification=claim_verification,
+        coverage=coverage,
+        gap_rounds=gap_rounds,
+        iterations=iterations,
+        tool_calls=tool_calls,
+        missing_aspects=missing_aspects,
+        stop_reason=stop_reason,
+        abstain_stop_reason=fast_path_result.stop_reason.value,
+        corpora_used=(fast_path_result.corpus_id,),
+        answer_markdown=answer_markdown,
+    )
+
+
+def build_multi_corpus_envelope(
+    ctx: SecurityContext,
+    *,
+    query: str,
+    evidence: tuple[SnapshotEvidence, ...],
+    corpora_used: tuple[str, ...],
+    answer_markdown: str,
+    claims: list[Claim] | None = None,
+    coverage: SufficiencyResult | None = None,
+    claim_verification: ClaimVerificationResult | None = None,
+    gap_rounds: int = 1,
+    iterations: int = 1,
+    tool_calls: int = 1,
+    missing_aspects: tuple[str, ...] | None = None,
+    stop_reason: str | None = None,
+) -> AnswerEnvelope:
+    """Build a validated envelope from merged multi-corpus Evidence (E-016).
+
+    Mirrors :func:`build_answer_envelope` but binds across *multiple* corpora
+    (``corpora_used`` + a multi-corpus tenant binding) instead of a single
+    Fast Path corpus. The merged Evidence must be bound to the request tenant and
+    to the set of contributing corpora — a cross-tenant / cross-corpus snapshot
+    must never reach the envelope (same fail-closed invariant as the single-corpus
+    path, extended to the E-016 multi-corpus merge).
+    """
+    for ev in evidence:
+        if ev.tenant_id != ctx.tenant_id:
+            raise TenantBindingError(
+                f"Evidence {ev.evidence_id!r} belongs to tenant {ev.tenant_id!r}, "
+                f"not {ctx.tenant_id!r}"
+            )
+        if ev.corpus_id not in corpora_used:
+            raise TenantBindingError(
+                f"Evidence {ev.evidence_id!r} belongs to corpus {ev.corpus_id!r}, "
+                f"not in the contributing set {corpora_used!r}"
+            )
+
+    # Empty merged evidence → conservative refusal (abstain lock). The single-pass
+    # multi-corpus path never fabricates an answer from nothing.
+    if not evidence:
+        return _build_refusal(
+            ctx,
+            corpora_used=corpora_used,
+            coverage=coverage,
+            gap_rounds=gap_rounds,
+            iterations=iterations,
+            tool_calls=tool_calls,
+        )
+
+    return _build_envelope_from_evidence(
+        ctx,
+        evidence,
+        claims or [],
+        claim_verification=claim_verification,
+        coverage=coverage,
+        gap_rounds=gap_rounds,
+        iterations=iterations,
+        tool_calls=tool_calls,
+        missing_aspects=missing_aspects,
+        stop_reason=stop_reason,
+        # Multi-corpus abstain lock always uses the canonical no_evidence reason.
+        abstain_stop_reason="no_evidence",
+        corpora_used=corpora_used,
+        answer_markdown=answer_markdown,
+    )
+
+
+def _build_envelope_from_evidence(
+    ctx: SecurityContext,
+    evidence: tuple[SnapshotEvidence, ...],
+    claims: list[Claim],
+    *,
+    claim_verification: ClaimVerificationResult | None,
+    coverage: SufficiencyResult | None,
+    gap_rounds: int,
+    iterations: int,
+    tool_calls: int,
+    missing_aspects: tuple[str, ...] | None,
+    stop_reason: str | None,
+    abstain_stop_reason: str,
+    corpora_used: tuple[str, ...],
+    answer_markdown: str,
+) -> AnswerEnvelope:
+    """Shared synthesis core for the single- and multi-corpus envelope builders."""
     evidence_ids = {ev.evidence_id for ev in evidence}
 
-    verification = claim_verification or verify_claims(claims or [], evidence_ids)
+    verification = claim_verification or verify_claims(claims, evidence_ids)
     citations = render_citations(evidence)
 
     # M3 coverage verdict drives completeness/confidence when available; otherwise
@@ -196,9 +298,9 @@ def build_answer_envelope(
 
     # An insufficient coverage verdict must abstain (preserves the E-013 lock).
     if completeness == "insufficient":
-        return conservative_refusal(
-            fast_path_result,
+        return _build_refusal(
             ctx,
+            corpora_used=corpora_used,
             coverage=coverage,
             gap_rounds=gap_rounds,
             iterations=iterations,
@@ -213,9 +315,7 @@ def build_answer_envelope(
     # no_new_evidence / all_sources_exhausted / sufficient / continue) is surfaced
     # when provided; otherwise the Fast Path's reason is used (P2-1). The abstain
     # lock always forces stop_reason == no_evidence and is never overridden here.
-    final_stop_reason = (
-        stop_reason if stop_reason is not None else fast_path_result.stop_reason.value
-    )
+    final_stop_reason = stop_reason if stop_reason is not None else abstain_stop_reason
 
     return AnswerEnvelope(
         request_id=ctx.request_id,
@@ -227,7 +327,7 @@ def build_answer_envelope(
         completeness=completeness,
         confidence=confidence,
         missing_aspects=missing_aspects or (),
-        corpora_used=(fast_path_result.corpus_id,),
+        corpora_used=corpora_used,
         iterations=iterations,
         tool_calls=tool_calls,
         gap_rounds=gap_rounds,
@@ -251,6 +351,47 @@ def _map_coverage_to_completeness(overall: str) -> tuple[Completeness, Confidenc
     if mapped is None:
         return ("partial", "medium")
     return mapped
+
+
+def _build_refusal(
+    ctx: SecurityContext,
+    *,
+    corpora_used: tuple[str, ...],
+    coverage: SufficiencyResult | None = None,
+    gap_rounds: int = 1,
+    iterations: int = 1,
+    tool_calls: int = 1,
+) -> AnswerEnvelope:
+    """Internal abstain builder shared by single- and multi-corpus paths.
+
+    Unlike the public :func:`conservative_refusal`, this does not require a
+    ``FastPathResult`` — it binds directly to ``ctx`` and the contributing
+    ``corpora_used`` (which, for multi-corpus, may be several corpora). The abstain
+    lock (``stop_reason == no_evidence``) is always honoured.
+    """
+    missing: tuple[str, ...] = ()
+    if coverage is not None:
+        missing = tuple(
+            fc.missing_information for fc in coverage.fact_coverage if fc.missing_information
+        )
+    return AnswerEnvelope(
+        request_id=ctx.request_id,
+        session_id=ctx.session_id,
+        answer_markdown=_ABSTAIN_MESSAGE,
+        claims=(),
+        evidence=(),
+        citations=(),
+        completeness="insufficient",
+        confidence="low",
+        missing_aspects=missing,
+        corpora_used=corpora_used,
+        iterations=iterations,
+        tool_calls=tool_calls,
+        gap_rounds=gap_rounds,
+        coverage=coverage,
+        stop_reason="no_evidence",
+        abstained=True,
+    )
 
 
 def conservative_refusal(

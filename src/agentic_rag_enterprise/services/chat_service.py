@@ -26,7 +26,10 @@ import logging
 from typing import TYPE_CHECKING, Callable, cast
 
 from agentic_rag_enterprise.answer import build_answer_envelope, conservative_refusal
+from agentic_rag_enterprise.answer.builder import build_multi_corpus_envelope
 from agentic_rag_enterprise.answer.envelope import AnswerEnvelope, TenantBindingError
+from agentic_rag_enterprise.corpus.registry import CorpusRegistry
+from agentic_rag_enterprise.corpus.router import CorpusRouter
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
@@ -51,6 +54,10 @@ from agentic_rag_enterprise.retrieval.fast_path import (
     run_fast_path,
 )
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
+from agentic_rag_enterprise.retrieval.multi_corpus import (
+    MultiCorpusRetrieval,
+    MultiCorpusResult,
+)
 from agentic_rag_enterprise.services.claims_schema import ClaimExtraction
 from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEncoder
 
@@ -116,6 +123,8 @@ class ChatService:
         sparse_encoder: SparseEncoder,
         model: ModelProvider,
         resolve_corpus: Callable[[str], CorpusConfig],
+        registry: CorpusRegistry | None = None,
+        router: CorpusRouter | None = None,
         top_k: int | None = None,
     ) -> None:
         self._retriever = retriever
@@ -123,6 +132,9 @@ class ChatService:
         self._sparse_encoder = sparse_encoder
         self._model = model
         self._resolve_corpus = resolve_corpus
+        self._registry = registry
+        self._router = router or CorpusRouter()
+        self._multi = MultiCorpusRetrieval(retriever)
         self._top_k = top_k
 
     def answer(
@@ -138,6 +150,133 @@ class ChatService:
         (including the ``insufficient`` → abstain short-circuit) is preserved.
         """
         return self.answer_with_iteration(query, ctx, corpus_id, max_rounds=1, judge=None)
+
+    def answer_multi_corpus(
+        self,
+        query: str,
+        ctx: SecurityContext,
+        *,
+        corpus_ids: list[str] | None = None,
+        router_limit: int = 2,
+    ) -> AnswerEnvelope:
+        """Answer one query across multiple (authorized) corpora — E-016 mode.
+
+        This is an explicit, separate entry from the single-corpus ``answer`` /
+        ``answer_with_iteration`` paths: it runs the permission-aware soft router,
+        then the cross-corpus retrieval + merge/dedup, then the *single-pass*
+        synthesis (no judge, no iteration). The single-corpus Fast Path and the
+        E-013/E-019/E-020 envelope all stay untouched.
+
+        Selection:
+        * When ``corpus_ids`` is given, the caller pins the corpora (each is still
+          resolved + discoverability-checked via ``resolve_corpus``; an
+          undiscoverable corpus fails closed).
+        * When ``corpus_ids`` is ``None``, the router selects the top ``router_limit``
+          discoverable corpora from the registry.
+
+        Fault semantics: a backend fault in one corpus is captured by the retrieval
+        layer and the other corpora's evidence is still merged; a *total* fault
+        raises (never becomes a refusal). Empty merged evidence with no fault
+        yields a conservative refusal (abstain lock).
+
+        Args:
+            query: The user question.
+            ctx: The runtime-injected security context (shared across all corpora).
+            corpus_ids: Optional explicit corpus selection. ``None`` → router picks.
+            router_limit: Max corpora the router may select when ``corpus_ids`` is
+                ``None`` (default 2).
+        """
+        # 1) Select the corpora to query (router or explicit), all discoverable.
+        if corpus_ids is not None:
+            if self._registry is None:
+                raise ChatServiceError(
+                    "explicit corpus_ids require a CorpusRegistry on the ChatService"
+                )
+            selected = []
+            for cid in corpus_ids:
+                # resolve_corpus fails closed for unknown ids; the registry gate
+                # (get) fails closed for non-discoverable ones.
+                cfg = self._resolve_corpus(cid)
+                self._registry.get(cid, ctx)  # raises CorpusNotDiscoverableError
+                selected.append(cfg)
+        else:
+            if self._registry is None:
+                raise ChatServiceError(
+                    "multi-corpus routing requires a CorpusRegistry on the ChatService"
+                )
+            route = self._router.route(query, ctx, self._registry, limit=router_limit)
+            selected = [self._resolve_corpus(c.corpus_id) for c in route.candidates]
+
+        if not selected:
+            # Nothing discoverable to query → abstain (no evidence, fail-closed).
+            return build_multi_corpus_envelope(
+                ctx,
+                query=query,
+                evidence=(),
+                corpora_used=(),
+                answer_markdown="",
+                claims=[],
+                coverage=None,
+                stop_reason="no_evidence",
+            )
+
+        # 2) Cross-corpus retrieval + merge/dedup (raises on total fault).
+        try:
+            result = self._multi.retrieve(
+                ctx,
+                query,
+                selected,
+                top_k=self._top_k,
+                dense_encoder=self._dense_encoder,
+                sparse_encoder=self._sparse_encoder,
+            )
+        except Exception as exc:  # noqa: BLE001 - total retrieval outage surfaces as 5xx
+            raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
+
+        if not result.evidence:
+            # No evidence and no fault → conservative refusal (abstain lock).
+            return build_multi_corpus_envelope(
+                ctx,
+                query=query,
+                evidence=(),
+                corpora_used=result.corpora_used,
+                answer_markdown="",
+                claims=[],
+                coverage=None,
+                stop_reason="no_evidence",
+            )
+
+        # 3) Single-pass synthesis from the merged, verified claims.
+        return self._synthesize_multi_corpus(query, ctx, result)
+
+    def _synthesize_multi_corpus(
+        self,
+        query: str,
+        ctx: SecurityContext,
+        result: MultiCorpusResult,
+    ) -> AnswerEnvelope:
+        """Run LLM claim extraction over merged evidence, then build the envelope."""
+        messages = _build_messages(query, result.evidence)
+        try:
+            extraction = cast(
+                ClaimExtraction,
+                self._model.with_structured_output(ClaimExtraction).invoke(messages),
+            )
+        except Exception as exc:  # noqa: BLE001 - wrapped as a typed service error
+            raise ModelInvocationError(
+                f"claim extraction failed for multi-corpus query: {exc}"
+            ) from exc
+
+        return build_multi_corpus_envelope(
+            ctx,
+            query=query,
+            evidence=result.evidence,
+            corpora_used=result.corpora_used,
+            answer_markdown=extraction.draft_answer,
+            claims=list(extraction.claims),
+            coverage=None,
+            stop_reason="evidence_found",
+        )
 
     def answer_with_iteration(
         self,

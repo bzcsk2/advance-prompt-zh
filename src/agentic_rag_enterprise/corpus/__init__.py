@@ -11,11 +11,19 @@ from agentic_rag_enterprise.corpus.registry import (
     CorpusRegistry,
     InMemoryCorpusRegistry,
 )
+from agentic_rag_enterprise.corpus.router import (
+    CorpusCandidate,
+    CorpusRoute,
+    CorpusRouter,
+)
 
 __all__ = [
     "CapabilityCatalog",
     "CorpusRegistry",
     "InMemoryCorpusRegistry",
+    "CorpusRouter",
+    "CorpusRoute",
+    "CorpusCandidate",
     "fixture_by_id",
     "three_corpus_fixtures",
 ]
