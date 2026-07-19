@@ -1830,6 +1830,20 @@ class MetadataStore:
             (status, _now_iso(), run_id),
         )
 
+    def mark_run_checkpoint_running(self, run_id: str) -> None:
+        """Flip a completed/aborted checkpoint back to 'running'.
+
+        Used when a completed checkpoint must be re-entered because its evidence
+        was revoked since the original completion (E-023 P1-3 residual: completed
+        → running flip before recompute).
+        """
+        from agentic_rag_enterprise.storage.checkpoint_store import CHECKPOINT_RUNNING
+
+        self._conn.execute(
+            "UPDATE run_checkpoints SET status=?, updated_at=? WHERE run_id=?",
+            (CHECKPOINT_RUNNING, _now_iso(), run_id),
+        )
+
     def list_run_checkpoints(
         self, *, tenant_id: str, user_id: str, session_id: str
     ) -> list["RunCheckpoint"]:  # noqa: F821

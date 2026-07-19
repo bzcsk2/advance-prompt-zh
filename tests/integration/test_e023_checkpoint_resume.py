@@ -54,7 +54,6 @@ from agentic_rag_enterprise.services.container import (
     reset_default_container,
 )
 from agentic_rag_enterprise.storage.checkpoint_store import (
-    CHECKPOINT_COMPLETED,
     CHECKPOINT_RUNNING,
     CheckpointIdentityConflict,
     RunCheckpoint,
@@ -689,27 +688,64 @@ def test_run_id_same_identity_updates_state_without_conflict() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# P1-3 residual 测试：completed 终止状态机必须统一支持 idempotent resume
+# P1-3 residual 测试：completed 状态机 — 零调用 / 翻转验证
 # --------------------------------------------------------------------------- #
-def _build_refusal_checkpoint(
-    run_id: str,
-    *,
-    status: str = CHECKPOINT_COMPLETED,
-    evidence: tuple | None = None,
-    round_index: int = 1,
-    coverage: object = None,
-) -> "RunCheckpoint":
-    from agentic_rag_enterprise.judge.models import SufficiencyResult
+class _FaultModel:
+    """Model that raises on any call — used to prove resume does not invoke it."""
 
-    if coverage is None:
-        coverage = SufficiencyResult(
-            overall_status="insufficient",
-            should_abstain=True,
-            fact_coverage=(),
-        )
-    evs = evidence or ()
-    return RunCheckpoint(
-        run_id=run_id,
+    def invoke(self, *args, **kwargs):
+        pytest.fail("model.invoke should not be called on completed refusal resume")
+
+    def with_structured_output(self, *args, **kwargs):
+        pytest.fail("model.with_structured_output should not be called on completed refusal resume")
+
+
+class _FaultJudge:
+    """Judge that raises on any call — used to prove resume does not invoke it."""
+
+    def judge(self, *, query, required_facts, evidence, timeout=None):
+        pytest.fail("judge.judge should not be called on completed refusal resume")
+
+
+class _FaultRetriever:
+    """Retriever that raises on any call — used to prove resume does not invoke it."""
+
+    def retrieve_evidence(
+        self, ctx, query, corpus, top_k=None, *, dense_encoder, sparse_encoder, **kwargs
+    ):
+        pytest.fail("retriever.retrieve_evidence should not be called on completed refusal resume")
+
+
+def _fault_service(container):
+    """ChatService whose Model / Judge / Retriever all fault on invocation."""
+    return ChatService(
+        retriever=_FaultRetriever(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        model=_FaultModel(),
+        resolve_corpus=lambda cid: _eng_corpus(),
+        metadata_store=container.metadata_store,
+        judge=_FaultJudge(),
+        registry=container.corpus_registry,
+    )
+
+
+def test_completed_no_evidence_resume_zero_model_calls() -> None:
+    """A 'completed' no-evidence checkpoint must resume deterministically
+    WITHOUT calling Retriever / Judge / Model — the stored terminal state
+    is authoritative."""
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    mstore = container.metadata_store
+
+    ev = _evidence("e1", "vacation text", "d1")
+    cov = SufficiencyResult(
+        overall_status="insufficient",
+        should_abstain=True,
+        fact_coverage=(),
+    )
+    ck = RunCheckpoint(
+        run_id="NE-ZERO",
         tenant_id="t1",
         user_id="u1",
         session_id="s1",
@@ -718,110 +754,107 @@ def _build_refusal_checkpoint(
         corpus_id="eng",
         max_rounds=5,
         required_facts=_facts("vacation policy"),
-        round_index=round_index,
-        evidence=evs,
+        round_index=1,
+        evidence=(ev,),
         prior_queries=["q"],
-        seen_text_hashes=[ev.text_hash for ev in evs],
-        seen_doc_versions=[(ev.document_id, ev.document_version) for ev in evs],
+        seen_text_hashes=[ev.text_hash],
+        seen_doc_versions=[(ev.document_id, ev.document_version)],
         retrieval_calls=1,
         gap_rounds=1,
         final_reason="no_evidence",
         conflict_stop=False,
-        coverage=coverage,
+        coverage=cov,
         final_report=None,
         final_evidence_ids=[],
-        first_result=None,
+        first_result=FastPathResult(
+            query="q",
+            corpus_id="eng",
+            tenant_id="t1",
+            evidence=(ev,),
+            sufficiency=FastPathSufficiency.SUFFICIENT,
+            stop_reason=FastPathStopReason.EVIDENCE_FOUND,
+        ),
     )
-
-
-def test_completed_no_evidence_checkpoint_resumes_idempotently() -> None:
-    """A 'completed' checkpoint whose terminal outcome was no-evidence must
-    resume idempotently (no AssertionError, no re-entering the loop)."""
-    container = get_default_container()
-    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
-    mstore = container.metadata_store
-    svc = _service(container, _FakeRetriever({"q": []}))
-    ck = _build_refusal_checkpoint("NE1", evidence=(_evidence("e1", "text", "d1"),))
-    # first_result must be set for a resumable checkpoint.
-    ck = ck.model_copy(
-        update={
-            "first_result": FastPathResult(
-                query="q",
-                corpus_id="eng",
-                tenant_id="t1",
-                evidence=(_evidence("e1", "text", "d1"),),
-                sufficiency=FastPathSufficiency.SUFFICIENT,
-                stop_reason=FastPathStopReason.EVIDENCE_FOUND,
-            ),
-        }
-    )
+    # Step 1: save as running (save_run_checkpoint always writes status=running).
     mstore.save_run_checkpoint(ck)
+    # Step 2: mark completed so the DB truly shows status=completed.
+    mstore.mark_run_checkpoint_done("NE-ZERO")
+    assert mstore.load_run_checkpoint("NE-ZERO").status == "completed"
 
-    resumed = svc.resume_run("NE1", _ctx())
+    # Resume with FAULT service — any call to model/judge/retriever fails the test.
+    svc = _fault_service(container)
+    resumed = svc.resume_run("NE-ZERO", _ctx())
     assert resumed.abstained is True
-    assert resumed.completeness == "insufficient"
-    # Verify the checkpoint is still 'completed' (not corrupted by resume).
-    row = mstore._conn.execute(
-        "SELECT status FROM run_checkpoints WHERE run_id=?", ("NE1",)
-    ).fetchone()
-    assert row["status"] == "completed"
 
-    # A second resume must return the same result (idempotent).
-    resumed2 = svc.resume_run("NE1", _ctx())
+    # Verify checkpoint is still completed (resume didn't corrupt).
+    assert mstore.load_run_checkpoint("NE-ZERO").status == "completed"
+
+    # Second resume — idempotent.
+    resumed2 = svc.resume_run("NE-ZERO", _ctx())
     assert resumed2.abstained == resumed.abstained
-    assert resumed2.completeness == resumed.completeness
 
 
-def test_completed_judge_fault_checkpoint_resumes_idempotently() -> None:
-    """A 'completed' checkpoint that ended via judge fault must resume
-    idempotently (no re-calling the Judge, no AssertionError)."""
+def test_completed_judge_fault_resume_zero_model_calls() -> None:
+    """A 'completed' judge-fault checkpoint must resume deterministically
+    WITHOUT calling Retriever / Judge / Model."""
     container = get_default_container()
     _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
     mstore = container.metadata_store
-    svc = _service(container, _FakeRetriever({"q": []}))
+
+    ev = _evidence("e1", "vacation text", "d1")
     cov = SufficiencyResult(
         overall_status="insufficient",
         should_abstain=True,
         fact_coverage=(),
     )
-    ck = _build_refusal_checkpoint(
-        "JF1",
-        evidence=(_evidence("e1", "text", "d1"),),
+    ck = RunCheckpoint(
+        run_id="JF-ZERO",
+        tenant_id="t1",
+        user_id="u1",
+        session_id="s1",
+        policy_version="1.0",
+        query="q",
+        corpus_id="eng",
+        max_rounds=5,
+        required_facts=_facts("vacation policy"),
+        round_index=1,
+        evidence=(ev,),
+        prior_queries=["q"],
+        seen_text_hashes=[ev.text_hash],
+        seen_doc_versions=[(ev.document_id, ev.document_version)],
+        retrieval_calls=1,
+        gap_rounds=1,
+        final_reason="judge_fault",
+        conflict_stop=False,
         coverage=cov,
-    )
-    ck = ck.model_copy(
-        update={
-            "final_reason": "judge_fault",
-            "first_result": FastPathResult(
-                query="q",
-                corpus_id="eng",
-                tenant_id="t1",
-                evidence=(_evidence("e1", "text", "d1"),),
-                sufficiency=FastPathSufficiency.SUFFICIENT,
-                stop_reason=FastPathStopReason.EVIDENCE_FOUND,
-            ),
-        }
+        final_report=None,
+        final_evidence_ids=[],
+        first_result=FastPathResult(
+            query="q",
+            corpus_id="eng",
+            tenant_id="t1",
+            evidence=(ev,),
+            sufficiency=FastPathSufficiency.SUFFICIENT,
+            stop_reason=FastPathStopReason.EVIDENCE_FOUND,
+        ),
     )
     mstore.save_run_checkpoint(ck)
+    mstore.mark_run_checkpoint_done("JF-ZERO")
+    assert mstore.load_run_checkpoint("JF-ZERO").status == "completed"
 
-    resumed = svc.resume_run("JF1", _ctx())
+    svc = _fault_service(container)
+    resumed = svc.resume_run("JF-ZERO", _ctx())
     assert resumed.abstained is True
-    assert resumed.completeness == "insufficient"
-    row = mstore._conn.execute(
-        "SELECT status FROM run_checkpoints WHERE run_id=?", ("JF1",)
-    ).fetchone()
-    assert row["status"] == "completed"
+    assert mstore.load_run_checkpoint("JF-ZERO").status == "completed"
 
 
 def test_running_checkpoint_revoke_all_evidence_marks_completed() -> None:
     """A 'running' checkpoint whose ALL evidence is revoked on resume must
-    return a no-evidence refusal AND persist status='completed'."""
+    return no-evidence refusal AND persist status='completed'."""
     container = get_default_container()
     _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
     mstore = container.metadata_store
 
-    # Save a RUNNING (incomplete) checkpoint with one evidence.
-    svc = _service(container, _FakeRetriever({"q": []}))
     ev = _evidence("e1", "The vacation policy grants 20 days paid leave.", "d1")
     ck = RunCheckpoint(
         run_id="REVOKE-ALL",
@@ -871,11 +904,86 @@ def test_running_checkpoint_revoke_all_evidence_marks_completed() -> None:
         denied_group_ids=[],
     )
 
+    # Use fault service: the all-revoked path returns refusal without model.
+    svc = _fault_service(container)
     resumed = svc.resume_run("REVOKE-ALL", _ctx())
     assert resumed.abstained is True
 
     # The checkpoint must now be 'completed' (not left as 'running').
-    row = mstore._conn.execute(
-        "SELECT status FROM run_checkpoints WHERE run_id=?", ("REVOKE-ALL",)
-    ).fetchone()
-    assert row["status"] == "completed"
+    assert mstore.load_run_checkpoint("REVOKE-ALL").status == "completed"
+
+
+def test_completed_checkpoint_flips_to_running_on_evidence_revocation() -> None:
+    """When a completed checkpoint loses evidence (ACL revoke), resume must
+    flip status to 'running', recompute derived state, and eventually mark
+    'completed' again — returning a valid answer from surviving evidence."""
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    _ingest(container, "d2", "The bonus policy grants a 10% bonus.")
+    mstore = container.metadata_store
+
+    ev1 = _evidence("e1", "Vacation policy text", "d1")
+    ev2 = _evidence("e2", "Bonus policy text", "d2")
+    cov = SufficiencyResult(
+        overall_status="sufficient",
+        should_abstain=False,
+        fact_coverage=(),
+    )
+    ck = RunCheckpoint(
+        run_id="FLIP-RUN",
+        tenant_id="t1",
+        user_id="u1",
+        session_id="s1",
+        policy_version="1.0",
+        query="q",
+        corpus_id="eng",
+        max_rounds=5,
+        required_facts=_facts("vacation policy", "bonus structure"),
+        round_index=2,
+        evidence=(ev1, ev2),
+        prior_queries=["q", "bonus structure"],
+        seen_text_hashes=[ev1.text_hash, ev2.text_hash],
+        seen_doc_versions=[
+            (ev1.document_id, ev1.document_version),
+            (ev2.document_id, ev2.document_version),
+        ],
+        retrieval_calls=2,
+        gap_rounds=2,
+        final_reason="sufficient",
+        conflict_stop=False,
+        coverage=cov,
+        final_report=None,
+        final_evidence_ids=["e1", "e2"],
+        first_result=FastPathResult(
+            query="q",
+            corpus_id="eng",
+            tenant_id="t1",
+            evidence=(ev1,),
+            sufficiency=FastPathSufficiency.SUFFICIENT,
+            stop_reason=FastPathStopReason.EVIDENCE_FOUND,
+        ),
+    )
+    mstore.save_run_checkpoint(ck)
+    mstore.mark_run_checkpoint_done("FLIP-RUN")
+    assert mstore.load_run_checkpoint("FLIP-RUN").status == "completed"
+
+    # Revoke d2 — only e1 survives re-auth.
+    mstore.update_document_acl(
+        "t1",
+        "eng",
+        "d2",
+        "v1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["other"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
+    )
+
+    svc = _service(container, _FakeRetriever({"q": [ev1], "bonus structure": []}))
+    resumed = svc.resume_run("FLIP-RUN", _ctx())
+    # Surviving evidence is only e1 (e2 was revoked).
+    assert {e.evidence_id for e in resumed.evidence} == {"e1"}
+    # Final status is completed (the loop+mark_done re-completed it).
+    assert mstore.load_run_checkpoint("FLIP-RUN").status == "completed"

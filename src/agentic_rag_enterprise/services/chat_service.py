@@ -787,12 +787,19 @@ class ChatService:
         seen_text_hashes = {ev.text_hash for ev in surviving}
         seen_doc_versions = {(ev.document_id, ev.document_version) for ev in surviving}
         coverage = ck.coverage
-        fe_ids = set(ck.final_evidence_ids)
-        final_evidence = (
-            tuple(ev for ev in surviving if ev.evidence_id in fe_ids)
-            if fe_ids
-            else tuple(evidence_by_id.values())
-        )
+        # Distinguish "unresolved" (running / never set) from "explicitly empty"
+        # (completed refusal).  A completed checkpoint with empty
+        # final_evidence_ids means the terminal outcome had zero evidence
+        # (P1-3 residual).
+        if ck.status == CHECKPOINT_COMPLETED and not ck.final_evidence_ids:
+            final_evidence: tuple[SnapshotEvidence, ...] = ()
+        else:
+            fe_set = set(ck.final_evidence_ids)
+            final_evidence = (
+                tuple(ev for ev in surviving if ev.evidence_id in fe_set)
+                if fe_set
+                else tuple(evidence_by_id.values())
+            )
         return _IterationState(
             evidence_by_id=evidence_by_id,
             seen_ids=seen_ids,
@@ -1212,22 +1219,17 @@ class ChatService:
         # name the revoked source. The recomputed verdict then decides whether to
         # stop or to continue retrieving.
         if dropped:
-            # A completed checkpoint whose evidence was revoked must be marked
-            # "running" before recompute so the status reflects active processing
-            # (P1-3 residual). The terminal save at loop/end flips it back to
-            # completed.
+            # A completed checkpoint whose evidence was revoked must be explicitly
+            # flipped to 'running' AND its derived state cleared before recompute
+            # (P1-3 residual). ``_save_checkpoint`` preserves the existing status,
+            # so we use ``mark_run_checkpoint_running`` instead.
             if ck.status == CHECKPOINT_COMPLETED and self._metadata_store is not None:
-                self._save_checkpoint(
-                    run_id,
-                    ctx,
-                    state,
-                    first_result=ck.first_result,
-                    required=ck.required_facts,
-                    max_rounds=ck.max_rounds,
-                    query=ck.query,
-                    corpus_id=ck.corpus_id,
-                    round_index=ck.round_index,
-                )
+                self._metadata_store.mark_run_checkpoint_running(run_id)
+                state.coverage = None
+                state.final_report = None
+                state.final_evidence = ()
+                state.conflict_stop = False
+                state.final_reason = None
             report, kept_evidence = self._run_conflict_stage(ck.query, tuple(surviving))
             if not kept_evidence:
                 # Temporal filter dropped every surviving evidence → refuse.
@@ -1279,9 +1281,17 @@ class ChatService:
             # Otherwise: insufficient → continue iterating from ck.round_index.
         elif ck.status == CHECKPOINT_COMPLETED and not dropped:
             # No evidence revoked and the checkpoint was already completed →
-            # idempotent finalize (invariant 4). Uses stored state so ANY terminal
-            # outcome (sufficient, contradicted, no-evidence, judge-fault) is
-            # returned identically — not just sufficient/contradicted (P1-3 residual).
+            # idempotent return (invariant 4).  For refusal outcomes (empty final
+            # evidence) return deterministically WITHOUT calling Retriever / Judge
+            # / Model — the stored state is authoritative (P1-3 residual).
+            if not state.final_evidence:
+                return build_no_evidence_refusal(
+                    ctx,
+                    corpora_used=(ck.corpus_id,),
+                    tool_calls=state.retrieval_calls,
+                    gap_rounds=state.gap_rounds,
+                    iterations=state.gap_rounds,
+                )
             self._metadata_store.mark_run_checkpoint_done(run_id)
             return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
 
