@@ -34,6 +34,7 @@ from agentic_rag_enterprise.answer.verification import (
 )
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
+from agentic_rag_enterprise.evidence.models import ConflictReport, ConflictStatus
 from agentic_rag_enterprise.judge.models import SufficiencyResult
 from agentic_rag_enterprise.retrieval.fast_path import (
     FastPathResult,
@@ -115,6 +116,7 @@ def build_answer_envelope(
     missing_aspects: tuple[str, ...] | None = None,
     evidence: tuple[SnapshotEvidence, ...] | None = None,
     stop_reason: str | None = None,
+    conflict_report: ConflictReport | None = None,
 ) -> AnswerEnvelope:
     """Build a validated envelope from a Fast Path result and a grounded answer.
 
@@ -179,6 +181,7 @@ def build_answer_envelope(
         abstain_stop_reason=fast_path_result.stop_reason.value,
         corpora_used=(fast_path_result.corpus_id,),
         answer_markdown=answer_markdown,
+        conflict_report=conflict_report,
     )
 
 
@@ -199,6 +202,7 @@ def build_multi_corpus_envelope(
     limitations: tuple[str, ...] = (),
     partial_retrieval: bool = False,
     stop_reason: str | None = None,
+    conflict_report: ConflictReport | None = None,
 ) -> AnswerEnvelope:
     """Build a validated envelope from merged multi-corpus Evidence (E-016).
 
@@ -250,6 +254,7 @@ def build_multi_corpus_envelope(
         abstain_stop_reason="no_evidence",
         corpora_used=corpora_used,
         answer_markdown=answer_markdown,
+        conflict_report=conflict_report,
     )
 
 
@@ -270,6 +275,7 @@ def _build_envelope_from_evidence(
     answer_markdown: str,
     limitations: tuple[str, ...] = (),
     partial_retrieval: bool = False,
+    conflict_report: ConflictReport | None = None,
 ) -> AnswerEnvelope:
     """Shared synthesis core for the single- and multi-corpus envelope builders."""
     evidence_ids = {ev.evidence_id for ev in evidence}
@@ -300,6 +306,17 @@ def _build_envelope_from_evidence(
         else:
             completeness = "complete"
             confidence = "high"
+
+    # E-021 (fail-closed): a CONTRADICTED conflict report forces a "conflicted"
+    # envelope regardless of any coverage verdict — the answer must enumerate
+    # both conflicting sources/times. This overrides the completeness derived
+    # above and is independent of whether a coverage verdict was supplied.
+    if (
+        conflict_report is not None
+        and conflict_report.conflict_status == ConflictStatus.CONTRADICTED
+    ):
+        completeness = "conflicted"
+        confidence = "low"
 
     # An insufficient coverage verdict must abstain (preserves the E-013 lock).
     if completeness == "insufficient":
@@ -347,6 +364,7 @@ def _build_envelope_from_evidence(
         coverage=coverage,
         stop_reason=final_stop_reason,
         abstained=False,
+        conflict_report=conflict_report,
     )
 
 

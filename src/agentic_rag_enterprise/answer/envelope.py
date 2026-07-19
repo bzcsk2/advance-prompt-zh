@@ -22,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
+from agentic_rag_enterprise.evidence.models import ConflictReport, ConflictStatus
 from agentic_rag_enterprise.judge.models import SufficiencyResult
 
 ClaimImportance = Literal["critical", "supporting", "minor"]
@@ -126,6 +127,11 @@ class AnswerEnvelope(BaseModel):
     gap_rounds: int = 1
     coverage: SufficiencyResult | None = None
 
+    # E-021 conflict report (optional, backward-compatible). When the resolver
+    # reports CONTRADICTED the envelope's completeness is forced to "conflicted"
+    # (see `_lock_state`). Absent for all pre-E-021 envelopes.
+    conflict_report: ConflictReport | None = None
+
     stop_reason: str
     abstained: bool
 
@@ -157,4 +163,20 @@ class AnswerEnvelope(BaseModel):
             raise ValueError("completeness 'insufficient' requires abstained=True")
         if self.stop_reason == "no_evidence" and not self.abstained:
             raise ValueError("stop_reason 'no_evidence' requires abstained=True")
+        # E-021 conflict override (fail-closed): a contradicted report MUST be
+        # paired with ``completeness == "conflicted"`` (the answer must enumerate
+        # both sources/times). The ChatService path sets this via a contradicted
+        # coverage; this check guarantees the invariant even for envelopes built
+        # directly. It does not alter the existing abstain / insufficient lock
+        # above, and only a non-abstained envelope can be conflicted.
+        if (
+            self.conflict_report is not None
+            and self.conflict_report.conflict_status == ConflictStatus.CONTRADICTED
+            and not self.abstained
+            and self.completeness != "conflicted"
+        ):
+            raise ValueError(
+                "envelope with a CONTRADICTED conflict_report must have "
+                "completeness == 'conflicted'"
+            )
         return self
