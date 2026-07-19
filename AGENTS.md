@@ -4,7 +4,8 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M6** — Temporal scope, source authority & conflict (`E-021`)
+- Milestone: **M7** — Runtime hardening (`E-022` → `E-024`); M6 / E-021 **CLOSED / ACCEPTED at `c6c3e6b`**
+- Current Issue: **E-022** — Reconciler + purge + index migration + rollback (build plan Milestone 7)
 - Issue: **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator — **CLOSED /
   ACCEPTED at `398f059`** (acceptance re-audit `33c...` passed: 10-check independent
   re-verification — schema invariants, DAG integrity for required+optional edges, binding
@@ -177,14 +178,23 @@
   at `4d072bd`** ("E-018: real RetrieverTool two-hop + full regression pass") on top of the
   amended `docs/issue-e018-contract.md` (`5d02d99` / `2027102`). Full Planner/DAG contract
   at `docs/issue-e017-contract.md`; Executor contract at `docs/issue-e018-contract.md`.
-- **M6 / E-021** — Temporal scope, source authority & conflict — **contract frozen / amended,
-  implementation pending** (this commit amends the `30c1d2e` freeze with three main-path
-  fixes: `as_of`-vs-`range` precedence, `ConflictReport` no longer carries `OverallStatus`,
-  conflict detection requires a structured `assertion` parser). Adds `TemporalScope`, a
-  deterministic temporal parser + filter, a `ConflictResolver` (five conflict types, four
-  explicit auto-resolution rules; unresolvable → `CONTRADICTED`), and the minimal
-  `AnswerEnvelope.conflict_report` extension, integrated into the post-retrieval evidence
-  pipeline without changing the Planner core. Full contract at `docs/issue-e021-contract.md`.
+- **M6 / E-021** — Temporal scope, source authority & conflict — **CLOSED / ACCEPTED at
+  `c6c3e6b`** (final acceptance verdict **PASS**; the three P1 defects from the `d37592e`
+  review are closed). Implementation at `c6c3e6b` adds `domain/temporal.py`
+  (`TemporalScope`, deterministic temporal parser + `filter_by_temporal_scope`),
+  `evidence/conflict_resolver.py` (`ConflictResolver` — four auto-resolution rules; unresolvable →
+  `CONTRADICTED`, emits `ConflictReport.conflict_status`), the `AnswerEnvelope.conflict_report`
+  extension, a deterministic `render_conflict_answer` (claims cleared, both sides' sources +
+  effective times listed, no single conclusion), and `ChatService` wiring on all three paths:
+  temporal filter + conflict stage run BEFORE the Coverage Judge each round, `TemporalScope`
+  parsed once at request entry, zero-evidence after filtering short-circuits to conservative
+  refusal (`insufficient`/`abstained`/`no_evidence`, NO model call), and `CONTRADICTED` stops
+  iteration immediately (no further gap retrieval). `tests/integration/test_e021_evidence_pipeline.py`
+  extends with 5 P1 tests. Planner core unchanged; M7 not entered in the acceptance commit. Full
+  contract at `docs/issue-e021-contract.md`.
+- **M7 / E-022 → E-024** — Runtime hardening — **current work switched to `E-022`**
+  (Reconciler + purge + index migration + rollback; build plan §Milestone 7). Detailed E-022
+  contract / allowed-changes section to be authored when the issue opens.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
@@ -712,9 +722,11 @@ Controlled Executor + dependent multi-hop (build plan §13.4). Full contract at
   Executor injects `SecurityContext`); no write operation (`sql`/`api`/`graph`); no dynamic
   step creation; no change to E-011→E-016 behaviour.
 
-## E-021 Allowed Changes (M6 only) — contract frozen / amended, implementation pending
-Temporal scope, source authority & conflict (build plan §15 / Milestone 6). Full contract at
-`docs/issue-e021-contract.md`.
+## E-021 Allowed Changes (M6 only) — CLOSED / ACCEPTED at `c6c3e6b`
+Temporal scope, source authority & conflict (build plan §15 / Milestone 6). Implemented and
+accepted; the three P1 main-path fixes (`c6c3e6b`) are within this scope. Planner core stayed
+frozen. Full contract at `docs/issue-e021-contract.md`.
+
 - `docs/issue-e021-contract.md`, `AGENTS.md`.
 - **This commit is contract-only (amendment)**: it amends the `30c1d2e` freeze to fix three
   main-path-breaking defects — (1) `as_of` vs `range` parser precedence (explicit range →
@@ -739,6 +751,12 @@ Temporal scope, source authority & conflict (build plan §15 / Milestone 6). Ful
   extraction / NER in the resolver; no new `Evidence` field; no reliance on `retrieval_score` /
   `rerank_score` to pick a winning fact; no change to E-011→E-020 behaviour beyond the agreed
   `AnswerEnvelope.conflict_report` extension; no upstream modification.
+
+## E-022 Allowed Changes (M7 only) — issue opens next
+Runtime hardening (build plan §Milestone 7): Reconciler + purge + index migration + rollback
+(`E-022`). Allowed paths / forbidden paths to be written when the issue opens. Follows the
+E-008.x recon/ingestion-stack precedent and the §29.5 `depends_on` / `in_scope` / `deferred_to`
+rules.
 
 ## Standard Checks
 ```bash
