@@ -34,6 +34,7 @@ from agentic_rag_enterprise.ingestion.chunker import ParentChildChunker
 from agentic_rag_enterprise.ingestion.job import DocumentManager, IngestionRequest, IngestionResult
 from agentic_rag_enterprise.providers import ModelProfile
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
+from agentic_rag_enterprise.corpus.registry import InMemoryCorpusRegistry
 from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
@@ -158,9 +159,11 @@ class DefaultServiceContainer:
         import yaml
 
         _corpora_data = yaml.safe_load(corpora_path.read_text(encoding="utf-8")) or {}
-        for _c in _corpora_data.get("corpora", []):
-            self._mstore.register_corpus(CorpusConfig(**_c))
+        _corpora = [CorpusConfig(**_c) for _c in _corpora_data.get("corpora", [])]
+        for _c in _corpora:
+            self._mstore.register_corpus(_c)
 
+        self._registry = InMemoryCorpusRegistry(_corpora)
         self._resolver = resolve_corpus_from_yaml(corpora_path)
 
         self._manager = DocumentManager(
@@ -170,6 +173,7 @@ class DefaultServiceContainer:
             chunker=ParentChildChunker(),
             dense_encoder=self._dense,
             sparse_encoder=self._sparse,
+            corpus_registry=self._registry,
         )
 
         self._service = ChatService(
@@ -231,6 +235,14 @@ class DefaultServiceContainer:
     @property
     def parent_store(self) -> ParentStore:
         return self._pstore
+
+    @property
+    def corpus_registry(self) -> InMemoryCorpusRegistry:
+        return self._registry
+
+    @property
+    def document_manager(self) -> DocumentManager:
+        return self._manager
 
 
 _CONTAINER: DefaultServiceContainer | None = None

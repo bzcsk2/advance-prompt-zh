@@ -29,6 +29,7 @@ from agentic_rag_enterprise.domain.ingestion import (
     JobStatus,
 )
 from agentic_rag_enterprise.domain.security import SecurityContext
+from agentic_rag_enterprise.corpus.registry import CorpusRegistry
 from agentic_rag_enterprise.ingestion.chunker import ChildChunk, ParentChildChunker, ParentChunk
 from agentic_rag_enterprise.security.policy import (
     ResourceAcl,
@@ -929,6 +930,7 @@ class DocumentManager:
         chunker: ParentChildChunker,
         dense_encoder: DenseEncoder,
         sparse_encoder: SparseEncoder,
+        corpus_registry: Optional[CorpusRegistry] = None,
     ) -> None:
         self._store = metadata_store
         self._vector = vector_store
@@ -936,6 +938,18 @@ class DocumentManager:
         self._chunker = chunker
         self._dense = dense_encoder
         self._sparse = sparse_encoder
+        self._registry = corpus_registry
+
+    def _collection(self, corpus_id: str) -> str:
+        """Resolve the live retrieval collection name for a corpus.
+
+        Uses the migrated ``vector_collection`` pointer when set, else falls back
+        to ``corpus_id``. Ensures delete/purge target the same collection
+        retrieval reads after an index migration (hybrid.py:66).
+        """
+        if self._registry is not None:
+            return self._registry.resolve_collection_name(corpus_id)
+        return corpus_id
 
     def ingest(
         self,
@@ -1044,12 +1058,13 @@ class DocumentManager:
         )
         # 2) Idempotent data-plane propagation (Qdrant + Parent Store). Retrieval
         #    filtering via status=active is already in effect from step 1.
+        collection = self._collection(corpus_id)
         point_ids = self._vector.list_point_ids_by_document(
-            corpus_id, doc.tenant_id, corpus_id, document_id, version
+            collection, doc.tenant_id, corpus_id, document_id, version
         )
         if point_ids:
             self._vector.update_payload(
-                corpus_id, point_ids, {"status": "deleted", "deprecated": True}
+                collection, point_ids, {"status": "deleted", "deprecated": True}
             )
         self._parents.deprecate_document(doc.tenant_id, corpus_id, document_id, version)
 
@@ -1069,12 +1084,13 @@ class DocumentManager:
             raise DocumentMutationError(
                 f"refuse to purge non-deleted document {document_id!r}; call delete() first"
             )
+        collection = self._collection(corpus_id)
         for version in self._store.list_document_versions(ctx.tenant_id, corpus_id, document_id):
             point_ids = self._vector.list_point_ids_by_document(
-                corpus_id, doc.tenant_id, corpus_id, document_id, version
+                collection, doc.tenant_id, corpus_id, document_id, version
             )
             if point_ids:
-                self._vector.delete(corpus_id, point_ids)
+                self._vector.delete(collection, point_ids)
             self._parents.delete_document(doc.tenant_id, corpus_id, document_id, version)
             self._store.delete_chunk_records(doc.tenant_id, corpus_id, document_id, version)
         self._store.delete_document(doc.tenant_id, corpus_id, document_id)
@@ -1130,13 +1146,87 @@ class DocumentManager:
         )
         # 2) Idempotent data-plane propagation (Qdrant + Parent Store). Payload-
         #    only, no re-embedding (§10.7).
+        collection = self._collection(corpus_id)
         point_ids = self._vector.list_point_ids_by_document(
-            corpus_id, doc.tenant_id, corpus_id, document_id, version
+            collection, doc.tenant_id, corpus_id, document_id, version
         )
         if point_ids:
-            self._vector.update_payload(corpus_id, point_ids, acl_fields)
+            self._vector.update_payload(collection, point_ids, acl_fields)
         self._parents.update_acl_document(
             doc.tenant_id, corpus_id, document_id, version, acl_fields
+        )
+
+    # ------------------------------------------------------------------ #
+    # E-022 reconciler callbacks + active-version rollback (control plane)
+    # ------------------------------------------------------------------ #
+    def reconcile_purge(self, tenant_id: str, corpus_id: str, document_id: str) -> None:
+        """Control-plane physical purge (no user-auth gate).
+
+        Supplied to the :class:`Reconciler` as its ``purge_document`` callback for
+        the post-commit cleanup-retry path (§10.10 #6). Performs the same storage
+        deletions as :meth:`purge` but without the caller ``SecurityContext`` /
+        ``can_manage_document`` check, because the reconciler is an automated
+        control-plane process, not a user request. It still refuses to touch a
+        document that was never logically deleted (the Metadata DB row guards
+        this: ``delete_document`` removes the row first).
+        """
+        collection = self._collection(corpus_id)
+        for version in self._store.list_document_versions(tenant_id, corpus_id, document_id):
+            point_ids = self._vector.list_point_ids_by_document(
+                collection, tenant_id, corpus_id, document_id, version
+            )
+            if point_ids:
+                self._vector.delete(collection, point_ids)
+            self._parents.delete_document(tenant_id, corpus_id, document_id, version)
+            self._store.delete_chunk_records(tenant_id, corpus_id, document_id, version)
+        self._store.delete_document(tenant_id, corpus_id, document_id)
+
+    def rebuild_document(
+        self, tenant_id: str, corpus_id: str, document_id: str, document_version: str
+    ) -> None:
+        """Re-embed a document's child chunks into the live collection.
+
+        Supplied to the :class:`Reconciler` as its ``rebuild_document`` callback
+        for the missing-data-plane path. Rebuilds from the existing control-plane
+        chunk content (no re-parsing), exactly as :func:`build_index_v2` does for
+        a whole corpus.
+        """
+        from agentic_rag_enterprise.ingestion.index_migration import _chunk_row_to_point
+
+        collection = self._collection(corpus_id)
+        rows = [
+            r
+            for r in self._store.iter_child_chunks(corpus_id)
+            if r["document_id"] == document_id and r["document_version"] == document_version
+        ]
+        points = [
+            _chunk_row_to_point(r, dense_encoder=self._dense, sparse_encoder=self._sparse)
+            for r in rows
+        ]
+        self._vector.upsert(collection, points)
+
+    def rollback_active_version(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        *,
+        to_version: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+    ) -> tuple[int, Optional[str]]:
+        """Temporarily roll a document's active version back (build plan §2630).
+
+        Delegates to :meth:`MetadataStore.rollback_active_version`; see its
+        contract for the CAS guard and the "never reactivate a purged version"
+        rule. Retrieval picks up the rolled-back version via the active-version
+        gate (§10.10 #5).
+        """
+        return self._store.rollback_active_version(
+            tenant_id=tenant_id,
+            corpus_id=corpus_id,
+            document_id=document_id,
+            to_version=to_version,
+            expected_revision=expected_revision,
         )
 
 
