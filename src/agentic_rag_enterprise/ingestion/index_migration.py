@@ -25,7 +25,10 @@ from typing import Optional
 from qdrant_client.models import PointStruct
 
 from agentic_rag_enterprise.corpus.registry import CorpusRegistry
-from agentic_rag_enterprise.storage.metadata_store import MetadataStore
+from agentic_rag_enterprise.storage.metadata_store import (
+    IndexSwitchConflict,
+    MetadataStore,
+)
 from agentic_rag_enterprise.storage.vector_store import (
     DEFAULT_SPARSE_NAME,
     DenseEncoder,
@@ -112,7 +115,10 @@ def build_index_v2(
     )
     vector_store.create_collection(collection, dense_size, sparse_name=DEFAULT_SPARSE_NAME)
 
-    rows = metadata_store.iter_child_chunks(corpus_id)
+    # Only the active, non-deprecated versions are migrated — this is what stops
+    # the v2 index from resurrecting deprecated or logically-deleted evidence
+    # (E-022 contract P1-1).
+    rows = metadata_store.iter_active_child_chunks(corpus_id)
     points = [
         _chunk_row_to_point(row, dense_encoder=dense_encoder, sparse_encoder=sparse_encoder)
         for row in rows
@@ -132,6 +138,45 @@ def build_index_v2(
     return collection
 
 
+def _switch_pointer(
+    corpus_id: str,
+    target_collection: str,
+    *,
+    metadata_store: MetadataStore,
+    corpus_registry: CorpusRegistry,
+    vector_store: VectorStore,
+    owner: str,
+) -> None:
+    """Leased, atomic pointer flip shared by switch + rollback (P1-3).
+
+    1. Acquire the per-corpus index-switch lease (rejected if another switch
+       owns it -> :class:`IndexSwitchConflict`).
+    2. Flip the persisted pointer + mark the live build ``switched`` inside one
+       ``BEGIN IMMEDIATE`` (``MetadataStore.set_active_collection_atomic``).
+    3. Mirror the flip onto the live in-memory registry. If that fails, the
+       persisted pointer is *compensated* back to its previous value so the two
+       never diverge, then the error is re-raised.
+    The lease is always released (success or failure).
+    """
+    if not vector_store.collection_exists(target_collection):
+        raise ValueError(f"target collection {target_collection!r} does not exist")
+    # Exact prior pointer (may be None); used only to compensate on failure.
+    previous = metadata_store.get_active_collection(corpus_id)
+    if not metadata_store.acquire_index_switch_lease(corpus_id, owner):
+        raise IndexSwitchConflict(f"index switch for corpus {corpus_id!r} is already in progress")
+    try:
+        metadata_store.set_active_collection_atomic(corpus_id, target_collection, owner)
+        try:
+            corpus_registry.set_active_collection(corpus_id, target_collection)
+        except Exception:
+            # Compensate: revert the persisted pointer so it stays consistent
+            # with the live registry (which still points at `previous`).
+            metadata_store.set_active_collection_atomic(corpus_id, previous, owner)
+            raise
+    finally:
+        metadata_store.release_index_switch_lease(corpus_id, owner)
+
+
 def switch_index(
     corpus_id: str,
     *,
@@ -139,20 +184,30 @@ def switch_index(
     metadata_store: MetadataStore,
     corpus_registry: CorpusRegistry,
     vector_store: VectorStore,
+    owner: Optional[str] = None,
     dry_run: bool = False,
 ) -> None:
     """Atomically flip the active-collection pointer to ``target_collection``.
 
-    The switch updates both the persisted ``corpus_registry.vector_collection``
-    and the live :class:`CorpusConfig` the retriever reads. The previous
-    collection is retained (never deleted) so a rollback is always possible.
+    The switch is lease-guarded and flips the persisted
+    ``corpus_registry.vector_collection`` and the live :class:`CorpusConfig` the
+    retriever reads inside one transaction, with compensation if the live
+    registry update fails (E-022 contract P1-3). The previous collection is
+    retained (never deleted) so a rollback is always possible.
     """
-    if not vector_store.collection_exists(target_collection):
-        raise ValueError(f"target collection {target_collection!r} does not exist")
     if dry_run:
+        if not vector_store.collection_exists(target_collection):
+            raise ValueError(f"target collection {target_collection!r} does not exist")
         return
-    metadata_store.set_active_collection(corpus_id, target_collection)
-    corpus_registry.set_active_collection(corpus_id, target_collection)
+    owner = owner or f"index-switch-{uuid.uuid4().hex[:8]}"
+    _switch_pointer(
+        corpus_id,
+        target_collection,
+        metadata_store=metadata_store,
+        corpus_registry=corpus_registry,
+        vector_store=vector_store,
+        owner=owner,
+    )
 
 
 def rollback_index(
@@ -161,11 +216,13 @@ def rollback_index(
     metadata_store: MetadataStore,
     corpus_registry: CorpusRegistry,
     vector_store: VectorStore,
+    owner: Optional[str] = None,
 ) -> str:
     """Flip the active pointer back to the collection retained at last build.
 
     Returns the collection name switched back to. Raises ``ValueError`` if there
-    is no retained previous collection (e.g. the corpus was never migrated).
+    is no retained previous collection (e.g. the corpus was never migrated). Uses
+    the same leased, atomic, compensated flip as :func:`switch_index` (P1-3).
     """
     # The most recent build for this corpus records the collection that was
     # active when the build started — that is the rollback target.
@@ -178,11 +235,13 @@ def rollback_index(
     if row is None or not row["previous_collection"]:
         raise ValueError(f"no retained previous collection to roll back for {corpus_id!r}")
     previous = row["previous_collection"]
-    switch_index(
+    owner = owner or f"index-rollback-{uuid.uuid4().hex[:8]}"
+    _switch_pointer(
         corpus_id,
-        target_collection=previous,
+        previous,
         metadata_store=metadata_store,
         corpus_registry=corpus_registry,
         vector_store=vector_store,
+        owner=owner,
     )
     return previous

@@ -170,6 +170,20 @@ class VersionContentConflict(Exception):
         super().__init__(reason)
 
 
+class IndexSwitchConflict(Exception):
+    """Raised when an index switch (pointer flip) cannot be taken because another
+    in-flight switch already holds the per-corpus lease.
+
+    Serializes ``switch_index`` / ``rollback_index`` so the persisted pointer and
+    the live in-memory registry cannot be left inconsistent by concurrent
+    switches (E-022 contract P1-3).
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class BuildConflict(Exception):
     """Raised when a build for a ``(tenant, corpus, document, version)`` is
     already owned by a different in-flight job, or when a build's lease has been
@@ -1293,6 +1307,37 @@ class MetadataStore:
             (finished_at, finding_count, int(mutated), run_id),
         )
 
+    def record_control_plane_finding(
+        self,
+        *,
+        corpus_id: str,
+        kind: str,
+        tenant_id: Optional[str] = None,
+        document_id: Optional[str] = None,
+        document_version: Optional[str] = None,
+        detail: str = "",
+    ) -> None:
+        """Persist a control-plane finding as its own reconciliation run.
+
+        Used when an automated control-plane operation (e.g. active-version
+        rollback) cannot fully sync the data plane and needs the periodic
+        :class:`Reconciler` to retry (build plan §10.10 / E-022 contract P1-2).
+        The finding is durable and audit-visible even though no corpus-wide
+        reconcile run produced it.
+        """
+        run_id = uuid.uuid4().hex
+        self.begin_reconciliation_run(run_id, corpus_id, _now_iso(), dry_run=False)
+        self.record_reconciliation_finding(
+            run_id,
+            kind=kind,
+            corpus_id=corpus_id,
+            tenant_id=tenant_id,
+            document_id=document_id,
+            document_version=document_version,
+            detail=detail,
+        )
+        self.finish_reconciliation_run(run_id, _now_iso(), 1, mutated=False)
+
     def record_reconciliation_finding(
         self,
         run_id: str,
@@ -1390,6 +1435,28 @@ class MetadataStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def iter_active_child_chunks(self, corpus_id: str) -> list[dict]:
+        """Return child-chunk records for the **active, non-deprecated** versions.
+
+        Index migration builds a parallel collection from these only: a chunk is
+        included iff its ``(tenant_id, corpus_id, document_id, document_version)``
+        is an ``active`` and non-``deprecated`` row in ``documents``. This is what
+        prevents the migrated index from resurrecting a deprecated or logically
+        ``deleted`` version's evidence (build plan §10.8 + E-022 contract P1-1).
+        """
+        rows = self._conn.execute(
+            "SELECT c.chunk_id, c.parent_id, c.tenant_id, c.corpus_id, c.document_id, "
+            "c.document_version, c.section_path, c.content, c.security_level, c.acl_scope, "
+            "c.allowed_user_ids, c.allowed_group_ids, c.denied_user_ids, c.denied_group_ids "
+            "FROM chunks c "
+            "JOIN documents d ON d.tenant_id=c.tenant_id AND d.corpus_id=c.corpus_id "
+            "   AND d.document_id=c.document_id AND d.version=c.document_version "
+            "WHERE c.corpus_id=? AND c.chunk_type='child' "
+            "AND d.status='active' AND d.deprecated=0",
+            (corpus_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_active_collection(self, corpus_id: str) -> Optional[str]:
         """Persisted active collection name (None => falls back to ``corpus_id``)."""
         row = self._conn.execute(
@@ -1404,6 +1471,102 @@ class MetadataStore:
             "UPDATE corpus_registry SET vector_collection=? WHERE corpus_id=?",
             (collection_name, corpus_id),
         )
+
+    # ------------------------------------------------------------------ #
+    # Index-switch lease + atomic pointer flip (E-022 contract P1-3)
+    # ------------------------------------------------------------------ #
+    def acquire_index_switch_lease(
+        self, corpus_id: str, owner: str, *, ttl_seconds: int = 300
+    ) -> bool:
+        """Claim the per-corpus index-switch lease atomically.
+
+        Returns ``True`` if ``owner`` now holds the lease (newly acquired,
+        re-acquired, or took over an expired lease), ``False`` if another owner
+        holds a live lease. Serializes ``switch_index`` / ``rollback_index``.
+        """
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            row = cur.execute(
+                "SELECT owner, acquired_at FROM index_switch_leases WHERE corpus_id=?",
+                (corpus_id,),
+            ).fetchone()
+            now = _now_iso()
+            if row is None:
+                cur.execute(
+                    "INSERT INTO index_switch_leases(corpus_id, owner, acquired_at) "
+                    "VALUES (?, ?, ?)",
+                    (corpus_id, owner, now),
+                )
+                cur.execute("COMMIT")
+                return True
+            if row["owner"] == owner:
+                # Refresh the held lease (idempotent re-acquire).
+                cur.execute(
+                    "UPDATE index_switch_leases SET acquired_at=? WHERE corpus_id=?",
+                    (now, corpus_id),
+                )
+                cur.execute("COMMIT")
+                return True
+            acquired = datetime.fromisoformat(row["acquired_at"])
+            expired = (datetime.now(timezone.utc) - acquired).total_seconds() > ttl_seconds
+            if expired:
+                cur.execute("DELETE FROM index_switch_leases WHERE corpus_id=?", (corpus_id,))
+                cur.execute(
+                    "INSERT INTO index_switch_leases(corpus_id, owner, acquired_at) "
+                    "VALUES (?, ?, ?)",
+                    (corpus_id, owner, now),
+                )
+                cur.execute("COMMIT")
+                return True
+            cur.execute("COMMIT")
+            return False
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    def release_index_switch_lease(self, corpus_id: str, owner: str) -> None:
+        """Release the lease only if ``owner`` currently holds it (fencing)."""
+        self._conn.execute(
+            "DELETE FROM index_switch_leases WHERE corpus_id=? AND owner=?",
+            (corpus_id, owner),
+        )
+
+    def set_active_collection_atomic(
+        self, corpus_id: str, collection_name: Optional[str], owner: str
+    ) -> None:
+        """Flip the persisted pointer + mark the live build switched, in one txn.
+
+        Must be called while ``owner`` holds the index-switch lease. Updates both
+        ``corpus_registry.vector_collection`` (the durable retrieval pointer; a
+        ``None`` value resets it to NULL, i.e. falls back to ``corpus_id``) and
+        the matching ``index_builds.status='switched'`` so the persisted state and
+        the index-build ledger agree (E-022 contract P1-3).
+        """
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            lease = cur.execute(
+                "SELECT owner FROM index_switch_leases WHERE corpus_id=?",
+                (corpus_id,),
+            ).fetchone()
+            if lease is None or lease["owner"] != owner:
+                raise IndexSwitchConflict(
+                    f"index switch lease for {corpus_id!r} not held by {owner!r}"
+                )
+            cur.execute(
+                "UPDATE corpus_registry SET vector_collection=? WHERE corpus_id=?",
+                (collection_name, corpus_id),
+            )
+            cur.execute(
+                "UPDATE index_builds SET status='switched', finished_at=? "
+                "WHERE corpus_id=? AND collection_name=?",
+                (_now_iso(), corpus_id, collection_name),
+            )
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     def begin_index_build(
         self,

@@ -14,6 +14,7 @@ can resume without producing duplicate business IDs or Chunks (§10.10 #3).
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import uuid
 from dataclasses import dataclass
@@ -55,6 +56,19 @@ from agentic_rag_enterprise.storage.vector_store import (
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _parse_list(value) -> list[str]:
+    """Parse a stored ACL/section list that may be a JSON string or a list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return [str(v) for v in parsed]
+    return [str(v) for v in value]
 
 
 def _now() -> datetime:
@@ -1184,12 +1198,17 @@ class DocumentManager:
     def rebuild_document(
         self, tenant_id: str, corpus_id: str, document_id: str, document_version: str
     ) -> None:
-        """Re-embed a document's child chunks into the live collection.
+        """Rebuild a document's data plane from the control-plane chunk content.
 
         Supplied to the :class:`Reconciler` as its ``rebuild_document`` callback
-        for the missing-data-plane path. Rebuilds from the existing control-plane
+        for the missing-data-plane paths. Rebuilds from the existing control-plane
         chunk content (no re-parsing), exactly as :func:`build_index_v2` does for
-        a whole corpus.
+        a whole corpus — and, for E-022 contract P1-4, also recreates the Parent
+        Store entries, which the in-memory Parent Store does not persist. The
+        parent text is faithfully reconstructed by grouping the child chunk rows
+        by ``parent_id`` (the chunker content-addresses parents from
+        ``tenant|corpus|doc|version|section_path|text``, so all children of a
+        parent share its identity) and concatenating their content.
         """
         from agentic_rag_enterprise.ingestion.index_migration import _chunk_row_to_point
 
@@ -1204,6 +1223,54 @@ class DocumentManager:
             for r in rows
         ]
         self._vector.upsert(collection, points)
+        self._rebuild_parents(tenant_id, corpus_id, document_id, document_version, rows)
+
+    def _rebuild_parents(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        document_version: str,
+        rows: list[dict],
+    ) -> None:
+        """Recreate Parent Store entries for a version from its child chunk rows.
+
+        Parents are not persisted anywhere (the Parent Store is in-memory and the
+        ``documents`` table stores only a content hash), so the only faithful
+        source is the ``chunks`` control-plane rows. Children are grouped by
+        ``parent_id`` and their content concatenated to reconstruct the parent
+        text; ACL/lifecycle metadata is taken from the (shared) child rows.
+        """
+        by_parent: dict[str, list[dict]] = {}
+        for r in rows:
+            by_parent.setdefault(r.get("parent_id") or "", []).append(r)
+        for parent_id, children in by_parent.items():
+            if not parent_id:
+                continue
+            children.sort(key=lambda r: str(r.get("chunk_id", "")))
+            first = children[0]
+            text = "\n\n".join(r["content"] for r in children)
+            metadata = {
+                "status": "active",
+                "deprecated": False,
+                "security_level": first.get("security_level", "internal"),
+                "acl_scope": first.get("acl_scope", "restricted"),
+                "allowed_user_ids": _parse_list(first.get("allowed_user_ids")),
+                "allowed_group_ids": _parse_list(first.get("allowed_group_ids")),
+                "denied_user_ids": _parse_list(first.get("denied_user_ids")),
+                "denied_group_ids": _parse_list(first.get("denied_group_ids")),
+            }
+            parent = ParentChunk(
+                parent_id=parent_id,
+                document_id=document_id,
+                document_version=document_version,
+                tenant_id=tenant_id,
+                corpus_id=corpus_id,
+                text=text,
+                section_path=_parse_list(first.get("section_path")),
+                metadata=metadata,
+            )
+            self._parents.put(parent)
 
     def rollback_active_version(
         self,
@@ -1216,18 +1283,84 @@ class DocumentManager:
     ) -> tuple[int, Optional[str]]:
         """Temporarily roll a document's active version back (build plan §2630).
 
-        Delegates to :meth:`MetadataStore.rollback_active_version`; see its
-        contract for the CAS guard and the "never reactivate a purged version"
-        rule. Retrieval picks up the rolled-back version via the active-version
-        gate (§10.10 #5).
+        Delegates the CAS-guarded metadata switch to
+        :meth:`MetadataStore.rollback_active_version`, then synchronizes the
+        rebuildable data planes (Qdrant payload ``status``/``deprecated`` and the
+        Parent Store) so the control-plane truth and the retrieval path agree
+        (E-022 contract P1-2): the newly-active target version is made visible
+        and the previously-active version is deprecated. If the data-plane sync
+        fails it is NOT silently swallowed — a persistent, reconciler-retryable
+        finding is recorded and the error is re-raised so operators see the
+        partial result.
         """
-        return self._store.rollback_active_version(
+        new_rev, previous_version = self._store.rollback_active_version(
             tenant_id=tenant_id,
             corpus_id=corpus_id,
             document_id=document_id,
             to_version=to_version,
             expected_revision=expected_revision,
         )
+        target = (
+            to_version
+            if to_version is not None
+            else self._store.get_active_version(tenant_id, corpus_id, document_id)
+        )
+        collection = self._collection(corpus_id)
+        try:
+            # Make the rolled-back (now active) version visible in the data plane.
+            if target is not None:
+                self._sync_version_status(
+                    collection, tenant_id, corpus_id, document_id, target, active=True
+                )
+            # Deprecate the version we just rolled back FROM (unless it was already
+            # the target, i.e. an idempotent no-op rollback).
+            if previous_version is not None and previous_version != target:
+                self._sync_version_status(
+                    collection, tenant_id, corpus_id, document_id, previous_version, active=False
+                )
+        except Exception as exc:  # pragma: no cover - exercised by fault-injection test
+            self._store.record_control_plane_finding(
+                corpus_id=corpus_id,
+                kind="rollback_data_plane_sync_failed",
+                tenant_id=tenant_id,
+                document_id=document_id,
+                document_version=target,
+                detail=f"target={target} previous={previous_version}: {exc}",
+            )
+            raise
+        return new_rev, previous_version
+
+    def _sync_version_status(
+        self,
+        collection: str,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        document_version: str,
+        *,
+        active: bool,
+    ) -> None:
+        """Force a version's data plane to match its control-plane lifecycle.
+
+        ``active=True`` -> Qdrant ``status=active``/``deprecated=false`` + Parent
+        Store active; ``active=False`` -> Qdrant ``status=deprecated``/
+        ``deprecated=true`` + Parent Store deprecated. Used by active-version
+        rollback (§2630) so retrieval (``status==active AND deprecated==false``)
+        serves exactly the control-plane active version.
+        """
+        point_ids = self._vector.list_point_ids_by_document(
+            collection, tenant_id, corpus_id, document_id, document_version
+        )
+        if point_ids:
+            payload = {
+                "status": "active" if active else "deprecated",
+                "deprecated": not active,
+            }
+            self._vector.update_payload(collection, point_ids, payload)
+        if active:
+            self._parents.activate_document(tenant_id, corpus_id, document_id, document_version)
+        else:
+            self._parents.deprecate_document(tenant_id, corpus_id, document_id, document_version)
 
 
 def _acl_from_doc(doc: SourceDocument) -> ResourceAcl:

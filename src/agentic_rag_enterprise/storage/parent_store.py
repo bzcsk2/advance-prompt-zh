@@ -54,6 +54,41 @@ class ParentStore:
         metadata["deprecated"] = True
         self._store[parent_id] = chunk.model_copy(update={"metadata": metadata})
 
+    def activate(self, parent_id: str) -> None:
+        """Mark a stored parent active so retrieval's second-auth includes it.
+
+        The inverse of :meth:`deprecate`: used when the Metadata DB makes a
+        version active again (e.g. active-version rollback, build plan §2630) so
+        the Parent Store data plane agrees with the control-plane truth.
+        """
+        chunk = self._store.get(parent_id)
+        if chunk is None:
+            return
+        metadata = dict(chunk.metadata)
+        metadata["status"] = "active"
+        metadata["deprecated"] = False
+        self._store[parent_id] = chunk.model_copy(update={"metadata": metadata})
+
+    def activate_document(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        document_version: str,
+    ) -> None:
+        """Make every parent of one (tenant, corpus, document, version) active.
+
+        Scoped by ``tenant_id`` + ``corpus_id`` (build plan §10.6). Idempotent.
+        """
+        for chunk in list(self._store.values()):
+            if (
+                chunk.tenant_id == tenant_id
+                and chunk.corpus_id == corpus_id
+                and chunk.document_id == document_id
+                and chunk.document_version == document_version
+            ):
+                self.activate(chunk.parent_id)
+
     def deprecate_document(
         self,
         tenant_id: str,

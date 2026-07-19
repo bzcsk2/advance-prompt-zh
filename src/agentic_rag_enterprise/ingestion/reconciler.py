@@ -157,6 +157,25 @@ class Reconciler:
     # Core
     # ------------------------------------------------------------------ #
     def _reconcile(self, corpus_id: str, report: ReconciliationReport) -> None:
+        # --- Registry pointer realign (E-022 contract P1-4) ------------ #
+        # The persisted pointer (MetadataStore) is the source of truth; the live
+        # in-memory registry is a derived mirror. If they have drifted (e.g. a
+        # restart re-seeded the registry without the migrated pointer), realign
+        # the live registry to the persisted value BEFORE scanning, so the rest
+        # of the reconcile operates on the correct collection.
+        persisted_collection = self._store.get_active_collection(corpus_id)
+        live_collection = self._registry.resolve_collection_name(corpus_id)
+        effective_persisted = persisted_collection or corpus_id
+        if live_collection != effective_persisted:
+            report.add(
+                "registry_mismatch",
+                corpus_id,
+                detail=f"live registry={live_collection!r} persisted={effective_persisted!r}",
+            )
+            if not self._dry_run:
+                self._registry.set_active_collection(corpus_id, effective_persisted)
+                report.mutated = True
+
         collection = self._registry.resolve_collection_name(corpus_id)
 
         active = set(self._store.iter_active_document_versions(corpus_id))
@@ -188,6 +207,41 @@ class Reconciler:
                 if not self._dry_run:
                     self._vector.delete(collection, [point_id])
                     report.mutated = True
+                continue
+            # Stale data-plane status: the Metadata DB is the truth. A point for
+            # an active version must read active; a point for a non-active
+            # (deprecated/deleted) version must read deprecated. This keeps
+            # retrieval (status==active AND deprecated==false) consistent with the
+            # control plane after an active-version rollback (E-022 contract P1-2).
+            point_status = payload.get("status")
+            if key in active and point_status != "active":
+                report.add(
+                    "stale_qdrant_status",
+                    corpus_id,
+                    tenant_id=p_tenant,
+                    document_id=doc,
+                    document_version=ver,
+                    detail=f"point {point_id} should be active (metadata active)",
+                )
+                if not self._dry_run:
+                    self._vector.update_payload(
+                        collection, [point_id], {"status": "active", "deprecated": False}
+                    )
+                    report.mutated = True
+            elif key not in active and point_status == "active":
+                report.add(
+                    "stale_qdrant_status",
+                    corpus_id,
+                    tenant_id=p_tenant,
+                    document_id=doc,
+                    document_version=ver,
+                    detail=f"point {point_id} should be deprecated (metadata non-active)",
+                )
+                if not self._dry_run:
+                    self._vector.update_payload(
+                        collection, [point_id], {"status": "deprecated", "deprecated": True}
+                    )
+                    report.mutated = True
 
         for t_id, doc, ver in sorted(active):
             if (t_id, doc, ver) not in qdrant_present:
@@ -198,6 +252,24 @@ class Reconciler:
                     document_id=doc,
                     document_version=ver,
                     detail="active version has no Qdrant points",
+                )
+                if self._rebuild is not None and not self._dry_run:
+                    self._rebuild(t_id, corpus_id, doc, ver)
+                    report.mutated = True
+                continue
+            # P1-4: an active version whose Qdrant points exist but whose Parent
+            # Store entries are missing. The Parent Store is in-memory and not
+            # persisted, so a crash/restart can leave it empty while Qdrant is
+            # intact. Flag it and rebuild (DocumentManager.rebuild_document also
+            # recreates the parents from the child chunk rows).
+            if not self._parents.list_parent_ids(t_id, corpus_id, doc, ver):
+                report.add(
+                    "missing_parent_chunk",
+                    corpus_id,
+                    tenant_id=t_id,
+                    document_id=doc,
+                    document_version=ver,
+                    detail="active version has Qdrant points but no Parent Store entries",
                 )
                 if self._rebuild is not None and not self._dry_run:
                     self._rebuild(t_id, corpus_id, doc, ver)
@@ -240,6 +312,40 @@ class Reconciler:
                 if not self._dry_run:
                     self._parents.delete(parent_id)
                     report.mutated = True
+                continue
+            # Stale parent status: mirror the Qdrant stale-status check. A parent
+            # for an active version must be active; a parent for a non-active
+            # version must be deprecated, so the ParentReader's second-auth
+            # (status==active AND deprecated==false) agrees with the control plane.
+            parent = self._parents.get(parent_id)
+            p_status = parent.metadata.get("status") if parent is not None else None
+            p_dep = parent.metadata.get("deprecated") if parent is not None else None
+            if (p_tenant, p_doc, p_ver) in active:
+                if p_status != "active" or p_dep:
+                    report.add(
+                        "stale_parent_status",
+                        corpus_id,
+                        tenant_id=p_tenant,
+                        document_id=p_doc,
+                        document_version=p_ver,
+                        detail=f"parent {parent_id} should be active (metadata active)",
+                    )
+                    if not self._dry_run:
+                        self._parents.activate_document(p_tenant, p_corpus, p_doc, p_ver)
+                        report.mutated = True
+            else:
+                if p_status == "active" and not p_dep:
+                    report.add(
+                        "stale_parent_status",
+                        corpus_id,
+                        tenant_id=p_tenant,
+                        document_id=p_doc,
+                        document_version=p_ver,
+                        detail=f"parent {parent_id} should be deprecated (metadata non-active)",
+                    )
+                    if not self._dry_run:
+                        self._parents.deprecate_document(p_tenant, p_corpus, p_doc, p_ver)
+                        report.mutated = True
 
         # --- Dead-letter jobs ------------------------------------------ #
         for job_id in self._store.iter_failed_job_ids(corpus_id):
