@@ -4,8 +4,8 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M7** — Runtime hardening (`E-022` → `E-024`); M6 / E-021 **CLOSED / ACCEPTED at `c6c3e6b`**
-- Current Issue: **E-022** — Reconciler + purge + index migration + rollback (build plan Milestone 7)
+- Milestone: **M7** — Runtime hardening (`E-022` → `E-024`); M6 / E-021 **CLOSED / ACCEPTED at `c6c3e6b`**; **M7 / E-022** **CLOSED / ACCEPTED at `cd4ddb2`**
+- Current Issue: **E-023** — Persistent Checkpoint + re-authorization on resume (build plan Milestone 7)
 - Issue: **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator — **CLOSED /
   ACCEPTED at `398f059`** (acceptance re-audit `33c...` passed: 10-check independent
   re-verification — schema invariants, DAG integrity for required+optional edges, binding
@@ -192,9 +192,20 @@
   iteration immediately (no further gap retrieval). `tests/integration/test_e021_evidence_pipeline.py`
   extends with 5 P1 tests. Planner core unchanged; M7 not entered in the acceptance commit. Full
   contract at `docs/issue-e021-contract.md`.
-- **M7 / E-022 → E-024** — Runtime hardening — **current work switched to `E-022`**
-  (Reconciler + purge + index migration + rollback; build plan §Milestone 7). Detailed E-022
-  contract / allowed-changes section to be authored when the issue opens.
+- Issue: **E-022** — Reconciler + purge + index migration + rollback (build plan Milestone 7) —
+  **CLOSED / ACCEPTED at `cd4ddb2`**. All 4 P1 defects closed: **P1-1** v2 index builds only the
+  active version (`iter_active_child_chunks` JOINs active, non-deprecated documents; deprecated and
+  logically-deleted content excluded); **P1-2** `DocumentManager.rollback_active_version` re-syncs
+  the real data plane (Qdrant payload + Parent Store status/`deprecated` flip via `_sync_version_status`,
+  with a `rollback_data_plane_sync_failed` control-plane finding + re-raise on failure); **P1-3**
+  index switch gains a per-corpus lease (`index_switch_leases`) + `BEGIN IMMEDIATE` atomic pointer flip
+  (`set_active_collection_atomic`) with registry-update compensation (`_switch_pointer` reverts the
+  persisted pointer on live-registry failure, `IndexSwitchConflict` on contention); **P1-4** the
+  reconciler rebuilds missing Parent Store entries from child chunk rows (parents are never persisted,
+  so text is reconstructed by `parent_id` grouping) and realigns a drifted live-registry pointer to
+  the persisted truth (`registry_mismatch`). Gates at acceptance: **766 passed / 1 skipped**, ruff
+  check + `ruff format --check` clean, mypy clean. Full contract at `docs/issue-e022-contract.md`.
+  E-023 / E-024 remain OPEN within M7.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
@@ -752,7 +763,7 @@ frozen. Full contract at `docs/issue-e021-contract.md`.
   `rerank_score` to pick a winning fact; no change to E-011→E-020 behaviour beyond the agreed
   `AnswerEnvelope.conflict_report` extension; no upstream modification.
 
-## E-022 Allowed Changes (M7 only) — contract open, implementation pending
+## E-022 Allowed Changes (M7 only) — CLOSED / ACCEPTED at `cd4ddb2`
 Runtime hardening (build plan Milestone 7): Reconciler + purge + index migration + rollback
 (`E-022`). Full contract at `docs/issue-e022-contract.md`. In scope: standalone `Reconciler`
 (deterministic, idempotent, fenceable; metadata-DB-as-truth; orphan purge, missing-data-plane
