@@ -66,6 +66,7 @@ from agentic_rag_enterprise.retrieval.fast_path import (
     run_fast_path,
 )
 from agentic_rag_enterprise.storage.checkpoint_store import (
+    CHECKPOINT_ABORTED,
     RunCheckpoint,
     ResumeAuthError,
     reauthorize_evidence,
@@ -275,6 +276,16 @@ class ChatService:
         self._top_k = top_k
         self._metadata_store = metadata_store
         self._judge = judge
+
+    @property
+    def judge(self) -> Judge | None:
+        """The default Judge configured on this service (may be ``None``).
+
+        The API uses this so a ``POST /v1/chat`` with a ``run_id`` (but no
+        ``resume`` flag) can run the checkpointed iteration loop through the
+        default judge instead of the single-pass ``answer`` path (E-023 P1-1).
+        """
+        return self._judge
 
     def answer(
         self,
@@ -742,9 +753,7 @@ class ChatService:
         evidence_by_id = {ev.evidence_id: ev for ev in first_result.evidence}
         seen_ids = set(evidence_by_id)
         seen_text_hashes = {ev.text_hash for ev in first_result.evidence}
-        seen_doc_versions = {
-            (ev.document_id, ev.document_version) for ev in first_result.evidence
-        }
+        seen_doc_versions = {(ev.document_id, ev.document_version) for ev in first_result.evidence}
         return _IterationState(
             evidence_by_id=evidence_by_id,
             seen_ids=seen_ids,
@@ -905,9 +914,7 @@ class ChatService:
 
         # --- E-021 conflict stage (P1-2): run BEFORE the Judge each round ---
         current_evidence = tuple(state.evidence_by_id.values())
-        report, kept_evidence = self._run_conflict_stage(
-            query, current_evidence, scope=state.scope
-        )
+        report, kept_evidence = self._run_conflict_stage(query, current_evidence, scope=state.scope)
         if not kept_evidence:
             # Temporal filter dropped every surviving evidence (all expired /
             # not-yet-effective / outside the window). Refuse without the model (P1-1).
@@ -1079,6 +1086,17 @@ class ChatService:
         ck = self._metadata_store.load_run_checkpoint(run_id)
         if ck is None:
             raise ResumeAuthError("checkpoint_not_found")
+        # A resumable checkpoint must have first_result (round 0 completed);
+        # mypy uses this to narrow ck.first_result to FastPathResult below.
+        assert ck.first_result is not None, "resumable checkpoint has no first_result"
+
+        # 0) Persisted lifecycle status gate (E-023 P1-3). A checkpoint must be
+        #    re-readable by its status, not just its presence:
+        #      * aborted  → refuse resume (the run was explicitly cancelled);
+        #      * running / completed → may be resumed (running continues,
+        #        completed is re-authorized then returned idempotently).
+        if ck.status == CHECKPOINT_ABORTED:
+            raise ResumeAuthError("checkpoint_aborted")
 
         # 1) Cross-principal resume is refused (fail closed).
         if (
@@ -1102,6 +1120,7 @@ class ChatService:
 
         # 4) Re-authorize each gathered Evidence against CURRENT metadata.
         surviving: list[SnapshotEvidence] = []
+        dropped: list[tuple[SnapshotEvidence, str]] = []
         for ev in ck.evidence:
             kept, reason = reauthorize_evidence(
                 ev, ctx, metadata_store=self._metadata_store, registry=self._registry
@@ -1111,14 +1130,21 @@ class ChatService:
             else:
                 # Fail closed: drop the now-unauthorized evidence and record it for
                 # audit. The dropped evidence must never re-surface (invariant 1).
+                # The audit **detail** is a fixed, controlled string: it must NOT
+                # repeat the evidence id or its body, which would re-leak data the
+                # principal can no longer read (E-023 audit tightening; P1-6).
                 self._metadata_store.record_control_plane_finding(
                     corpus_id=ev.corpus_id,
                     kind="resume_evidence_revoked",
                     tenant_id=ev.tenant_id,
                     document_id=ev.document_id,
                     document_version=ev.document_version,
-                    detail=f"evidence {ev.evidence_id} dropped on resume: {reason}",
+                    detail=(
+                        "checkpoint evidence revoked during current-policy "
+                        f"reauthorization: {reason}"
+                    ),
                 )
+                dropped.append((ev, reason))
         if not surviving:
             # No authorized evidence remains → refuse without invoking the model.
             return build_no_evidence_refusal(ctx, corpora_used=(ck.corpus_id,))
@@ -1129,17 +1155,59 @@ class ChatService:
         verifier = DeterministicClaimEvidenceVerifier()
         state = self._build_state_from_checkpoint(ck, surviving)
 
-        # The checkpoint may already represent a *finished* run (a retried
-        # resume, or a run that reached sufficiency/conflict and stopped). If the
-        # stored coverage is already terminal (sufficient / contradicted), there
-        # is nothing left to iterate: finalize directly so the resumed envelope is
-        # byte-for-byte identical to the uninterrupted run (invariant 4 — the
-        # original stop_reason is preserved instead of being over-written by a
-        # re-run of empty gap rounds).
-        if ck.coverage is not None and ck.coverage.overall_status in ("sufficient", "contradicted"):
+        # 5) Derived-state recomputation (E-023 P1-4).
+        #
+        # If NO evidence was revoked, the stored coverage / final_report /
+        # final_evidence_ids are still valid: a completed checkpoint is finalized
+        # idempotently (determinism, invariant 4). If AT LEAST ONE evidence was
+        # revoked, the stored derived state is stale and MUST be recomputed from
+        # the surviving evidence — re-run the temporal/conflict stage and the
+        # coverage Judge. Reusing the old ``sufficient`` verdict would silently
+        # keep answering from revoked data, and the old ConflictReport could still
+        # name the revoked source. The recomputed verdict then decides whether to
+        # stop or to continue retrieving.
+        if dropped:
+            report, kept_evidence = self._run_conflict_stage(ck.query, tuple(surviving))
+            if not kept_evidence:
+                # Temporal filter dropped every surviving evidence → refuse.
+                return build_no_evidence_refusal(
+                    ctx,
+                    corpora_used=(ck.corpus_id,),
+                    tool_calls=state.retrieval_calls,
+                    gap_rounds=state.gap_rounds,
+                    iterations=state.gap_rounds,
+                )
+            # Clear and recompute the derived state from surviving evidence only.
+            state.final_report = report
+            state.final_evidence = kept_evidence
+            state.conflict_stop = report.conflict_status == ConflictStatus.CONTRADICTED
+            state.coverage = active_judge.judge(
+                query=ck.query, required_facts=ck.required_facts, evidence=kept_evidence
+            )
+            if state.conflict_stop:
+                # A contradiction cannot be auto-resolved: surface both sources.
+                state.coverage = _contradicted_coverage()
+                self._metadata_store.mark_run_checkpoint_done(run_id)
+                return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
+            if state.coverage.overall_status == "sufficient":
+                # The reauthorized answer is sufficient from surviving evidence.
+                self._metadata_store.mark_run_checkpoint_done(run_id)
+                return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
+            # Otherwise: insufficient → continue iterating from ck.round_index.
+        elif ck.coverage is not None and ck.coverage.overall_status in (
+            "sufficient",
+            "contradicted",
+        ):
+            # No evidence revoked and already terminal → idempotent finalize so the
+            # resumed envelope is byte-for-byte identical to the uninterrupted run
+            # (invariant 4). The original stop_reason is preserved.
             self._metadata_store.mark_run_checkpoint_done(run_id)
             return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
 
+        # 6) Continue the loop from the checkpointed round. Every completed round
+        #    is persisted (E-023 P1-3) so a second crash resumes from the latest
+        #    round, not the stale one — and the run ends only after the final
+        #    state has been written (terminal / BreakLoop → save THEN mark done).
         for round_idx in range(ck.round_index, ck.max_rounds):
             try:
                 terminal = self._run_round(
@@ -1157,16 +1225,42 @@ class ChatService:
                     ck.corpus_id,
                 )
             except _BreakLoop:
-                self._metadata_store.mark_run_checkpoint_done(run_id)
+                # Persist the latest state BEFORE marking done (P1-3), then stop.
+                if self._metadata_store is not None:
+                    self._save_checkpoint(
+                        run_id,
+                        ctx,
+                        state,
+                        first_result=ck.first_result,
+                        required=ck.required_facts,
+                        max_rounds=ck.max_rounds,
+                        query=ck.query,
+                        corpus_id=ck.corpus_id,
+                        round_index=round_idx + 1,
+                    )
+                    self._metadata_store.mark_run_checkpoint_done(run_id)
                 return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
+            # P1-3: persist after each completed (non-terminal) round.
+            if self._metadata_store is not None:
+                self._save_checkpoint(
+                    run_id,
+                    ctx,
+                    state,
+                    first_result=ck.first_result,
+                    required=ck.required_facts,
+                    max_rounds=ck.max_rounds,
+                    query=ck.query,
+                    corpus_id=ck.corpus_id,
+                    round_index=round_idx + 1,
+                )
             if terminal is not None:
                 self._metadata_store.mark_run_checkpoint_done(run_id)
                 return terminal
 
         result = self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
-        self._metadata_store.mark_run_checkpoint_done(run_id)
+        if self._metadata_store is not None:
+            self._metadata_store.mark_run_checkpoint_done(run_id)
         return result
-
 
     def _run_single_pass(
         self,

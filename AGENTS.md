@@ -205,7 +205,13 @@
   so text is reconstructed by `parent_id` grouping) and realigns a drifted live-registry pointer to
   the persisted truth (`registry_mismatch`). Gates at acceptance: **766 passed / 1 skipped**, ruff
   check + `ruff format --check` clean, mypy clean. Full contract at `docs/issue-e022-contract.md`.
-  E-023 / E-024 remain OPEN within M7.
+- Issue: **E-023** — Persistent checkpoint + re-authorization on resume (build plan
+  Milestone 7) — **CONTRACT OPEN** (implementation pending). Checkpoints the
+  `answer_with_iteration` loop to a `run_checkpoints` table on the Metadata DB and
+  re-authorizes on resume against current ACLs/active version/corpus discoverability
+  (fail closed: drops any evidence the principal can no longer read; refuses
+  cross-principal / stale-`policy_version` / undiscoverable-corpus resume). Full
+  contract at `docs/issue-e023-contract.md`. E-024 remains OPEN within M7.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

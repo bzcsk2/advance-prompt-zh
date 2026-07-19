@@ -18,9 +18,7 @@ answer/abstain) is exercisable end-to-end against the *real* default app.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +33,9 @@ from agentic_rag_enterprise.ingestion.job import DocumentManager, IngestionReque
 from agentic_rag_enterprise.providers import ModelProfile
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.corpus.registry import InMemoryCorpusRegistry
+from agentic_rag_enterprise.judge.deterministic_coverage_judge import (
+    DeterministicCoverageJudge,
+)
 from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
@@ -137,17 +138,22 @@ class _DevStructuredWrapper:
 class DefaultServiceContainer:
     """Holds the single shared storage stack + ChatService for the Internal MVP."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, metadata_db_path: str | None = None) -> None:
         # In-memory Qdrant: no server required.
         self._client = QdrantClient(location=":memory:")
         self._vstore = VectorStore(self._client)
         self._pstore = ParentStore()
 
-        # Metadata DB on a throwaway sqlite file (no shared server required).
-        fd, path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
-        os.unlink(path)
-        self._mstore = MetadataStore(path)
+        # Metadata DB path. P1-2 (E-023): the default container must persist its
+        # checkpoint store to a STABLE path so a process restart can reopen the
+        # same database and recover an interrupted run — not a fresh random
+        # tempfile that vanishes on exit. An explicit ``metadata_db_path`` wins
+        # (used by tests for hermetic, per-test databases); otherwise we fall
+        # back to ``settings.metadata_db_path`` (env-configurable, default
+        # ``metadata.db``). The path is never unlinked, so the checkpoint table
+        # survives container teardown / process restart.
+        self._db_path = metadata_db_path or settings.metadata_db_path
+        self._mstore = MetadataStore(self._db_path)
 
         self._dense = _DevDenseEncoder()
         self._sparse = _DevSparseEncoder()
@@ -176,6 +182,13 @@ class DefaultServiceContainer:
             corpus_registry=self._registry,
         )
 
+        # Default, runnable Judge so the default service can run the E-019/E-020
+        # iteration loop AND checkpoint it (E-023 P1-1): ``POST /v1/chat`` with a
+        # ``run_id`` now produces a recoverable checkpoint instead of silently
+        # ignoring ``run_id``. Without it, ``resume_run`` could not run (it
+        # requires a judge).
+        self._judge = DeterministicCoverageJudge()
+
         self._service = ChatService(
             retriever=SecureRetriever(
                 _HybridSearchAdapter(self._vstore),
@@ -188,7 +201,13 @@ class DefaultServiceContainer:
             resolve_corpus=self._resolver,
             top_k=settings.max_retrieval_top_k,
             metadata_store=self._mstore,
+            registry=self._registry,
+            judge=self._judge,
         )
+
+    @property
+    def judge(self) -> DeterministicCoverageJudge:
+        return self._judge
 
     def ingest(
         self,
@@ -247,23 +266,38 @@ class DefaultServiceContainer:
 
 
 _CONTAINER: DefaultServiceContainer | None = None
+# Test-injected default DB path (set by ``reset_default_container``). When a test
+# passes a hermetic per-test path here, every subsequent ``get_default_container``
+# built in that test uses it, keeping the REAL default app's stable production
+# path (``settings.metadata_db_path``) untouched for non-test callers.
+_DEFAULT_DB_PATH: str | None = None
 
 
-def get_default_container() -> DefaultServiceContainer:
-    """Return the process-wide default service container (lazily built)."""
+def get_default_container(metadata_db_path: str | None = None) -> DefaultServiceContainer:
+    """Return the process-wide default service container (lazily built).
+
+    Path precedence when the singleton is first created: an explicit
+    ``metadata_db_path`` wins; else a test-injected ``_DEFAULT_DB_PATH``; else the
+    production default ``settings.metadata_db_path`` (a STABLE file, so a process
+    restart can reopen the same database and recover an interrupted run — E-023
+    P1-2). Subsequent calls return the already-built container (path frozen).
+    """
     global _CONTAINER
     if _CONTAINER is None:
-        _CONTAINER = DefaultServiceContainer()
+        _CONTAINER = DefaultServiceContainer(metadata_db_path=metadata_db_path or _DEFAULT_DB_PATH)
     return _CONTAINER
 
 
-def reset_default_container() -> None:
-    """Discard the process-wide default container.
+def reset_default_container(metadata_db_path: str | None = None) -> None:
+    """Discard the process-wide default container and (optionally) set its DB path.
 
     The next :func:`get_default_container` call rebuilds a fresh, empty storage
-    stack. Used by the end-to-end default-app tests to get a hermetic
-    in-memory Qdrant + sqlite (no pollution from other tests that share the
-    singleton), without altering any other test module's view of the singleton.
+    stack. Pass ``metadata_db_path`` to give the rebuilt container a hermetic,
+    per-test database (otherwise it falls back to the production default). Used by
+    the default-app / E-023 tests so they don't share one ``metadata.db`` and
+    pollute each other's ingested documents and run checkpoints (E-023 P1-2
+    hermeticity fix).
     """
-    global _CONTAINER
+    global _CONTAINER, _DEFAULT_DB_PATH
+    _DEFAULT_DB_PATH = metadata_db_path
     _CONTAINER = None

@@ -22,13 +22,14 @@ Asserts the E-023 invariants end-to-end:
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from datetime import datetime
 
 import pytest
 
 from agentic_rag_enterprise.answer.envelope import Claim
-from agentic_rag_enterprise.corpus.registry import InMemoryCorpusRegistry
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
@@ -47,15 +48,29 @@ from agentic_rag_enterprise.services.container import (
     get_default_container,
     reset_default_container,
 )
+from agentic_rag_enterprise.storage.checkpoint_store import (
+    CHECKPOINT_RUNNING,
+    CheckpointIdentityConflict,
+    RunCheckpoint,
+)
 from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEncoder
 from tests.fixtures import FakeDenseEncoder, FakeSparseEncoder
 
 
 @pytest.fixture(autouse=True)
 def _fresh_container() -> None:
-    reset_default_container()
+    # E-023 P1-2 hermeticity fix: each test gets its own temp metadata DB file
+    # (the default container would otherwise share the production ``metadata.db``
+    # across tests, leaking ingested docs / run checkpoints between them).
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    reset_default_container(metadata_db_path=path)
     yield
     reset_default_container()
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _ctx() -> SecurityContext:
@@ -237,12 +252,21 @@ def test_checkpoint_persists_on_shared_metadata_db_and_resume_matches() -> None:
     svc = _service(container, _FakeRetriever(_vacation_map()))
 
     ref = svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=5, judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "bonus structure"),
     )
 
     svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=5, run_id="R1", judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        run_id="R1",
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "bonus structure"),
     )
 
@@ -264,17 +288,28 @@ def test_resume_drops_revoked_evidence_after_acl_tighten_no_leak() -> None:
 
     svc = _service(container, _FakeRetriever(_vacation_map()))
     svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=5, run_id="R2", judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        run_id="R2",
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "bonus structure"),
     )
 
     # Tighten d2's ACL so u1 can no longer read it (control-plane ACL tighten).
     mstore = container.metadata_store
     mstore.update_document_acl(
-        "t1", "eng", "d2", "v1",
-        security_level="public", acl_scope="restricted",
-        allowed_user_ids=["other"], allowed_group_ids=[],
-        denied_user_ids=[], denied_group_ids=[],
+        "t1",
+        "eng",
+        "d2",
+        "v1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["other"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
 
     resumed = svc.resume_run("R2", _ctx())
@@ -283,10 +318,7 @@ def test_resume_drops_revoked_evidence_after_acl_tighten_no_leak() -> None:
     assert all(e.document_id != "d2" for e in resumed.evidence)
     # The drop is auditable.
     findings = [
-        dict(r)
-        for r in mstore._conn.execute(
-            "SELECT kind FROM reconciliation_findings"
-        ).fetchall()
+        dict(r) for r in mstore._conn.execute("SELECT kind FROM reconciliation_findings").fetchall()
     ]
     assert any(f["kind"] == "resume_evidence_revoked" for f in findings)
 
@@ -301,7 +333,12 @@ def test_mid_loop_crash_leaves_resumable_checkpoint() -> None:
     svc = _service(container, crash_retriever)
     with pytest.raises(FastPathBackendError):
         svc.answer_with_iteration(
-            "q", _ctx(), "eng", max_rounds=5, run_id="R3", judge=DeterministicCoverageJudge(),
+            "q",
+            _ctx(),
+            "eng",
+            max_rounds=5,
+            run_id="R3",
+            judge=DeterministicCoverageJudge(),
             required_facts=_facts("vacation policy", "bonus structure"),
         )
     ck = container.metadata_store.load_run_checkpoint("R3")
@@ -316,7 +353,330 @@ def test_mid_loop_crash_leaves_resumable_checkpoint() -> None:
     assert {e.evidence_id for e in resumed.evidence} == {"e1", "e2"}
 
     ref = _service(container, _FakeRetriever(_vacation_map())).answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=5, judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "bonus structure"),
     )
     _assert_same(resumed, ref)
+
+
+# --------------------------------------------------------------------------- #
+# E-023 P1-2: checkpoint must survive a real process restart (file-backed DB)
+# --------------------------------------------------------------------------- #
+def test_checkpoint_persists_across_process_restart(tmp_path: "object") -> None:
+    """A checkpoint written by one container/process must be recoverable by a
+    brand-new container that reopens the SAME metadata DB file — proving the
+    default container no longer uses a vanishing random tempfile (P1-2 fix)."""
+    import os
+
+    db = str(tmp_path / "ck_cross_process.db")
+    # Process A: a REAL default container writing to a STABLE file.
+    a = DefaultServiceContainer(metadata_db_path=db)
+    a.ingest(
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="d1",
+        document_version="v1",
+        content="The vacation policy grants 20 days paid leave.",
+        acl=_public_acl(),
+        job_id="job-proc-a",
+        security_level="public",
+    )
+    a.ingest(
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="d2",
+        document_version="v1",
+        content="The bonus policy grants a 10% bonus.",
+        acl=_public_acl(),
+        job_id="job-proc-a2",
+        security_level="public",
+    )
+    svc_a = _service(a, _FakeRetriever(_vacation_map()))
+    ref = svc_a.answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        run_id="XP",
+        judge=DeterministicCoverageJudge(),
+        required_facts=_facts("vacation policy", "bonus structure"),
+    )
+    # The checkpoint lives in the FILE, not process memory — it survives teardown.
+    assert os.path.exists(db)
+
+    # Process B: a brand-new container + store reopening the SAME file.
+    b = DefaultServiceContainer(metadata_db_path=db)
+    svc_b = _service(b, _FakeRetriever(_vacation_map()))
+    resumed = svc_b.resume_run("XP", _ctx())
+    _assert_same(resumed, ref)
+
+
+# --------------------------------------------------------------------------- #
+# E-023 P1-3: every completed round persists, so a SECOND crash resumes from
+# the latest round — not round 0 — and the run still completes identically.
+# --------------------------------------------------------------------------- #
+def _three_fact_map() -> dict[str, object]:
+    return {
+        "q": [_evidence("e1", "The vacation policy grants 20 days paid leave.", "d1")],
+        "bonus structure": [_evidence("e2", "The bonus policy grants a 10% bonus.", "d2")],
+        "remote work policy": [
+            _evidence("e3", "The remote work policy allows two remote days.", "d3")
+        ],
+    }
+
+
+class _CrashRetriever:
+    """Fake retriever that raises ONCE per query in ``crash_queries`` (simulating a
+    mid-loop crash), then returns the evidence on later calls so a resume past the
+    crash point succeeds. Crashing once-per-query models a transient infra fault
+    that is gone by the time the run is resumed."""
+
+    def __init__(self, evidence_map: dict[str, object], *, crash_queries: set[str]) -> None:
+        self._map = evidence_map
+        self._crash = set(crash_queries)
+        self._crashed: set[str] = set()
+
+    def retrieve_evidence(
+        self,
+        ctx: "SecurityContext",
+        query: str,
+        corpus: "CorpusConfig",
+        top_k: object = None,
+        *,
+        dense_encoder: "DenseEncoder",
+        sparse_encoder: "SparseEncoder",
+        iteration: int = 0,
+        plan_step_id: object = None,
+    ) -> list["SnapshotEvidence"]:
+        if corpus.tenant_id != ctx.tenant_id:
+            raise CorpusNotDiscoverableError(
+                f"corpus {corpus.corpus_id} not discoverable for {ctx.tenant_id}"
+            )
+        if query in self._crash and query not in self._crashed:
+            self._crashed.add(query)
+            raise RuntimeError("simulated crash")
+        payload = self._map.get(query, [])
+        if isinstance(payload, Exception):
+            raise payload
+        return list(payload)
+
+
+def test_double_crash_resumes_from_latest_round_not_round_zero() -> None:
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    _ingest(container, "d2", "The bonus policy grants a 10% bonus.")
+    _ingest(container, "d3", "The remote work policy allows two remote days.")
+    facts = _facts("vacation policy", "bonus structure", "remote work policy")
+
+    retr = _CrashRetriever(
+        _three_fact_map(), crash_queries={"bonus structure", "remote work policy"}
+    )
+    svc = _service(container, retr)
+
+    # First execution crashes on the round-1 gap query → leaves a running
+    # checkpoint at round_index == 1 (only round 0 had completed).
+    with pytest.raises(FastPathBackendError):
+        svc.answer_with_iteration(
+            "q",
+            _ctx(),
+            "eng",
+            max_rounds=5,
+            run_id="DC",
+            judge=DeterministicCoverageJudge(),
+            required_facts=facts,
+        )
+    ck1 = container.metadata_store.load_run_checkpoint("DC")
+    assert ck1 is not None
+    assert ck1.round_index == 1
+
+    # Resume: re-runs round 1 (now succeeds because the fault is gone), then
+    # crashes on the round-2 gap query → round 1 was persisted (round_index == 2).
+    with pytest.raises(FastPathBackendError):
+        svc.resume_run("DC", _ctx())
+    ck2 = container.metadata_store.load_run_checkpoint("DC")
+    assert ck2 is not None
+    assert ck2.round_index == 2  # not 0 — persistence advances per completed round
+
+    # Second resume: continues from round 2 and completes identically.
+    resumed = svc.resume_run("DC", _ctx())
+    assert resumed.abstained is False
+    assert {e.evidence_id for e in resumed.evidence} == {"e1", "e2", "e3"}
+
+    ref = _service(
+        container, _CrashRetriever(_three_fact_map(), crash_queries=set())
+    ).answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        judge=DeterministicCoverageJudge(),
+        required_facts=facts,
+    )
+    _assert_same(resumed, ref)
+
+
+# --------------------------------------------------------------------------- #
+# E-023 P1-4: after an ACL tighten, the resumed run recomputes its derived state
+# from the SURVIVING evidence and never reuses the stale "sufficient" verdict or
+# names the revoked source in the ConflictReport.
+# --------------------------------------------------------------------------- #
+def test_resume_recomputes_derived_state_after_revocation_no_stale_sufficient() -> None:
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    _ingest(container, "d2", "The bonus policy grants a 10% bonus.")
+
+    svc = _service(container, _FakeRetriever(_vacation_map()))
+    svc.answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        run_id="R4",
+        judge=DeterministicCoverageJudge(),
+        required_facts=_facts("vacation policy", "bonus structure"),
+    )
+
+    # Tighten d2's ACL so u1 can no longer read e2 (control-plane ACL tighten).
+    mstore = container.metadata_store
+    mstore.update_document_acl(
+        "t1",
+        "eng",
+        "d2",
+        "v1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["other"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
+    )
+
+    resumed = svc.resume_run("R4", _ctx())
+    # The revoked evidence must never re-surface (invariant 1).
+    assert {e.evidence_id for e in resumed.evidence} == {"e1"}
+    # The stale "sufficient" verdict must NOT survive the revocation: with e2 gone
+    # the run can no longer be sufficient/complete from the revoked data.
+    assert resumed.coverage is not None
+    assert resumed.coverage.overall_status != "sufficient"
+    # The recomputed ConflictReport must not name the revoked source e2.
+    if resumed.conflict_report is not None:
+        named = {
+            src.evidence_id
+            for finding in resumed.conflict_report.findings
+            for src in finding.sources
+        }
+        assert "e2" not in named
+
+
+# --------------------------------------------------------------------------- #
+# E-023 P1-5: a client-supplied run_id is bound to an immutable identity; reusing
+# it under a DIFFERENT tenant / user / query is refused and the original row is
+# left untouched. The same identity may UPDATE (re-checkpoint) without conflict.
+# --------------------------------------------------------------------------- #
+def _make_checkpoint(
+    run_id: str,
+    *,
+    tenant: str = "t1",
+    user: str = "u1",
+    session: str = "s1",
+    query: str = "q",
+    corpus: str = "eng",
+    policy: str = "1.0",
+    round_index: int = 0,
+) -> RunCheckpoint:
+    return RunCheckpoint(
+        run_id=run_id,
+        tenant_id=tenant,
+        user_id=user,
+        session_id=session,
+        policy_version=policy,
+        query=query,
+        corpus_id=corpus,
+        max_rounds=5,
+        required_facts=[],
+        round_index=round_index,
+        evidence=(),
+        prior_queries=[query],
+        seen_text_hashes=[],
+        seen_doc_versions=[],
+        retrieval_calls=1,
+        gap_rounds=0,
+        final_reason="ok",
+        conflict_stop=False,
+        coverage=None,
+        final_report=None,
+        final_evidence_ids=[],
+        first_result=None,
+    )
+
+
+def _row_identity(mstore: "object", run_id: str) -> dict:
+    return dict(
+        mstore._conn.execute(
+            "SELECT tenant_id, user_id, session_id, query, corpus_id, policy_version "
+            "FROM run_checkpoints WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+    )
+
+
+def test_run_id_collision_rejected_across_tenant() -> None:
+    mstore = get_default_container().metadata_store
+    mstore.save_run_checkpoint(
+        _make_checkpoint("C1", tenant="t1", user="u1", session="s1", query="q")
+    )
+    with pytest.raises(CheckpointIdentityConflict):
+        mstore.save_run_checkpoint(
+            _make_checkpoint("C1", tenant="t2", user="u1", session="s1", query="q")
+        )
+    assert _row_identity(mstore, "C1") == {
+        "tenant_id": "t1",
+        "user_id": "u1",
+        "session_id": "s1",
+        "query": "q",
+        "corpus_id": "eng",
+        "policy_version": "1.0",
+    }
+
+
+def test_run_id_collision_rejected_across_user() -> None:
+    mstore = get_default_container().metadata_store
+    mstore.save_run_checkpoint(
+        _make_checkpoint("C2", tenant="t1", user="u1", session="s1", query="q")
+    )
+    with pytest.raises(CheckpointIdentityConflict):
+        mstore.save_run_checkpoint(
+            _make_checkpoint("C2", tenant="t1", user="u2", session="s1", query="q")
+        )
+    assert _row_identity(mstore, "C2") == {
+        "tenant_id": "t1",
+        "user_id": "u1",
+        "session_id": "s1",
+        "query": "q",
+        "corpus_id": "eng",
+        "policy_version": "1.0",
+    }
+
+
+def test_run_id_collision_rejected_across_query() -> None:
+    mstore = get_default_container().metadata_store
+    mstore.save_run_checkpoint(_make_checkpoint("C3", query="what is the vacation policy?"))
+    with pytest.raises(CheckpointIdentityConflict):
+        mstore.save_run_checkpoint(_make_checkpoint("C3", query="what is the bonus policy?"))
+    assert _row_identity(mstore, "C3")["query"] == "what is the vacation policy?"
+
+
+def test_run_id_same_identity_updates_state_without_conflict() -> None:
+    mstore = get_default_container().metadata_store
+    mstore.save_run_checkpoint(_make_checkpoint("C4", round_index=0))
+    # Same identity → UPDATE (re-checkpoint), no conflict; the status column is
+    # frozen by the complete/abort methods, not overwritten here.
+    mstore.save_run_checkpoint(_make_checkpoint("C4", round_index=2))
+    ck = mstore.load_run_checkpoint("C4")
+    assert ck is not None
+    assert ck.round_index == 2
+    assert ck.status == CHECKPOINT_RUNNING

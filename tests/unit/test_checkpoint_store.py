@@ -215,22 +215,24 @@ def test_reauthorize_drops_when_corpus_undiscoverable() -> None:
     # The corpus is no longer discoverable for the principal.
     mstore = active_metadata_store("t1", "eng", "doc1", "v1")
     foreign_registry = InMemoryCorpusRegistry(
-        [CorpusConfig(
-            corpus_id="other",
-            tenant_id="t2",
-            name="Other",
-            description="",
-            domain="",
-            owner="",
-            source_type="wiki",
-            capability_ids=[],
-            enabled=True,
-            searchable=True,
-            security_policy_id="p",
-            default_security_level="internal",
-            created_at=datetime(2024, 1, 1),
-            updated_at=datetime(2024, 1, 1),
-        )]
+        [
+            CorpusConfig(
+                corpus_id="other",
+                tenant_id="t2",
+                name="Other",
+                description="",
+                domain="",
+                owner="",
+                source_type="wiki",
+                capability_ids=[],
+                enabled=True,
+                searchable=True,
+                security_policy_id="p",
+                default_security_level="internal",
+                created_at=datetime(2024, 1, 1),
+                updated_at=datetime(2024, 1, 1),
+            )
+        ]
     )
     kept, reason = reauthorize_evidence(
         _evidence(), _ctx(), metadata_store=mstore, registry=foreign_registry

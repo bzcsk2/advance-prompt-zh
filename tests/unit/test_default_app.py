@@ -9,6 +9,8 @@ uses, proving the run-chain (ingest -> retrieve -> answer/abstain) works with no
 external dependency and that the default endpoint is actually runnable.
 """
 
+import os
+import tempfile
 from fastapi.testclient import TestClient
 import pytest
 
@@ -21,13 +23,19 @@ from agentic_rag_enterprise.services.container import get_default_container
 @pytest.fixture(autouse=True)
 def _fresh_default_container():
     # The default container is a process-wide singleton shared by many tests.
-    # Swap in a fresh, empty one for this test (and restore the prior view
-    # afterwards) so the e2e run-chain is hermetic and not polluted by other
-    # tests' ingested documents in the shared in-memory Qdrant / sqlite.
+    # Swap in a fresh, empty one (with its own temp metadata DB file, E-023 P1-2
+    # hermeticity fix) for this test so the e2e run-chain is hermetic and not
+    # polluted by other tests' ingested documents in the shared Qdrant / sqlite.
     saved = _container_mod._CONTAINER
-    _container_mod.reset_default_container()
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    _container_mod.reset_default_container(metadata_db_path=path)
     yield
     _container_mod._CONTAINER = saved
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 _TENANT = "t1"

@@ -96,7 +96,9 @@ def _evidence(
     )
 
 
-def _ctx(tenant_id: str = "t1", user_id: str = "u1", policy_version: str = "1.0") -> SecurityContext:
+def _ctx(
+    tenant_id: str = "t1", user_id: str = "u1", policy_version: str = "1.0"
+) -> SecurityContext:
     return SecurityContext(
         request_id="r1",
         session_id="s1",
@@ -216,9 +218,15 @@ def _vacation_scenario() -> dict[str, object]:
 
 def test_resume_from_completed_checkpoint_equals_uninterrupted() -> None:
     # Uninterrupted reference run.
-    ref_service = _service(_FakeLoopRetriever(_vacation_scenario()), mstore=None, registry=_registry())
+    ref_service = _service(
+        _FakeLoopRetriever(_vacation_scenario()), mstore=None, registry=_registry()
+    )
     ref = ref_service.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=5, judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "request time off"),
     )
 
@@ -227,7 +235,12 @@ def test_resume_from_completed_checkpoint_equals_uninterrupted() -> None:
     _seed_active_document(mstore, "d1")
     svc = _service(_FakeLoopRetriever(_vacation_scenario()), mstore=mstore, registry=_registry())
     svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=5, run_id="R1", judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        run_id="R1",
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "request time off"),
     )
     ck = mstore.load_run_checkpoint("R1")
@@ -254,7 +267,12 @@ def test_resume_from_mid_loop_crash_continues_to_same_answer() -> None:
     svc = _service(crash_retriever, mstore=mstore, registry=_registry())
     with pytest.raises(FastPathBackendError):  # fault propagates as a backend error
         svc.answer_with_iteration(
-            "q", _ctx(), "eng", max_rounds=5, run_id="R2", judge=DeterministicCoverageJudge(),
+            "q",
+            _ctx(),
+            "eng",
+            max_rounds=5,
+            run_id="R2",
+            judge=DeterministicCoverageJudge(),
             required_facts=_facts("vacation policy", "request time off"),
         )
     # The crash leaves a running checkpoint at round_index 1 with only round-0 evidence.
@@ -270,8 +288,14 @@ def test_resume_from_mid_loop_crash_continues_to_same_answer() -> None:
     assert {e.evidence_id for e in resumed.evidence} == {"e1", "e2"}
 
     # Reference uninterrupted run for identity.
-    ref = _service(_FakeLoopRetriever(scenario), mstore=None, registry=_registry()).answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=5, judge=DeterministicCoverageJudge(),
+    ref = _service(
+        _FakeLoopRetriever(scenario), mstore=None, registry=_registry()
+    ).answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=5,
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "request time off"),
     )
     _assert_same_envelope(resumed, ref)
@@ -298,16 +322,27 @@ def test_resume_drops_revoked_evidence_after_acl_tighten() -> None:
     _seed_active_document(mstore, "d2")
 
     svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=1, run_id="R3", judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=1,
+        run_id="R3",
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy", "bonus policy"),
     )
 
     # Tighten d2's ACL: only "other" may read it now.
     mstore.update_document_acl(
-        "t1", "eng", "d2", "v1",
-        security_level="public", acl_scope="restricted",
-        allowed_user_ids=["other"], allowed_group_ids=[],
-        denied_user_ids=[], denied_group_ids=[],
+        "t1",
+        "eng",
+        "d2",
+        "v1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["other"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
 
     resumed = svc.resume_run("R3", _ctx())
@@ -323,7 +358,12 @@ def test_resume_refuses_on_principal_mismatch() -> None:
     mstore = _mstore()
     svc = _service(_FakeLoopRetriever(_vacation_scenario()), mstore=mstore, registry=_registry())
     svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=1, run_id="R4", judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=1,
+        run_id="R4",
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy"),
     )
     # A different user/session attempts to resume -> refused (fail closed).
@@ -335,7 +375,12 @@ def test_resume_refuses_on_policy_version_change() -> None:
     mstore = _mstore()
     svc = _service(_FakeLoopRetriever(_vacation_scenario()), mstore=mstore, registry=_registry())
     svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=1, run_id="R5", judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=1,
+        run_id="R5",
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy"),
     )
     # The authorization basis is stale -> abort.
@@ -347,14 +392,19 @@ def test_resume_refuses_when_corpus_undiscoverable() -> None:
     mstore = _mstore()
     svc = _service(_FakeLoopRetriever(_vacation_scenario()), mstore=mstore, registry=_registry())
     svc.answer_with_iteration(
-        "q", _ctx(), "eng", max_rounds=1, run_id="R6", judge=DeterministicCoverageJudge(),
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=1,
+        run_id="R6",
+        judge=DeterministicCoverageJudge(),
         required_facts=_facts("vacation policy"),
     )
     # A registry in which "eng" is not discoverable for the principal.
-    foreign_registry = InMemoryCorpusRegistry(
-        [_corpus(corpus_id="other", tenant_id="t2")]
+    foreign_registry = InMemoryCorpusRegistry([_corpus(corpus_id="other", tenant_id="t2")])
+    svc2 = _service(
+        _FakeLoopRetriever(_vacation_scenario()), mstore=mstore, registry=foreign_registry
     )
-    svc2 = _service(_FakeLoopRetriever(_vacation_scenario()), mstore=mstore, registry=foreign_registry)
     with pytest.raises(ResumeAuthError):
         svc2.resume_run("R6", _ctx())
 
@@ -428,7 +478,5 @@ def _seed_active_document(mstore: MetadataStore, document_id: str) -> None:
 
 
 def _control_plane_findings(mstore: MetadataStore) -> list[dict]:
-    rows = mstore._conn.execute(
-        "SELECT kind, detail FROM reconciliation_findings"
-    ).fetchall()
+    rows = mstore._conn.execute("SELECT kind, detail FROM reconciliation_findings").fetchall()
     return [dict(r) for r in rows]

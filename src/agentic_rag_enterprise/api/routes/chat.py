@@ -26,7 +26,10 @@ from agentic_rag_enterprise.services.chat_service import (
     ChatServiceError,
     ModelInvocationError,
 )
-from agentic_rag_enterprise.storage.checkpoint_store import ResumeAuthError
+from agentic_rag_enterprise.storage.checkpoint_store import (
+    CheckpointIdentityConflict,
+    ResumeAuthError,
+)
 
 logger = logging.getLogger("agentic_rag_enterprise.api.chat")
 
@@ -36,8 +39,10 @@ _MSG_BACKEND_UNAVAILABLE = "The retrieval backend is temporarily unavailable."
 _MSG_MODEL_UNAVAILABLE = "The answer service is temporarily unavailable."
 _MSG_INTERNAL_ERROR = "An internal error occurred."
 _MSG_RESUME_BAD_REQUEST = "Resume requested without a run_id."
+_MSG_RESUME_CONFLICT = "The requested run_id is already bound to another session."
 
 _STATUS_CHECKPOINT_NOT_FOUND = status.HTTP_404_NOT_FOUND
+_STATUS_RESUME_CONFLICT = status.HTTP_409_CONFLICT
 
 
 def chat_v1(
@@ -56,7 +61,28 @@ def chat_v1(
                     detail=_MSG_RESUME_BAD_REQUEST,
                 )
             return service.resume_run(request.run_id, ctx)
+        if request.run_id is not None:
+            # E-023 P1-1: a ``run_id`` WITHOUT ``resume`` starts a checkpointed
+            # iteration run through the default judge, so a later ``resume`` with
+            # the same ``run_id`` can recover it. (With no judge configured the
+            # service degrades to single-pass and ignores ``run_id``.)
+            return service.answer_with_iteration(
+                request.query,
+                ctx,
+                request.corpus_id,
+                run_id=request.run_id,
+                judge=service.judge,
+            )
         return service.answer(request.query, ctx, request.corpus_id, run_id=request.run_id)
+    except CheckpointIdentityConflict as exc:
+        # A ``run_id`` reused under a different principal/query is refused so it
+        # cannot hijack another session's checkpoint (build plan §5.4). The
+        # client learns only that the id is taken — never the binding details.
+        logger.warning("Checkpoint identity conflict for run_id %s", request.run_id)
+        raise HTTPException(
+            status_code=_STATUS_RESUME_CONFLICT,
+            detail=_MSG_RESUME_CONFLICT,
+        ) from exc
     except ResumeAuthError as exc:
         # A resume that cannot be re-authorized (foreign checkpoint, stale policy,
         # undiscoverable corpus, or revoked evidence) is a NOT-FOUND at the API

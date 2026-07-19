@@ -267,9 +267,7 @@ def _client_with_metadata(payload: object, extraction: ClaimExtraction) -> TestC
 def test_v1_chat_resume_without_run_id_returns_400() -> None:
     # Per contract §E-023 (api/schemas.py): ``resume`` without ``run_id`` is a
     # client error; never synthesize from a non-existent checkpoint.
-    client = _client_with_metadata(
-        [_evidence("e1")], ClaimExtraction(draft_answer="x", claims=[])
-    )
+    client = _client_with_metadata([_evidence("e1")], ClaimExtraction(draft_answer="x", claims=[]))
     resp = client.post("/v1/chat", json=_body(resume=True), headers=_HEADERS)
     assert resp.status_code == 400
     assert resp.json()["detail"] == "Resume requested without a run_id."
@@ -278,9 +276,7 @@ def test_v1_chat_resume_without_run_id_returns_400() -> None:
 def test_v1_chat_resume_unknown_run_id_returns_404_generic() -> None:
     # A resume for a missing / foreign checkpoint must NOT leak the reason; the
     # API maps ResumeAuthError to a fixed generic message at 404.
-    client = _client_with_metadata(
-        [_evidence("e1")], ClaimExtraction(draft_answer="x", claims=[])
-    )
+    client = _client_with_metadata([_evidence("e1")], ClaimExtraction(draft_answer="x", claims=[]))
     resp = client.post(
         "/v1/chat", json=_body(resume=True, run_id="does-not-exist"), headers=_HEADERS
     )

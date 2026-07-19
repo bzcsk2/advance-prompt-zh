@@ -64,6 +64,11 @@ class RunCheckpoint(BaseModel):
     # Next round to execute on resume (== rounds already completed).
     round_index: int = 0
 
+    # Persistence lifecycle status (mirrors the ``run_checkpoints.status`` column
+    # in the Metadata DB). Carried on the model so ``resume_run`` can refuse an
+    # ``aborted`` checkpoint and idempotently return a ``completed`` one.
+    status: str = CHECKPOINT_RUNNING
+
     # Accumulated, re-authorizable evidence gathered so far.
     evidence: tuple[SnapshotEvidence, ...] = ()
 
@@ -104,6 +109,23 @@ class ResumeAuthError(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class CheckpointIdentityConflict(Exception):
+    """Raised when a ``run_id`` is reused with a different immutable binding.
+
+    The ``run_id`` is a client-supplied identifier, but the checkpoint it names is
+    bound to an immutable identity (tenant / user / session / query / corpus /
+    policy_version). A second writer attempting to reuse an existing ``run_id``
+    under a *different* identity must be refused so it cannot hijack or overwrite
+    another principal's checkpoint (build plan §5.4). The original row is left
+    untouched. The message carries only the ``run_id`` (never tenant / evidence
+    identifiers) and is mapped to a generic 4xx by the API.
+    """
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(f"checkpoint run_id already bound to a different identity: {run_id}")
 
 
 def reauthorize_evidence(

@@ -17,9 +17,12 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from agentic_rag_enterprise.domain.chunk import ChunkRecord
+
+if TYPE_CHECKING:
+    from agentic_rag_enterprise.storage.checkpoint_store import RunCheckpoint
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.document import SourceDocument
 from agentic_rag_enterprise.domain.ingestion import (
@@ -1700,52 +1703,93 @@ class MetadataStore:
     # Run checkpoints (E-023 contract: persistent iteration-loop recovery)
     # ------------------------------------------------------------------ #
     def save_run_checkpoint(self, ck: "RunCheckpoint") -> None:  # noqa: F821 - imported below
-        """Persist (insert or replace) a run checkpoint.
+        """Persist (insert or update) a run checkpoint with an immutable binding.
 
-        Denormalizes the identity / status columns for the cross-principal check
-        and cleanup; the full resumable state lives in ``state_json``.
+        The ``run_id`` is client-supplied, but the checkpoint is bound to an
+        immutable identity — ``(tenant_id, user_id, session_id, query, corpus_id,
+        policy_version)``. Within one transaction:
+
+        * the ``run_id`` does not yet exist → ``INSERT`` a fresh ``running`` row;
+        * it exists with the SAME identity → ``UPDATE`` only the resumable state
+          (``round_index`` + ``state_json``), preserving the existing ``status``;
+        * it exists with a DIFFERENT identity → raise
+          :class:`CheckpointIdentityConflict` and leave the original row untouched
+          (fail closed — a second principal cannot hijack / overwrite another's
+          checkpoint, build plan §5.4).
+
+        The identity columns are never overwritten, so an existing checkpoint
+        cannot be re-bound to a different principal, query, or corpus.
         """
         from agentic_rag_enterprise.storage.checkpoint_store import (
             CHECKPOINT_RUNNING,
-            RunCheckpoint,
+            CheckpointIdentityConflict,
+            RunCheckpoint,  # noqa: F401 - used by the "RunCheckpoint" annotation (resolved by mypy)
         )
 
         now = _now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO run_checkpoints (
-                run_id, tenant_id, user_id, session_id, corpus_id, query,
-                policy_version, status, round_index, state_json,
-                created_at, updated_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET
-                tenant_id=excluded.tenant_id,
-                user_id=excluded.user_id,
-                session_id=excluded.session_id,
-                corpus_id=excluded.corpus_id,
-                query=excluded.query,
-                policy_version=excluded.policy_version,
-                status=excluded.status,
-                round_index=excluded.round_index,
-                state_json=excluded.state_json,
-                updated_at=excluded.updated_at
-            """,
-            (
-                ck.run_id,
-                ck.tenant_id,
-                ck.user_id,
-                ck.session_id,
-                ck.corpus_id,
-                ck.query,
-                ck.policy_version,
-                CHECKPOINT_RUNNING,  # status is owned by the save/complete/done methods
-                ck.round_index,
-                ck.to_json(),
-                now,
-                now,
-                None,
-            ),
+        identity = (
+            ck.tenant_id,
+            ck.user_id,
+            ck.session_id,
+            ck.query,
+            ck.corpus_id,
+            ck.policy_version,
         )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT tenant_id, user_id, session_id, query, corpus_id, "
+                "policy_version FROM run_checkpoints WHERE run_id=?",
+                (ck.run_id,),
+            ).fetchone()
+            if row is not None:
+                existing = (
+                    row["tenant_id"],
+                    row["user_id"],
+                    row["session_id"],
+                    row["query"],
+                    row["corpus_id"],
+                    row["policy_version"],
+                )
+                if existing != identity:
+                    raise CheckpointIdentityConflict(ck.run_id)
+                # Same principal: only the resumable state moves; identity and
+                # status columns are frozen (status is owned by the
+                # complete/abort methods).
+                self._conn.execute(
+                    "UPDATE run_checkpoints SET round_index=?, state_json=?, "
+                    "updated_at=? WHERE run_id=?",
+                    (ck.round_index, ck.to_json(), now, ck.run_id),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO run_checkpoints (
+                        run_id, tenant_id, user_id, session_id, corpus_id, query,
+                        policy_version, status, round_index, state_json,
+                        created_at, updated_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ck.run_id,
+                        ck.tenant_id,
+                        ck.user_id,
+                        ck.session_id,
+                        ck.corpus_id,
+                        ck.query,
+                        ck.policy_version,
+                        CHECKPOINT_RUNNING,  # status is owned by the save/complete/done methods
+                        ck.round_index,
+                        ck.to_json(),
+                        now,
+                        now,
+                        None,
+                    ),
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def load_run_checkpoint(self, run_id: str) -> "RunCheckpoint | None":  # noqa: F821
         from agentic_rag_enterprise.storage.checkpoint_store import RunCheckpoint
@@ -1767,7 +1811,12 @@ class MetadataStore:
             or ck.policy_version != row["policy_version"]
         ):
             return None
-        return ck
+        # The serialized ``status`` is a snapshot taken at save time and goes
+        # stale once ``mark_run_checkpoint_done`` flips the DB column. Always
+        # report the authoritative, current ``status`` from the row so
+        # ``resume_run`` can refuse ``aborted`` and idempotently return
+        # ``completed`` checkpoints (E-023 P1-3).
+        return ck.model_copy(update={"status": row["status"]})
 
     def mark_run_checkpoint_done(self, run_id: str, *, aborted: bool = False) -> None:
         from agentic_rag_enterprise.storage.checkpoint_store import (
