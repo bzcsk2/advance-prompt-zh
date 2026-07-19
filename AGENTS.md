@@ -752,11 +752,25 @@ frozen. Full contract at `docs/issue-e021-contract.md`.
   `rerank_score` to pick a winning fact; no change to E-011→E-020 behaviour beyond the agreed
   `AnswerEnvelope.conflict_report` extension; no upstream modification.
 
-## E-022 Allowed Changes (M7 only) — issue opens next
-Runtime hardening (build plan §Milestone 7): Reconciler + purge + index migration + rollback
-(`E-022`). Allowed paths / forbidden paths to be written when the issue opens. Follows the
-E-008.x recon/ingestion-stack precedent and the §29.5 `depends_on` / `in_scope` / `deferred_to`
-rules.
+## E-022 Allowed Changes (M7 only) — contract open, implementation pending
+Runtime hardening (build plan Milestone 7): Reconciler + purge + index migration + rollback
+(`E-022`). Full contract at `docs/issue-e022-contract.md`. In scope: standalone `Reconciler`
+(deterministic, idempotent, fenceable; metadata-DB-as-truth; orphan purge, missing-data-plane
+rebuild, post-commit cleanup retry per §10.10 #6, dead-letter cleanup, registry realign,
+dry-run + audit table); index migration (new `corpus_id_v{emb}_{chunk}` collection built
+alongside v1, atomic registry-pointer switch, retain v1); index + active-version rollback;
+reconciler-driven purge hardening. Depends on E-008.x / E-010 / E-011 / E-015 / E-016.
+- **Reuse, no change:** `domain/ingestion.py`, `domain/document.py`, `domain/chunk.py`,
+  existing `MetadataStore` lease/query primitives, `VectorStore.delete`/`update_payload`/
+  `list_point_ids_by_document`/`search`, `ParentStore` delete/deprecate,
+  `DocumentManager.delete`/`purge`/`_compensate`.
+- **Forbidden:** no LLM/NLP in reconciler or index migration (deterministic, hermetic); no new
+  model download / external API in tests; no "reserved interface" for E-023 (checkpoint/
+  re-auth) or E-024 (readiness/cancellation/backup/restore) — those stay in their issues; no
+  Postgres / Qdrant Server / SSO (M9); no clear-and-rebuild of the production collection
+  (§10.8); reconciler must never resurrect deleted/purged evidence; no change to Planner core
+  (`planner/`, `executor.py`, `result.py`, `budget.py`, `tool_registry.py`). E-023 / E-024
+  overlap explicitly deferred.
 
 ## Standard Checks
 ```bash
