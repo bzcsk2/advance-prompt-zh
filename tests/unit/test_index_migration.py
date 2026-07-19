@@ -31,6 +31,7 @@ from tests.fixtures import (
     FakeSparseEncoder,
     SAMPLE_MARKDOWN,
     acl_payload,
+    make_security_context,
 )
 
 from datetime import datetime, timezone
@@ -87,7 +88,12 @@ def _components():
             document_version="v1",
             content=SAMPLE_MARKDOWN,
             acl=ResourceAcl(
-                **acl_payload(tenant_id="t1", acl_scope="restricted", security_level="public")
+                **acl_payload(
+                    tenant_id="t1",
+                    acl_scope="restricted",
+                    security_level="public",
+                    allowed_user_ids=["u1", "u2"],
+                )
             ),
             job_id="j-init",
         )
@@ -199,3 +205,84 @@ def test_dry_run_switch_does_not_mutate() -> None:
         dry_run=True,
     )
     assert registry.resolve_collection_name("eng") == "eng"
+
+
+def test_build_excludes_deprecated_version_after_update() -> None:
+    """P1-1: a v2 migration must NOT resurrect the deprecated prior version."""
+    store, vstore, pstore, registry, mgr = _components()
+    mgr.ingest(
+        IngestionRequest(
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="doc1",
+            document_version="v1",
+            content=SAMPLE_MARKDOWN,
+            acl=ResourceAcl(
+                **acl_payload(tenant_id="t1", acl_scope="restricted", security_level="public")
+            ),
+            job_id="j-v1",
+        )
+    )
+    mgr.ingest(
+        IngestionRequest(
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="doc1",
+            document_version="v2",
+            content="# Updated\n\nDifferent body text for v2.",
+            acl=ResourceAcl(
+                **acl_payload(tenant_id="t1", acl_scope="restricted", security_level="public")
+            ),
+            job_id="j-v2",
+        )
+    )
+    # v1 is now deprecated; only v2 is active.
+    assert store.get_active_version("t1", "eng", "doc1") == "v2"
+
+    v2 = build_index_v2(
+        "eng",
+        embedding_version="v2",
+        chunking_version="v1",
+        dense_size=DENSE_DIM,
+        metadata_store=store,
+        vector_store=vstore,
+        corpus_registry=registry,
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+    )
+    # Migrated collection carries the active v2, NOT the deprecated v1.
+    assert vstore.list_point_ids_by_document(v2, "t1", "eng", "doc1", "v2")
+    assert vstore.list_point_ids_by_document(v2, "t1", "eng", "doc1", "v1") == []
+
+
+def test_build_excludes_logically_deleted_document() -> None:
+    """P1-1: a logically-deleted document must not appear in the migrated index."""
+    store, vstore, pstore, registry, mgr = _components()
+    mgr.ingest(
+        IngestionRequest(
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="doc1",
+            document_version="v1",
+            content=SAMPLE_MARKDOWN,
+            acl=ResourceAcl(
+                **acl_payload(tenant_id="t1", acl_scope="restricted", security_level="public")
+            ),
+            job_id="j-v1",
+        )
+    )
+    mgr.delete(make_security_context(), corpus_id="eng", document_id="doc1")  # status=deleted
+
+    v2 = build_index_v2(
+        "eng",
+        embedding_version="v2",
+        chunking_version="v1",
+        dense_size=DENSE_DIM,
+        metadata_store=store,
+        vector_store=vstore,
+        corpus_registry=registry,
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+    )
+    # Deleted evidence is never re-indexed.
+    assert vstore.list_point_ids_by_document(v2, "t1", "eng", "doc1", "v1") == []
