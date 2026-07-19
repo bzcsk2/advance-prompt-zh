@@ -26,14 +26,17 @@ import logging
 from typing import TYPE_CHECKING, Callable, cast
 
 from agentic_rag_enterprise.answer import build_answer_envelope, conservative_refusal
-from agentic_rag_enterprise.answer.builder import build_multi_corpus_envelope
+from agentic_rag_enterprise.answer.builder import (
+    build_multi_corpus_envelope,
+    build_no_evidence_refusal,
+)
 from agentic_rag_enterprise.answer.envelope import AnswerEnvelope, TenantBindingError
 from agentic_rag_enterprise.corpus.registry import CorpusRegistry
 from agentic_rag_enterprise.corpus.router import CorpusRouter
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
-from agentic_rag_enterprise.domain.temporal import parse_temporal_scope
+from agentic_rag_enterprise.domain.temporal import TemporalScope, parse_temporal_scope
 from agentic_rag_enterprise.evidence.conflict_resolver import ConflictResolver
 from agentic_rag_enterprise.evidence.models import (
     ConflictReport,
@@ -248,15 +251,20 @@ class ChatService:
         self,
         query: str,
         evidence: tuple[SnapshotEvidence, ...],
+        *,
+        scope: TemporalScope | None = None,
     ) -> tuple[ConflictReport, tuple[SnapshotEvidence, ...]]:
         """Run the E-021 temporal filter + conflict resolver on post-retrieval evidence.
 
-        Parses the ``TemporalScope`` once, filters, then resolves. Returns the
-        resolver report and the surviving (kept) evidence in filter order — exactly
-        the set the synthesis step should consume. The resolver only ever sees the
-        already-authorized evidence it is handed (invariant 1).
+        Parses the ``TemporalScope`` once (or reuses a caller-supplied ``scope``,
+        which the iteration path uses so the query is never re-parsed per round),
+        filters, then resolves. Returns the resolver report and the surviving
+        (kept) evidence in filter order — exactly the set the synthesis step
+        should consume. The resolver only ever sees the already-authorized
+        evidence it is handed (invariant 1).
         """
-        scope = parse_temporal_scope(query)
+        if scope is None:
+            scope = parse_temporal_scope(query)
         filt = filter_by_temporal_scope(evidence, scope)
         report = ConflictResolver().resolve(
             filt.retained, scope, topic_key=normalize_topic_key(query)
@@ -366,8 +374,17 @@ class ChatService:
         partial_retrieval = bool(result.faults)
         limitations = _partial_retrieval_limitations(result.faults)
 
-        # 3) Single-pass synthesis from the merged, verified claims.
+        # 3) Single-pass synthesis from the merged, verified claims — but only if
+        #    the temporal filter kept at least one evidence. A fully-filtered
+        #    result (all expired / not-yet-effective / outside the window) must
+        #    refuse without invoking the model (P1-1).
         report, final_evidence = self._run_conflict_stage(query, result.evidence)
+        if not final_evidence:
+            return build_no_evidence_refusal(
+                ctx,
+                corpora_used=result.corpora_used,
+                tool_calls=result.retrieval_calls,
+            )
         coverage = None
         if report.conflict_status == ConflictStatus.CONTRADICTED:
             coverage = _contradicted_coverage()
@@ -597,6 +614,15 @@ class ChatService:
         prev_covered: set[str] = set()
         final_reason = first_result.stop_reason.value  # real termination reason (P2-1)
 
+        # Parse the TemporalScope ONCE for the whole request; the conflict stage
+        # reuses it every round instead of re-parsing the query (P1-2).
+        scope = parse_temporal_scope(query)
+
+        # Per-round conflict-stage results, surfaced for synthesis after the loop.
+        final_report: ConflictReport | None = None
+        final_evidence: tuple[SnapshotEvidence, ...] = tuple(evidence_by_id.values())
+        conflict_stop = False
+
         for round_idx in range(max_rounds):
             gap_rounds = round_idx + 1
 
@@ -683,12 +709,38 @@ class ChatService:
                 if q not in prior_queries:
                     prior_queries.append(q)
 
-            # Stage A: judge coverage over all evidence accumulated so far.
+            # --- E-021 conflict stage (P1-2): run BEFORE the Judge each round ---
+            current_evidence = tuple(evidence_by_id.values())
+            report, kept_evidence = self._run_conflict_stage(query, current_evidence, scope=scope)
+            if not kept_evidence:
+                # Temporal filter dropped every surviving evidence this round (all
+                # expired / not-yet-effective / outside the window). Refuse without
+                # invoking the model (P1-1).
+                return build_no_evidence_refusal(
+                    ctx,
+                    corpora_used=(corpus.corpus_id,),
+                    tool_calls=retrieval_calls,
+                    gap_rounds=gap_rounds,
+                    iterations=gap_rounds,
+                )
+            if report.conflict_status == ConflictStatus.CONTRADICTED:
+                # A contradiction cannot be auto-resolved: stop iterating and
+                # surface both sources; do not run further gap retrieval (P1-2).
+                final_report = report
+                final_evidence = kept_evidence
+                coverage = _contradicted_coverage()
+                conflict_stop = True
+                final_reason = "conflict_detected"
+                break
+            # NONE / RESOLVED: the Coverage Judge only ever sees the
+            # resolved/retained evidence (P1-2).
+            final_report = report
+            final_evidence = kept_evidence
+
+            # Stage A: judge coverage over the conflict-filtered evidence.
             prev_covered = set(coverage.covered_fact_ids) if coverage else set()
             try:
-                coverage = judge.judge(
-                    query=query, required_facts=required, evidence=tuple(evidence_by_id.values())
-                )
+                coverage = judge.judge(query=query, required_facts=required, evidence=kept_evidence)
             except (JudgeTimeoutError, JudgeError) as exc:
                 # Judge fault: degrade conservatively (abstain), never fabricate.
                 logger.warning("coverage judge failed; degrading conservatively: %s", exc)
@@ -722,10 +774,16 @@ class ChatService:
             if decision.should_stop:
                 break
 
-        final_evidence = tuple(evidence_by_id.values())
-        report, final_evidence = self._run_conflict_stage(query, final_evidence)
+        # Synthesis. When the loop stopped on a contradiction, ``coverage`` is
+        # already the contradicted verdict and ``final_report``/``final_evidence``
+        # carry the conflict stage output; otherwise they hold the last round's
+        # verdict. The conflict report forces completeness="conflicted".
         coverage2 = coverage
-        if report.conflict_status == ConflictStatus.CONTRADICTED:
+        if (
+            conflict_stop
+            and final_report is not None
+            and final_report.conflict_status == ConflictStatus.CONTRADICTED
+        ):
             coverage2 = _contradicted_coverage()
         return self._synthesize(
             query,
@@ -738,7 +796,7 @@ class ChatService:
             iterations=gap_rounds,
             tool_calls=retrieval_calls,
             stop_reason=final_reason,
-            conflict_report=report,
+            conflict_report=final_report,
         )
 
     def _run_single_pass(
@@ -772,6 +830,11 @@ class ChatService:
             return conservative_refusal(result, ctx)
 
         report, final_evidence = self._run_conflict_stage(query, result.evidence)
+        if not final_evidence:
+            # Temporal filter dropped every retrieved evidence (all expired /
+            # not-yet-effective / outside the historical window). Refuse without
+            # invoking the model (P1-1).
+            return build_no_evidence_refusal(ctx, corpora_used=(result.corpus_id,))
         coverage = None
         if report.conflict_status == ConflictStatus.CONTRADICTED:
             coverage = _contradicted_coverage()

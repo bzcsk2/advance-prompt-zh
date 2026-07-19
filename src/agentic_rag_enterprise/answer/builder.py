@@ -102,6 +102,41 @@ def _render_answer_from_claims(claims: list[Claim]) -> str:
     return "\n".join(claim.text for claim in claims)
 
 
+def render_conflict_answer(
+    report: ConflictReport,
+    evidence: tuple[SnapshotEvidence, ...],
+) -> str:
+    """Deterministic CONTRADICTED answer text, independent of the LLM draft (P1-3).
+
+    Renders directly from ``ConflictReport.findings`` so the final answer lists
+    every conflicting source with its document/version and effective window even
+    when the model returns no claims or ignores the prompt instruction. No single
+    conclusion is asserted — the user is shown both positions and their times.
+    """
+    ev_by_id = {ev.evidence_id: ev for ev in evidence}
+    lines: list[str] = [
+        "The available evidence contradicts itself on this question. "
+        "Both positions are presented below; no single answer is asserted."
+    ]
+    for finding in report.findings:
+        if finding.resolvable:
+            # Only unresolved / contradicted findings surface to the user; an
+            # auto-resolved version/authority finding is not a live contradiction.
+            continue
+        lines.append("")
+        lines.append(f"Conflict type: {finding.conflict_type.value}.")
+        for src in finding.sources:
+            ef = src.effective_from.isoformat() if src.effective_from else "unknown"
+            et = src.effective_to.isoformat() if src.effective_to else "open-ended"
+            snap = ev_by_id.get(src.evidence_id)
+            text = snap.text if snap is not None else "(evidence text unavailable)"
+            lines.append(
+                f"- Source {src.evidence_id} (document {src.document_id}, "
+                f"version {src.document_version}, effective {ef} → {et}): {text}"
+            )
+    return "\n".join(lines)
+
+
 def build_answer_envelope(
     fast_path_result: FastPathResult,
     ctx: SecurityContext,
@@ -336,9 +371,20 @@ def _build_envelope_from_evidence(
     if partial_retrieval and completeness == "complete":
         completeness, confidence = "partial", "medium"
 
-    # Always derive the final answer from verified claims. Missing/empty claims
-    # fail closed to the generic partial response returned by the renderer.
-    final_answer = _render_answer_from_claims(verification.kept_claims)
+    # E-021 (P1-3): a CONTRADICTED report yields a deterministic answer rendered
+    # from the conflict findings alone — never from the model draft or extracted
+    # claims — so the final answer lists both sources + times even when the model
+    # returns no claims or ignores the instruction. No single conclusion is
+    # asserted, so the conflicted envelope carries no claims.
+    if (
+        conflict_report is not None
+        and conflict_report.conflict_status == ConflictStatus.CONTRADICTED
+    ):
+        final_answer = render_conflict_answer(conflict_report, evidence)
+        final_claims: tuple[Claim, ...] = ()
+    else:
+        final_answer = _render_answer_from_claims(verification.kept_claims)
+        final_claims = tuple(verification.kept_claims)
 
     # For a non-abstain envelope the real loop-termination reason (max_rounds /
     # no_new_evidence / all_sources_exhausted / sufficient / continue) is surfaced
@@ -350,7 +396,7 @@ def _build_envelope_from_evidence(
         request_id=ctx.request_id,
         session_id=ctx.session_id,
         answer_markdown=final_answer,
-        claims=tuple(verification.kept_claims),
+        claims=final_claims,
         evidence=tuple(evidence),
         citations=tuple(citations),
         completeness=completeness,
@@ -474,4 +520,29 @@ def conservative_refusal(
         coverage=coverage,
         stop_reason="no_evidence",
         abstained=True,
+    )
+
+
+def build_no_evidence_refusal(
+    ctx: SecurityContext,
+    *,
+    corpora_used: tuple[str, ...],
+    tool_calls: int = 1,
+    gap_rounds: int = 1,
+    iterations: int = 1,
+) -> AnswerEnvelope:
+    """Conservative refusal when no evidence survives retrieval + temporal filtering (P1-1).
+
+    Each ChatService path calls this *after* the E-021 temporal filter drops
+    *all* evidence (everything expired / not-yet-effective / outside the
+    historical window). The model is never invoked. The envelope locks to
+    ``completeness == insufficient`` / ``abstained is True`` /
+    ``stop_reason == no_evidence``.
+    """
+    return _build_refusal(
+        ctx,
+        corpora_used=corpora_used,
+        tool_calls=tool_calls,
+        gap_rounds=gap_rounds,
+        iterations=iterations,
     )
