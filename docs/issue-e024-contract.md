@@ -12,14 +12,14 @@ surface (built on the E-023 `run_checkpoints` state machine, with a new CAS meth
 covering BOTH the Metadata DB and the Evidence Snapshot Store + restore-through-
 reconciler), and the operations runbooks under `docs/runbooks/`.
 **E-024 source design baseline:** `1bc627f` (E-023 CLOSED / ACCEPTED at `a1cd282`; M7 current).
-**Contract content SHA:** `c093ad707ec7aac43aa3297c5a546b6e877a70ff` (this remediation
+**Contract content SHA:** `c093ad707ec7aac43aa3297c5a546b6e877a70ff` (the R5 remediation
 commit). This is the SHA whose content defines the accepted contract; implementation MUST
-branch from it and MUST include every R1–R4 clause frozen herein.
-**Acceptance marker:** a subsequent pure-doc commit records that `c093ad7` is ACCEPTED; its
-SHA (the "implementation starting HEAD") is reported in the delivery note, NOT self-referenced
-inside this document (avoiding a self-referential commit).
-Implementation MUST NOT start from the older, FAIL-judged `8ba1e89`; it starts from the
-accepted contract SHA `c093ad7` (or the later acceptance-marker HEAD if one supersedes it).
+branch from it and MUST include every R1–R5 clause frozen herein.
+**Acceptance marker (this commit):** `c093ad7` is ACCEPTED. The SHA of this acceptance-marker
+commit is the **implementation starting HEAD** (reported in the delivery note, not
+self-referenced inside the body). Implementation MUST NOT start from the older, FAIL-judged
+`8ba1e89`; it starts from the accepted contract SHA `c093ad7` (or this marker HEAD if it
+supersedes). E-024 source implementation is now PERMITTED.
 **Build plan refs:** Milestone 7 (§3619 / §3621 / §3623 — exit gate: "依赖故障降级和恢复
 测试通过；冻结 release reference profile"), §4214 (FastAPI runtime hardening list —
 "持久 Checkpoint / Health / readiness / Cancel / Backend failure degradation"), §5081

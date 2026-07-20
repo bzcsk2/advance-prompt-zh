@@ -221,8 +221,9 @@
    ruff + `ruff format --check` + mypy clean. Full contract at `docs/issue-e023-contract.md`.
   E-024 is the OPEN issue within M7.
 - Issue: **E-024** — Health/readiness, persistent cancellation, backup/restore + runbooks
-  (build plan Milestone 7) — **CONTRACT OPEN (remediation of first submission) at
-  `ea3c724` FAIL → remediated in a subsequent commit**. The first contract was returned
+  (build plan Milestone 7) — **CONTRACT ACCEPTED at `c093ad7`** (R5 remediation; R1–R5 all
+  closed; acceptance-marker commit records `c093ad7` ACCEPTED and is the implementation
+  starting HEAD). E-024 **source implementation is now PERMITTED**. The first contract was returned
   **FAIL** on six blocking (P1) gaps: (P1-1) backup omitted the separate `evidence.db`
   Evidence Snapshot Store; (P1-2) round-0 retrieval was not cancellable (no checkpoint
   existed pre-round-0); (P1-3) no CAS method for complete/cancel race; (P1-4) cancel API
@@ -298,8 +299,11 @@
   exclusive); the acceptance matrix adds a "deleted valid CURRENT while generation dir intact →
   startup fails" test; (P2) the header now records `Contract content SHA: c093ad7` and uses a
   separate acceptance-marker pattern (no self-referential SHA; the later acceptance-marker commit
-  SHA becomes the implementation starting HEAD). R1–R4 designs are NOT re-opened. No E-024 source
-  is implemented until the remediated contract is accepted.
+  SHA becomes the implementation starting HEAD). R1–R4 designs are NOT re-opened.
+- **E-024 ACCEPTANCE MARKER (this commit):** `c093ad7` is ACCEPTED; this marker commit is the
+  implementation starting HEAD. E-024 source implementation is now PERMITTED. All R1–R5 clauses in
+  `docs/issue-e024-contract.md` are frozen and MUST be honored by the implementation. No new
+  contract remediation is required.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
