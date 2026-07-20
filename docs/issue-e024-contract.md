@@ -11,11 +11,11 @@ surface (built on the E-023 `run_checkpoints` state machine, with a new CAS meth
 `storage/metadata_store.py`), the backup/restore tooling (multi-file SQLite snapshot
 covering BOTH the Metadata DB and the Evidence Snapshot Store + restore-through-
 reconciler), and the operations runbooks under `docs/runbooks/`.
-**Code baseline (where implementation starts):** `1bc627f` (E-023 CLOSED / ACCEPTED at
-`a1cd282`; M7 current).
-**Accepted contract SHA / implementation starting HEAD:** the SHA of this remediation commit
-(`cf0dcca` → this round's commit). Implementation MUST branch from the accepted contract SHA;
-it does not start from `1bc627f`.
+**E-024 source design baseline:** `1bc627f` (E-023 CLOSED / ACCEPTED at `a1cd282`; M7 current).
+**Accepted contract SHA:** `8ba1e8956fbe9a73aaf002520fb397aa43c9d9b9`.
+**Implementation starting HEAD:** `8ba1e8956fbe9a73aaf002520fb397aa43c9d9b9`.
+Implementation MUST branch from the accepted contract SHA; it does not start from the design
+baseline `1bc627f`.
 **Build plan refs:** Milestone 7 (§3619 / §3621 / §3623 — exit gate: "依赖故障降级和恢复
 测试通过；冻结 release reference profile"), §4214 (FastAPI runtime hardening list —
 "持久 Checkpoint / Health / readiness / Cancel / Backend failure degradation"), §5081
@@ -89,8 +89,9 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     client is cancellable even while the first retrieval is blocking. The pre-round-0
     checkpoint uses `first_result=None`, `round_index=0`, empty evidence, and the
     immutable identity binding; if the run is cancelled before round 0 retrieves, the
-    `cancel_run_checkpoint` CAS flips it to `aborted` and the cooperative check (below)
-    finalizes a conservative refusal with zero retrieval/judge/model calls. If the run
+    `    `cancel_run_checkpoint` CAS flips it to `aborted` and the cooperative check (below)
+    discards the partial result and raises `RunCancelledError` with zero
+    retrieval/judge/model calls. If the run
     completes naturally, the existing per-round `_save_checkpoint` overwrites this
     minimal row with the full state (same identity binding → UPDATE, not conflict).
   - Cooperative cancellation: at deterministic boundaries (before EACH retrieval — this
@@ -111,13 +112,18 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     that count is NEVER surfaced as a grounding `no_evidence` metric.
   - `aborted` survives restart (it is a persisted row status) and `aborted` checkpoints
     are NOT resumable (E-023 already refuses `aborted` in `resume_run`).
-  - **Pre-round-0 recovery state machine (R2-P1-1, FROZEN):** `resume_run` MUST branch on
-    the persisted `status` **FIRST**, and only NARROW `first_result` requirements for
-    states that need finalization. The pre-round-0 checkpoint (`first_result=None`,
-    `round_index=0`, empty evidence) introduces three additional (status × first_result)
-    combinations. The complete, exhaustive table:
-    - `aborted` + `first_result=None` → refuse **by status first** with
-      `ResumeAuthError("checkpoint_aborted")` (NEVER an `AssertionError`); the
+  - **Pre-round-0 recovery state machine (R2-P1-1, FROZEN) — cancellation semantics unified
+    (R4-P1-1):** `resume_run` MUST branch on the persisted `status` **FIRST**, and only
+    NARROW `first_result` requirements for states that need finalization. `aborted` is a
+    run-control signal, so ANY `aborted` checkpoint (regardless of `first_result`) raises
+    **`RunCancelledError`** (NOT `ResumeAuthError`) and the API maps it to **HTTP 409
+    `{"detail":"run cancelled"}`** — same as the live-loop cancel path. `ResumeAuthError` is
+    reserved ONLY for authorization/corruption failures (missing / principal mismatch /
+    stale `policy_version` / undiscoverable corpus / corrupt `completed`). The pre-round-0
+    checkpoint (`first_result=None`, `round_index=0`, empty evidence) introduces three
+    additional (status × first_result) combinations. The complete, exhaustive table:
+    - `aborted` + `first_result=None` → raise `RunCancelledError` (NEVER `AssertionError`,
+      NEVER `ResumeAuthError("checkpoint_aborted")`, NEVER a `conservative_refusal`); the
       `first_result` being `None` is irrelevant once status is `aborted`.
     - `running` + `first_result=None` → after the standard identity / `policy_version` /
       corpus-discoverability re-auth, **restart from round 0** (re-run `run_fast_path`,
@@ -127,13 +133,14 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
       always have a `first_result`). Fail closed: `ResumeAuthError` (or treat as broken,
       like `load_run_checkpoint`'s corruption guard) — do NOT enter Retriever / Judge /
       Model.
-    - `aborted` + `first_result` set → refuse with `ResumeAuthError("checkpoint_aborted")`
-      (unchanged E-023 behavior).
+    - `aborted` + `first_result` set → raise `RunCancelledError` (same as the
+      `first_result=None` aborted case; unified for both).
     - `running` + `first_result` set → normal resume from `round_index` (E-023 behavior).
     - `completed` + `first_result` set → idempotent finalize (E-023 behavior).
     The acceptance matrix MUST cover the first three (pre-round-0) combinations with
-    explicit tests, asserting `resume_run` raises `ResumeAuthError` (aborted/completed) or
-    re-runs round 0 (running) WITHOUT ever hitting an `AssertionError`.
+    explicit tests: `aborted` (both `first_result` variants) raises `RunCancelledError` →
+    HTTP 409; `running` re-runs round 0; `completed+None` raises `ResumeAuthError` — WITHOUT
+    ever hitting an `AssertionError`.
 - **C. Backup / Restore** (local MVP, no cloud / no Postgres / no Qdrant Server):
   - **Backup sources of truth = BOTH control-plane SQLite files** (P1-1): the Metadata
     DB (`metadata.db`) AND the Evidence Snapshot Store (`evidence.db`). Qdrant collection(s)
@@ -307,44 +314,90 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
 ### Backup / restore (CLI, not HTTP)
 - Unified command: `python -m agentic_rag_enterprise.operations.backup
   {backup|restore}` (subcommand form; `operations/__init__.py` + `operations/backup.py`
-  + `operations/restore.py` are the landing zones). Both subcommands read DB paths from
-  `settings.metadata_db_path` / `settings.evidence_db_path` unless overridden by flags.
+  + `operations/restore.py` are the landing zones). The CLI operates ONLY on the
+  generation-pointer layout (R4-P1-2): production storage is NEVER two standalone absolute
+  files opened directly. The config interface is:
+  - `settings.storage_generations_root` (dir holding `restore-generations/<generation-id>/`).
+  - `settings.current_generation_pointer` (`CURRENT` pointer file under that root).
+  - `metadata_db_path` / `evidence_db_path` are ONLY the **internal filenames inside a
+    generation** (i.e. `metadata.db` / `evidence.db` within
+    `restore-generations/<id>/`), OR an explicit hermetic **non-managed mode** used solely
+    by unit tests that pass both as absolute paths to bypass generation management. They
+    are NOT production direct-open absolute paths.
+- `... backup --out <dir>` reads the live DB pair via `CURRENT`, and is frozen below.
+- `... restore --in <backup-dir> --generations-root <root>` — restore takes NO
+  `--metadata-db` / `--evidence-db` target-file arguments. It stages a new generation under
+  `<root>/restore-generations/<new-id>/`, verifies, and flips `CURRENT`. The old target-file
+  CLI form is removed.
 - `... backup --out <dir>` → the `BackupCoordinator` acquires the cross-file write
   barrier, records `snapshot_epoch`, snapshots BOTH control-plane DBs
   (`<dir>/metadata-<ts>.db`, `<dir>/evidence-<ts>.db`), computes per-file sha256 + the
   Evidence schema version (`EVIDENCE_SCHEMA_VERSION`) and writes `<dir>/manifest.json` (format version,
   `snapshot_epoch`, per-file {path, sha256, evidence_schema_version, timestamp},
   corpus/collection pointers). Then releases the barrier.
-- `... restore --in <dir> --metadata-db <target> --evidence-db <target-evidence>` →
+- `... restore --in <dir>` →
   verifies manifest/checksum/`snapshot_epoch`/format for EVERY listed file (incl. the
-  Evidence schema version (`EVIDENCE_SCHEMA_VERSION`); refuses on any mismatch. **Crash-atomic restore is
-  mandatory (R3-P1-2, FROZEN): restores are NOT in-place file overwrites.**
-  - The deployment uses a **generation-pointer** layout: a single `CURRENT` pointer file
-    resolves BOTH DBs together via a generation directory, e.g.
-    `restore-generations/<generation-id>/{metadata.db, evidence.db, manifest.json}`.
-    Services read `metadata.db` + `evidence.db` ONLY through the path that `CURRENT` names;
-    they never open a raw DB path directly.
-  - Restore procedure: verify the two new DBs in a freshly-written staging generation
-    directory → `fsync` both the files AND their parent directories → atomically replace the
-    single `CURRENT` pointer (an atomic rename of a small pointer file) to point at the new
-    generation. Because only ONE pointer flip changes which DB pair the process uses, the
-    two DBs can never be observed at different generations by a restarted process. The old
-    generation directory is retained (for rollback) but is not pointed-at.
-  - Crash windows: if the process/host dies, the only committed state is whatever `CURRENT`
-    names. A crash between `fsync` of the staged files and the pointer rename leaves the old
-    generation live (full old state). A crash after the rename leaves the new generation live
-    (full new state). There is **no** window where `CURRENT` points at a half-swapped pair,
-    because the swap is a single atomic pointer rename, not two sequential file replacements.
+  Evidence schema version `EVIDENCE_SCHEMA_VERSION`); refuses on any mismatch. **Crash-atomic
+  restore is mandatory (R3-P1-2, FROZEN): restores are NOT in-place file overwrites.**
+  - **Generation-pointer layout (R4-P1-2):** a single `CURRENT` pointer file (at
+    `settings.current_generation_pointer`) names a generation directory under
+    `settings.storage_generations_root/restore-generations/<generation-id>/`, which contains
+    exactly `{metadata.db, evidence.db, manifest.json}`. Services read `metadata.db` +
+    `evidence.db` ONLY through the path that `CURRENT` names; they never open a raw DB path
+    directly.
+  - **Restore procedure:** verify the two new DBs in a freshly-written staging generation
+    directory → `fsync` both the files AND their parent directories. Then perform the pointer
+    commit (R4-P1-4, FROZEN durability sequence):
+    1. write `CURRENT.tmp` (same directory as `CURRENT`) containing the new `<generation-id>`;
+    2. `fsync(CURRENT.tmp)`;
+    3. `os.replace(CURRENT.tmp, CURRENT)` (atomic rename);
+    4. `fsync(parent_directory_of_CURRENT)`.
+    The durable commit point is step 4 (parent-dir `fsync`), NOT the `os.replace` call return.
+    Only after step 4 is the new generation defined as durable. Because only ONE pointer flip
+    changes which DB pair the process uses, the two DBs can never be observed at different
+    generations by a restarted process. The old generation directory is retained (for
+    rollback) but is not pointed-at.
+  - **Runtime activation after flip (R4-P1-3, FROZEN = option A, offline):** restore is an
+    OFFLINE operation for the local Internal MVP. After `CURRENT` is flipped, the operator
+    stops the service, then restarts it; on startup the service resolves `CURRENT` and opens
+    the new generation's DBs (the SQLite Store opens connections at container startup, so an
+    already-running process does NOT auto-switch — online reload is explicitly OUT of scope).
+    A post-restore restart is therefore mandatory; the runbook states this.
+  - **Bootstrap / `CURRENT` lifecycle (R4-P1-3, FROZEN startup correctness):**
+    - Fresh instance (no `CURRENT`): the service creates generation 0
+      (`restore-generations/gen-0/{metadata.db, evidence.db, manifest.json}`) with the
+      applied migrations + `EVIDENCE_SCHEMA_VERSION`, then writes `CURRENT` → `gen-0`
+      (using the same 4-step durable sequence). No legacy raw-DB mode.
+    - Legacy standalone `metadata.db` / `evidence.db` present (no `CURRENT`): a one-time
+      migration MOVES them into `restore-generations/gen-0/`, writes `CURRENT` → `gen-0`,
+      and removes/renames the originals. If BOTH legacy files are present → migrate both.
+      If ONLY ONE legacy file is present (missing sibling) → the instance FAILS CLOSED at
+      startup (`RuntimeError`, do NOT serve a single-DB generation); the operator must
+      repair from a backup.
+    - `CURRENT` missing/empty → fresh-instance bootstrap (above).
+    - `CURRENT` points at a non-existent generation directory, OR the pointed-at generation
+      fails manifest/checksum/`EVIDENCE_SCHEMA_VERSION` validation, OR `CURRENT` is a
+      half-written pointer (only `CURRENT.tmp` present, no valid `CURRENT`) → startup FAILS
+      CLOSED (`RuntimeError`), refusing to serve; operator restores from backup or runs the
+      bootstrap only when no `CURRENT.tmp` race is in flight.
+  - Crash windows (R4-P1-4, FROZEN crash-point definitions):
+    - before the `os.replace` (steps 1–2) → `CURRENT` still names the old generation;
+      restart loads the FULL OLD generation.
+    - after `os.replace` but before the parent-dir `fsync` (step 3 done, step 4 pending) →
+      on power loss the system MAY load old OR new; startup MUST accept EITHER and validate
+      the full pointed-at generation (manifest + both files) before serving — and if the
+      pointed-at generation is invalid it FAILS CLOSED (never serves a half-written pair).
+    - after parent-dir `fsync` (step 4 done) → restart loads the FULL NEW generation.
+    There is **no** window where `CURRENT` points at a half-swapped pair, because the swap is
+    a single atomic pointer rename + dir fsync, not two sequential DB-file replacements.
   - Before flipping `CURRENT`, the restore also takes a pre-restore backup of the currently
     pointed-at generation (for rollback), runs the `Reconciler`, and verifies readiness on the
     staged generation. On any verification failure, the `CURRENT` pointer is left unchanged and
     the live DBs are untouched.
-  - (Rejected alternative: two independent sequential file replacements — "swap atomically /
-    offline swap" — is explicitly NOT crash-safe; a crash between the two replacements yields a
-    mixed-generation pair. The generation-pointer scheme is the required approach.)
 - `restore-generations/` layout + `CURRENT` pointer, the `BackupCoordinator` staging-verify-
-  fsync-then-rename protocol, and the startup resolver (`CURRENT`→load generation) are part of
-  the E-024 implementation landing zones (`operations/backup.py`, `operations/restore.py`;
+  fsync-then-rename protocol, and the startup resolver (`CURRENT`→load generation, with the
+  bootstrap/fail-closed rules above) are part of the E-024 implementation landing zones
+  (`operations/backup.py`, `operations/restore.py`;
   `config.py` gains the generations root + `CURRENT` resolution). The manifest must carry the
   `generation_id` and both `metadata.db` + `evidence.db` fingerprints (`EVIDENCE_SCHEMA_VERSION` + per-file sha256) so a restart can validate that `CURRENT`'s named generation is internally consistent.
 
@@ -480,18 +533,26 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
 - restore failure preserves the old DBs (live `CURRENT` unchanged) and is testable.
 - after restore, the `Reconciler` can rebuild a missing Qdrant/Parent-Store data plane.
 - readiness passes after restore (on the staged generation, before pointer flip).
-- **Crash-atomicity crash-points (R3-P1-2, MUST test):** simulate process/host death during
-  restore and assert the restart resolves to a FULL old generation OR a FULL new generation,
-  never a mix:
-  - (a) both target files NOT yet staged → restart loads the original `CURRENT` generation
-    (full old state, unchanged).
-  - (b) both files staged + `fsync`'d but `CURRENT` rename NOT performed → restart still loads
-    the original `CURRENT` generation (full old state; staged dir is orphaned, not pointed-at).
-  - (c) `CURRENT` rename performed (new generation live) but a hypothetical post-commit marker
-    not flushed → restart loads the NEW generation (full new state); old generation retained
-    for rollback.
+- **Crash-atomicity crash-points (R4-P1-4, MUST test):** simulate host/power loss during the
+  4-step durable pointer commit and assert restart resolves to a FULL old generation OR a FULL
+  new generation, never a mix:
+  - (a) before `os.replace` (staged files + `CURRENT.tmp` written, rename not done) → restart
+    loads the original `CURRENT` generation (full old state, unchanged).
+  - (b) after `os.replace` but before the parent-dir `fsync` (step 3 done, step 4 pending) →
+    restart MAY load old OR new; the test asserts startup ACCEPTS and fully validates the
+    pointed-at generation (manifest + both files + `EVIDENCE_SCHEMA_VERSION`); if invalid it
+    FAILS CLOSED — never serves a half-written pair.
+  - (c) after parent-dir `fsync` (step 4 done, the durable commit point) → restart loads the
+    NEW generation (full new state); old generation retained for rollback.
   In every crash-point the two DBs are observed at the SAME generation via `CURRENT`; a
   mixed-generation pair is impossible by construction.
+- **`CURRENT` bootstrap / fail-closed (R4-P1-3, MUST test):** fresh instance creates gen-0
+  via the durable sequence; legacy standalone pair migrates into gen-0; legacy single file
+  FAILS CLOSED at startup; `CURRENT` naming a missing/invalid generation, or only
+  `CURRENT.tmp` present, FAILS CLOSED at startup.
+- **Offline activation (R4-P1-3, MUST test):** after a successful restore (post-flip), a
+  restarted service opens the new generation via `CURRENT`; an already-running process without
+  restart does NOT switch (online reload out of scope).
 
 ### Runbooks
 - `docs/operations.md` + `docs/runbooks/{readiness-failure,cancel-stuck-run,backup,restore,reconcile,index-rollback}.md`
@@ -546,25 +607,38 @@ uv run mypy src/agentic_rag_enterprise
   `resume_run` FIRST branches on `status` then narrows `first_result` per the R2-P1-1
   table (assert is removed for `first_result=None`); cooperative cancellation check before
   each retrieval (incl. round-0) / judge / synthesis.
-- `src/agentic_rag_enterprise/services/container.py` (edit, P2) — add `evidence_db_path`
-  param; construct `EvidenceSnapshotStore` from it; pass it to the service / expose it for
-  backup; `DefaultServiceContainer(metadata_db_path=None, evidence_db_path=None)` and
-  `reset_default_container(metadata_db_path=None, evidence_db_path=None)`.
-- `src/agentic_rag_enterprise/config.py` (edit, P2) — add `evidence_db_path: str =
-  "evidence.db"`; CLI/backup read both `metadata_db_path` and `evidence_db_path`.
-- `.env.example` (edit, P2) — document `EVIDENCE_DB_PATH`.
+- `src/agentic_rag_enterprise/services/container.py` (edit, R4-P1-2) — production storage is
+  generation-managed: the container resolves the live DB pair via `CURRENT`
+  (`settings.storage_generations_root` / `settings.current_generation_pointer`) and does NOT
+  open raw `metadata_db_path`/`evidence_db_path` absolute paths in production. It exposes a
+  **non-managed mode** used only by hermetic unit tests: when both
+  `metadata_db_path`+`evidence_db_path` are passed as absolute paths (and no generations root
+  is set), the container opens them directly and skips `CURRENT` resolution.
+  `DefaultServiceContainer.from_settings(settings)` (production) and a test-only constructor
+  accepting explicit `(metadata_db_path, evidence_db_path)` for the non-managed mode.
+- `src/agentic_rag_enterprise/config.py` (edit, R4-P1-2) — production settings:
+  `storage_generations_root: str`, `current_generation_pointer: str`; `metadata_db_path` /
+  `evidence_db_path` become internal generation filenames (default `"metadata.db"` /
+  `"evidence.db"`) used only inside a generation dir or in the non-managed test mode. CLI/
+  backup read `storage_generations_root` + `current_generation_pointer`, NOT direct DB files.
+- `.env.example` (edit, R4-P1-2) — document `STORAGE_GENERATIONS_ROOT` /
+  `CURRENT_GENERATION_POINTER`; remove standalone `EVIDENCE_DB_PATH` as a production direct-
+  open path.
 - `src/agentic_rag_enterprise/operations/__init__.py` (new, P2) — package init for the
   `operations` CLI namespace.
 - `src/agentic_rag_enterprise/operations/backup.py` (new) — `BackupCoordinator` (cross-file
-  barrier + `snapshot_epoch`) + `backup` subcommand.
+  barrier + `snapshot_epoch`) + `backup` subcommand (reads live pair via `CURRENT`).
 - `src/agentic_rag_enterprise/operations/restore.py` (new, P2) — `restore` subcommand
-  (manifest/checksum/schema-version verify, pre-restore backup, reconciler, readiness).
+  (staging + 4-step durable pointer commit + bootstrap/fail-closed rules + pre-restore backup,
+  reconciler, readiness; takes `--in` + `--generations-root`, NO target-DB-file args).
 - `src/agentic_rag_enterprise/api/schemas.py` — no `action` field on `ChatRequest` (cancel
   is a dedicated endpoint, P1-4); `ChatRequest` stays `query`+`corpus_id`+`run_id`+`resume`.
-- `docs/operations.md`, `docs/runbooks/*.md` (new).
-- **Test DB hygiene (P2):** every test must use a PAIR of hermetic temp paths
-  (`metadata_db_path`, `evidence_db_path`) so containers never share a root-dir
-  `evidence.db`; `reset_default_container` is called with both.
+- `docs/operations.md`, `docs/runbooks/*.md` (new) — the restore runbook MUST state that
+  restore is OFFLINE (stop service → flip `CURRENT` → restart; R4-P1-3 option A).
+- **Test DB hygiene (R4-P1-2):** hermetic unit tests use the container's non-managed mode with
+  a PAIR of temp absolute paths; integration tests exercise the generation-pointer layout
+  (bootstrap gen-0, legacy-migration, flip, restart) and MUST NOT open a root-dir
+  `evidence.db` in production mode.
 - `tests/unit/test_health_readiness.py` (incl. legacy `/health` regression,
   frozen-readiness-rule cases: registry-read-fail→503 / empty-profile→ready /
   missing-pointer→503 / missing-collection→503), `tests/unit/test_cancellation.py`

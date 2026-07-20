@@ -271,6 +271,23 @@
   vs implementation-starting HEAD clarified; Evidence schema id frozen to the
   `EVIDENCE_SCHEMA_VERSION` constant). No E-024 source is implemented until the remediated
   contract is accepted.
+- The remediated contract (`8ba1e89`) was returned FAIL again (R4) on four blocking gaps that
+  were *conflicting* residual clauses (not new design): (R4-P1-1) three conflicting cancel
+  semantics (conservative refusal vs `RunCancelledError` vs `ResumeAuthError("checkpoint_aborted")`
+  on `aborted`) — unified: ANY `aborted` checkpoint raises `RunCancelledError` → HTTP 409;
+  `ResumeAuthError` reserved for auth/corruption only; deleted the "finalizes a conservative
+  refusal" sentence; (R4-P1-2) generation-pointer vs `--metadata-db`/`--evidence-db` target-file
+  CLI vs raw-absolute-path config conflict — CLI now takes NO target-file args (`--in <dir>
+  --generations-root <root>`); production uses `storage_generations_root` + `current_generation_pointer`;
+  `metadata_db_path`/`evidence_db_path` are internal generation filenames or a hermetic non-managed
+  test mode only; (R4-P1-3) undefined runtime activation + bootstrap — froze OFFLINE restore (stop
+  → flip `CURRENT` → restart; online reload out of scope) and full `CURRENT` lifecycle: fresh gen-0,
+  legacy-pair migration, legacy-single-file FAILS CLOSED, missing/invalid/half-written pointer FAILS
+  CLOSED; (R4-P1-4) pointer durability sequence incomplete — froze the 4-step durable commit
+  (`CURRENT.tmp` write → fsync → `os.replace` → parent-dir fsync; commit point = parent-dir fsync)
+  and redefined the three crash-points around it. P2: contract SHA frozen to `8ba1e89`. The round-4
+  remediation DELETES conflicting clauses rather than layering new ones. No E-024 source is
+  implemented until the remediated contract is accepted.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
