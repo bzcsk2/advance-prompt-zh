@@ -218,8 +218,25 @@
   evidence without leak (`resume_evidence_revoked` finding), `completed` idempotent
   zero-call resume, partial/all-evidence revocation recompute, and `aborted` non-resumable
   (test `test_aborted_checkpoint_is_not_resumable`). Full suite **799 passed / 1 skipped**,
-  ruff + `ruff format --check` + mypy clean. Full contract at `docs/issue-e023-contract.md`.
+   ruff + `ruff format --check` + mypy clean. Full contract at `docs/issue-e023-contract.md`.
   E-024 is the OPEN issue within M7.
+- Issue: **E-024** — Health/readiness, persistent cancellation, backup/restore + runbooks
+  (build plan Milestone 7) — **CONTRACT OPEN (remediation of first submission) at
+  `ea3c724` FAIL → remediated in a subsequent commit**. The first contract was returned
+  **FAIL** on six blocking (P1) gaps: (P1-1) backup omitted the separate `evidence.db`
+  Evidence Snapshot Store; (P1-2) round-0 retrieval was not cancellable (no checkpoint
+  existed pre-round-0); (P1-3) no CAS method for complete/cancel race; (P1-4) cancel API
+  was an un-frozen "option" reusing `POST /v1/chat`; (P1-5) a `/health` route already
+  existed in `api/main.py` and the contract proposed a duplicate; (P1-6) readiness
+  "at least one collection" was too loose. The remediated contract freezes: a TWO-file
+  backup (metadata.db + evidence.db), a pre-round-0 minimal `running` checkpoint, a new
+  atomic `cancel_run_checkpoint` CAS in `storage/metadata_store.py`, a dedicated
+  `POST /v1/runs/{run_id}/cancel` endpoint with a fixed state table, `/health` migrated
+  (not duplicated) into `api/routes/health.py`, and readiness checking every
+  enabled+searchable corpus's active collection. No E-024 source is implemented until the
+  remediated contract is accepted. README's "Internal / Research MVP" and "/health"
+  claims were corrected to "Internal MVP / pre-Research-MVP" and "basic /health exists".
+  Full (remediated) contract at `docs/issue-e024-contract.md`.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

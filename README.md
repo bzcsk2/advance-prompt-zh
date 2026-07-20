@@ -40,7 +40,8 @@ Auditable Answer + Citations + Trace
 ## Development status
 
 This repository is **not** a scaffold. It implements the enterprise Agentic RAG runtime
-end-to-end for a local (in-process) Internal / Research MVP. The current milestone is
+end-to-end for a local (in-process) **Internal MVP / pre-Research-MVP** runtime. The
+current milestone is
 **M7 — Runtime hardening**, and the following issues are **CLOSED / ACCEPTED**:
 
 - **E-011** — Evidence snapshot store + required dedup (current-policy re-auth)
@@ -82,8 +83,9 @@ runbooks. See `docs/issue-e024-contract.md`.
 - Reconciler / checkpoint are single-process; a restart that loses a non-file-backed
   temp DB loses in-flight checkpoints (the default container uses a stable file).
 - Local backup is **unencrypted** (no approved encryption dependency); see E-024.
-- No `/health` or `/ready` endpoint, no cancellation API, and no backup/restore tooling
-  until E-024 ships.
+- A basic liveness `/health` endpoint exists; the dependency-aware `/ready` probe and the
+  finalized E-024 health/cancellation/backup-restore surface are **not yet implemented**
+  (contract open at `docs/issue-e024-contract.md`).
 
 ## Core capabilities
 - **Corpus Registry**: structured descriptions, ownership, metadata, and ACL boundaries for each enterprise knowledge source.
