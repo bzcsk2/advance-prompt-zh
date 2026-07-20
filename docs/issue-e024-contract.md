@@ -11,7 +11,11 @@ surface (built on the E-023 `run_checkpoints` state machine, with a new CAS meth
 `storage/metadata_store.py`), the backup/restore tooling (multi-file SQLite snapshot
 covering BOTH the Metadata DB and the Evidence Snapshot Store + restore-through-
 reconciler), and the operations runbooks under `docs/runbooks/`.
-**Baseline:** `1bc627f` (main HEAD; E-023 CLOSED / ACCEPTED at `a1cd282`; M7 current).
+**Code baseline (where implementation starts):** `1bc627f` (E-023 CLOSED / ACCEPTED at
+`a1cd282`; M7 current).
+**Accepted contract SHA / implementation starting HEAD:** the SHA of this remediation commit
+(`cf0dcca` → this round's commit). Implementation MUST branch from the accepted contract SHA;
+it does not start from `1bc627f`.
 **Build plan refs:** Milestone 7 (§3619 / §3621 / §3623 — exit gate: "依赖故障降级和恢复
 测试通过；冻结 release reference profile"), §4214 (FastAPI runtime hardening list —
 "持久 Checkpoint / Health / readiness / Cancel / Backend failure degradation"), §5081
@@ -94,6 +98,17 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     before judge / synthesis per round) the loop checks the persisted `aborted` status
     and stops. An already-entered synchronous call is allowed to finish (no hard
     preemption); no NEW Retriever / Judge / Model call is issued after cancel is observed.
+  - **Cancellation is a run-control signal, NOT a grounding outcome (R3-P1-1, FROZEN):**
+    when the loop observes `aborted` (whether pre-round-0, mid-loop, or via the
+    cooperative check), it DISCARDS the partial result and raises `RunCancelledError`.
+    It MUST NOT finalize a `conservative_refusal` / `build_no_evidence_refusal`, because
+    `AnswerEnvelope` semantics require `abstained=True` ⇒ no evidence + `stop_reason==
+    no_evidence`, which would mislabel a user-initiated cancellation as a "no evidence"
+    grounding result (build plan §5.4 — a control signal is not an answer). `RunCancelledError`
+    carries no tenant/evidence identifiers and never mutates an `AnswerEnvelope.stop_reason`
+    to `no_evidence`. The in-flight Scenario-B Retriever (if any) result is discarded; its
+    single execution is still recorded in the internal trace / `tool_calls` counter, but
+    that count is NEVER surfaced as a grounding `no_evidence` metric.
   - `aborted` survives restart (it is a persisted row status) and `aborted` checkpoints
     are NOT resumable (E-023 already refuses `aborted` in `resume_run`).
   - **Pre-round-0 recovery state machine (R2-P1-1, FROZEN):** `resume_run` MUST branch on
@@ -140,18 +155,18 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     5. releases the barrier.
     Under concurrent retrieval/audit writes, the barrier guarantees metadata.db and
     evidence.db are at the same `snapshot_epoch` (not metadata@T2 + evidence@T1).
-  - **Evidence schema version (R2-P1-4):** the Evidence Snapshot Store currently creates
-    its schema with inline `CREATE TABLE IF NOT EXISTS` and has no `schema_migrations`
-    table. The contract freezes ONE of the following (implementer picks, all acceptable):
-    - a module-level `EVIDENCE_SCHEMA_VERSION` constant written into the manifest, OR
-    - an `evidence_schema_version` table the store maintains, OR
-    - a structural fingerprint (sorted `CREATE TABLE` DDL hash) recorded in the manifest.
-    The manifest's per-file entry for the Evidence DB MUST carry this version/fingerprint
-    (not a "migration list" that does not exist). `storage/evidence_store.py` is added to
-    the allowed-paths list so it can expose a safe backup lock, its schema version, and a
-    backup primitive.
+  - **Evidence schema version (R2-P1-4, FROZEN choice):** the Evidence Snapshot Store
+    currently creates its schema with inline `CREATE TABLE IF NOT EXISTS` and has no
+    `schema_migrations` table. The contract FREEZES the **module-level
+    `EVIDENCE_SCHEMA_VERSION` constant** written into the manifest (the other two options —
+    an `evidence_schema_version` table, or a DDL fingerprint — are explicitly NOT chosen, to
+    avoid manifest/test-interface divergence at implementation time). The manifest's per-file
+    entry for the Evidence DB MUST carry this `EVIDENCE_SCHEMA_VERSION` (not a "migration
+    list" that does not exist). `storage/evidence_store.py` is added to the allowed-paths
+    list so it can expose a safe backup lock, the `EVIDENCE_SCHEMA_VERSION`, and a backup
+    primitive.
   - Backup artifact carries a **versioned manifest** (format version, `snapshot_epoch`,
-    per-file {path, sha256, schema_version_or_fingerprint, timestamp}, corpus/collection
+    per-file {path, sha256, evidence_schema_version, timestamp}, corpus/collection
     pointers). The manifest lists exactly the files captured so restore can verify each one.
   - **Restore**: verify manifest/checksum/format/compatibility for EVERY listed file
     FIRST; on failure, leave the current runnable DBs untouched. Before replacing, take
@@ -278,9 +293,16 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     generic 404** (reason never leaks).
 - The iteration loop consults `metadata_store.load_run_checkpoint(run_id).status`
   (cooperative boundary) before each retrieval (including the round-0 `run_fast_path` via
-  the pre-round-0 checkpoint, P1-2) / judge / synthesis step and raises a typed
-  `_CancelRequested` control flow that finalizes a conservative refusal WITHOUT calling
-  the model.
+  the pre-round-0 checkpoint, P1-2) / judge / synthesis step. When it observes `aborted`
+  it raises `RunCancelledError` (R3-P1-1) — it does NOT call the model and does NOT return
+  an `AnswerEnvelope`. The `POST /v1/chat` (and `resume` path) handler catches
+  `RunCancelledError` and maps it to a **fixed HTTP 409** with a fixed generic body
+  `{"detail":"run cancelled"}`, returning NO `AnswerEnvelope` and recording NO
+  `no_evidence` / `abstained` grounding outcome. The dedicated `POST /v1/runs/{run_id}/cancel`
+  endpoint still returns **200** (it is the cancel *command*, not the cancelled run's
+  result). Both Scenario A and Scenario B produce the same cancel HTTP semantics (409 on
+  the chat/resume request); the only difference is the internal trace, which in Scenario B
+  records the 1 already-executed (discarded) Retriever call.
 
 ### Backup / restore (CLI, not HTTP)
 - Unified command: `python -m agentic_rag_enterprise.operations.backup
@@ -290,15 +312,41 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
 - `... backup --out <dir>` → the `BackupCoordinator` acquires the cross-file write
   barrier, records `snapshot_epoch`, snapshots BOTH control-plane DBs
   (`<dir>/metadata-<ts>.db`, `<dir>/evidence-<ts>.db`), computes per-file sha256 + the
-  Evidence schema version/fingerprint, and writes `<dir>/manifest.json` (format version,
-  `snapshot_epoch`, per-file {path, sha256, schema_version_or_fingerprint, timestamp},
+  Evidence schema version (`EVIDENCE_SCHEMA_VERSION`) and writes `<dir>/manifest.json` (format version,
+  `snapshot_epoch`, per-file {path, sha256, evidence_schema_version, timestamp},
   corpus/collection pointers). Then releases the barrier.
 - `... restore --in <dir> --metadata-db <target> --evidence-db <target-evidence>` →
   verifies manifest/checksum/`snapshot_epoch`/format for EVERY listed file (incl. the
-  Evidence schema version/fingerprint); refuses on any mismatch; takes a pre-restore
-  backup of each target; swaps atomically (or requires offline swap); applies migrations;
-  runs the `Reconciler`; verifies readiness. On any verification failure, leaves the live
-  DBs untouched.
+  Evidence schema version (`EVIDENCE_SCHEMA_VERSION`); refuses on any mismatch. **Crash-atomic restore is
+  mandatory (R3-P1-2, FROZEN): restores are NOT in-place file overwrites.**
+  - The deployment uses a **generation-pointer** layout: a single `CURRENT` pointer file
+    resolves BOTH DBs together via a generation directory, e.g.
+    `restore-generations/<generation-id>/{metadata.db, evidence.db, manifest.json}`.
+    Services read `metadata.db` + `evidence.db` ONLY through the path that `CURRENT` names;
+    they never open a raw DB path directly.
+  - Restore procedure: verify the two new DBs in a freshly-written staging generation
+    directory → `fsync` both the files AND their parent directories → atomically replace the
+    single `CURRENT` pointer (an atomic rename of a small pointer file) to point at the new
+    generation. Because only ONE pointer flip changes which DB pair the process uses, the
+    two DBs can never be observed at different generations by a restarted process. The old
+    generation directory is retained (for rollback) but is not pointed-at.
+  - Crash windows: if the process/host dies, the only committed state is whatever `CURRENT`
+    names. A crash between `fsync` of the staged files and the pointer rename leaves the old
+    generation live (full old state). A crash after the rename leaves the new generation live
+    (full new state). There is **no** window where `CURRENT` points at a half-swapped pair,
+    because the swap is a single atomic pointer rename, not two sequential file replacements.
+  - Before flipping `CURRENT`, the restore also takes a pre-restore backup of the currently
+    pointed-at generation (for rollback), runs the `Reconciler`, and verifies readiness on the
+    staged generation. On any verification failure, the `CURRENT` pointer is left unchanged and
+    the live DBs are untouched.
+  - (Rejected alternative: two independent sequential file replacements — "swap atomically /
+    offline swap" — is explicitly NOT crash-safe; a crash between the two replacements yields a
+    mixed-generation pair. The generation-pointer scheme is the required approach.)
+- `restore-generations/` layout + `CURRENT` pointer, the `BackupCoordinator` staging-verify-
+  fsync-then-rename protocol, and the startup resolver (`CURRENT`→load generation) are part of
+  the E-024 implementation landing zones (`operations/backup.py`, `operations/restore.py`;
+  `config.py` gains the generations root + `CURRENT` resolution). The manifest must carry the
+  `generation_id` and both `metadata.db` + `evidence.db` fingerprints (`EVIDENCE_SCHEMA_VERSION` + per-file sha256) so a restart can validate that `CURRENT`'s named generation is internally consistent.
 
 ---
 
@@ -371,16 +419,29 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
 - **Round-0 cancellation — TWO distinct scenarios (R2-P1-2, MUST be split):**
   - **Scenario A (cancel BEFORE the round-0 pre-call check):** the run is cancelled before
     the loop's cooperative check fires (pre-round-0 checkpoint already `aborted`). On
-    resume/continue the loop issues **0 Retriever / 0 Judge / 0 Model** calls and
-    finalizes a conservative refusal (`tool_calls=0`).
+    resume/continue the loop issues **0 Retriever / 0 Judge / 0 Model** calls and raises
+    `RunCancelledError` (`tool_calls=0`, no `AnswerEnvelope`, no `no_evidence` metric).
   - **Scenario B (cancel AFTER the round-0 Retriever is already entered & blocking):** the
     in-flight synchronous Retriever call is allowed to RETURN (cooperative cancellation
     never hard-kills an entered call); its result is **discarded**; the loop then issues
-    **0 additional Retriever / 0 Judge / 0 Model** calls and keeps `status=aborted`. The
-    returned `AnswerEnvelope.tool_calls` MUST truthfully record the 1 already-executed
-    retrieval (NOT 0) — the count reflects reality, not the post-cancel ideal.
+    **0 additional Retriever / 0 Judge / 0 Model** calls, keeps `status=aborted`, and raises
+    `RunCancelledError`. The internal trace / `tool_calls` counter MUST truthfully record the
+    1 already-executed retrieval (NOT 0) — the count reflects reality, but it is NEVER
+    surfaced as a grounding `no_evidence` outcome.
   Both scenarios are covered by integration tests (blocking round-0 Retriever + concurrent
-  cancel, plus a cancel-before-check variant).
+  cancel, plus a cancel-before-check variant). **Both yield the same HTTP cancel semantics:
+  `POST /v1/chat` (and the resume path) return HTTP 409 `{"detail":"run cancelled"}` with NO
+  `AnswerEnvelope`; the dedicated cancel endpoint still returns 200.**
+- **Cancellation is a run-control signal, never a grounding outcome (R3-P1-1, MUST test):**
+  - `RunCancelledError` is raised on observed `aborted` (pre-round-0, mid-loop, cooperative
+    check) and is NOT a `conservative_refusal` / `build_no_evidence_refusal`.
+  - `POST /v1/chat` catches `RunCancelledError` → fixed **HTTP 409** + fixed body
+    `{"detail":"run cancelled"}`; returns NO `AnswerEnvelope`; records NO `no_evidence` /
+    `abstained` grounding outcome.
+  - the cancellation MUST NOT set `AnswerEnvelope.stop_reason = "no_evidence"` and MUST NOT
+    increment any no-evidence metric; a coverage/judge fault that would have produced
+    `no_evidence` is a DIFFERENT (grounding) path and is unaffected.
+  - `RunCancelledError` carries no tenant / evidence identifiers (no leak).
 - foreign principal cannot cancel → refused (generic 404, reason hidden).
 - **stale `policy_version` or undiscoverable corpus cannot cancel** → same generic 404.
 - **cancel of a `completed` run → 200, no-op (status stays `completed`).**
@@ -407,15 +468,30 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
 - consistent backup of BOTH the Metadata DB and the Evidence Snapshot Store taken under
   concurrent retrieval/audit writes, coordinated by the `BackupCoordinator` barrier so
   both files share one `snapshot_epoch` (NOT independently-timed consistent files).
-- manifest carries per-file sha256 + the Evidence schema version/fingerprint; both
-  verifiable.
-- tampered backup (any file checksum or schema-version mismatch) is rejected; live DBs
-  untouched.
+- manifest carries per-file sha256 + the `EVIDENCE_SCHEMA_VERSION` constant + `generation_id`;
+  both DBs verifiable.
+- tampered backup (any file checksum or `EVIDENCE_SCHEMA_VERSION` mismatch) is rejected; live
+  DBs untouched.
+- restore uses the **generation-pointer** crash-atomic protocol (R3-P1-2): staging
+  generation dir + `fsync` files & dirs + atomic `CURRENT` rename; services load DBs only via
+  `CURRENT`. A sequential two-file in-place replace is NOT permitted.
 - restore to fresh DBs yields identical documents / ACLs / checkpoints / active collection
   pointer / evidence snapshots / evidence audit log, all at the same `snapshot_epoch`.
-- restore failure preserves the old DBs.
+- restore failure preserves the old DBs (live `CURRENT` unchanged) and is testable.
 - after restore, the `Reconciler` can rebuild a missing Qdrant/Parent-Store data plane.
-- readiness passes after restore.
+- readiness passes after restore (on the staged generation, before pointer flip).
+- **Crash-atomicity crash-points (R3-P1-2, MUST test):** simulate process/host death during
+  restore and assert the restart resolves to a FULL old generation OR a FULL new generation,
+  never a mix:
+  - (a) both target files NOT yet staged → restart loads the original `CURRENT` generation
+    (full old state, unchanged).
+  - (b) both files staged + `fsync`'d but `CURRENT` rename NOT performed → restart still loads
+    the original `CURRENT` generation (full old state; staged dir is orphaned, not pointed-at).
+  - (c) `CURRENT` rename performed (new generation live) but a hypothetical post-commit marker
+    not flushed → restart loads the NEW generation (full new state); old generation retained
+    for rollback.
+  In every crash-point the two DBs are observed at the SAME generation via `CURRENT`; a
+  mixed-generation pair is impossible by construction.
 
 ### Runbooks
 - `docs/operations.md` + `docs/runbooks/{readiness-failure,cancel-stuck-run,backup,restore,reconcile,index-rollback}.md`
@@ -463,7 +539,7 @@ uv run mypy src/agentic_rag_enterprise
   `complete_run_checkpoint(run_id)` (replaces the unconditional `mark_run_checkpoint_done`
   UPDATE; all iteration terminal paths use it).
 - `src/agentic_rag_enterprise/storage/evidence_store.py` (edit, R2-P1-4) — expose a safe
-  backup lock / `EVIDENCE_SCHEMA_VERSION` (or schema-version table / DDL fingerprint) and
+  backup lock / the `EVIDENCE_SCHEMA_VERSION` constant and
   a backup primitive usable by the `BackupCoordinator`.
 - `src/agentic_rag_enterprise/services/chat_service.py` (edit) — `cancel_run` +
   `complete_run_checkpoint` delegation; pre-round-0 minimal `running` checkpoint (P1-2);

@@ -253,6 +253,24 @@
   `evidence_db_path`, `.env.example`, `operations/__init__.py`, `operations/restore.py`,
   `storage/evidence_store.py`). No E-024 source is implemented until the remediated
   contract is accepted.
+- The remediated contract (`cf0dcca`) was returned FAIL again (R3) on two new blocking gaps:
+  (R3-P1-1) cancellation was still mislabelled as a `no_evidence` `AnswerEnvelope`
+  (`abstained=true`); (R3-P1-2) dual-DB restore was not crash-atomic (sequential file
+  replace leaves a mixed-generation pair on crash between the two replaces). A third
+  remediation (this commit) freezes: cancellation as a run-control signal — observed
+  `aborted` DISCARDS the partial result and raises `RunCancelledError`; `POST /v1/chat`
+  maps it to a fixed HTTP 409 `{"detail":"run cancelled"}` with NO `AnswerEnvelope` and NO
+  `no_evidence`/`abstained` grounding metric; the cancel endpoint still returns 200;
+  Scenario B records the 1 already-executed (discarded) Retriever call internally but never
+  as a grounding outcome (no E-013 `AnswerEnvelope` change); a crash-atomic generation-
+  pointer restore protocol — both DBs live only via a single `CURRENT` pointer, restore
+  stages a new generation dir, `fsync`s files+dirs, then atomically renames `CURRENT` (a
+  single pointer flip, never two sequential file replacements), with three mandatory crash-
+  point tests (neither staged / staged-but-not-flipped / flipped) each resolving to a full
+  old OR full new generation; plus P2 precision (code baseline vs accepted-contract SHA
+  vs implementation-starting HEAD clarified; Evidence schema id frozen to the
+  `EVIDENCE_SCHEMA_VERSION` constant). No E-024 source is implemented until the remediated
+  contract is accepted.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
