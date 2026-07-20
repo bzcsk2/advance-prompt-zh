@@ -285,9 +285,21 @@
   legacy-pair migration, legacy-single-file FAILS CLOSED, missing/invalid/half-written pointer FAILS
   CLOSED; (R4-P1-4) pointer durability sequence incomplete — froze the 4-step durable commit
   (`CURRENT.tmp` write → fsync → `os.replace` → parent-dir fsync; commit point = parent-dir fsync)
-  and redefined the three crash-points around it. P2: contract SHA frozen to `8ba1e89`. The round-4
-  remediation DELETES conflicting clauses rather than layering new ones. No E-024 source is
-  implemented until the remediated contract is accepted.
+  and redefined the three crash-points around it. P2: contract SHA recorded as `8ba1e89`. No E-024
+  source is implemented until the remediated contract is accepted.
+- The remediated contract (`c093ad7`) was returned FAIL again (R5) on two startup/recovery
+  blocks plus a P2 SHA drift. Round-5 (this commit) is a small pure-doc fix that: (R5-P1-1)
+  unifies the offline restore ordering — deleted the "flip CURRENT → stop service" contradiction
+  and froze the single mandatory sequence stop → verify-no-open-handles → pre-restore backup →
+  stage/validate → reconciler/readiness → durably flip CURRENT → restart → /ready (flip happens
+  ONLY while no process holds the DBs); (R5-P1-2) added a mutually-exclusive bootstrap decision
+  so a missing `CURRENT` with an existing generations root (e.g. `gen-17/`) FAILS CLOSED instead
+  of silently creating an empty `gen-0` (true-fresh vs legacy-pair vs fail-closed are now
+  exclusive); the acceptance matrix adds a "deleted valid CURRENT while generation dir intact →
+  startup fails" test; (P2) the header now records `Contract content SHA: c093ad7` and uses a
+  separate acceptance-marker pattern (no self-referential SHA; the later acceptance-marker commit
+  SHA becomes the implementation starting HEAD). R1–R4 designs are NOT re-opened. No E-024 source
+  is implemented until the remediated contract is accepted.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

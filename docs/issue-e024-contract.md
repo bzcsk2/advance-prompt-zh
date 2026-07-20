@@ -12,10 +12,14 @@ surface (built on the E-023 `run_checkpoints` state machine, with a new CAS meth
 covering BOTH the Metadata DB and the Evidence Snapshot Store + restore-through-
 reconciler), and the operations runbooks under `docs/runbooks/`.
 **E-024 source design baseline:** `1bc627f` (E-023 CLOSED / ACCEPTED at `a1cd282`; M7 current).
-**Accepted contract SHA:** `8ba1e8956fbe9a73aaf002520fb397aa43c9d9b9`.
-**Implementation starting HEAD:** `8ba1e8956fbe9a73aaf002520fb397aa43c9d9b9`.
-Implementation MUST branch from the accepted contract SHA; it does not start from the design
-baseline `1bc627f`.
+**Contract content SHA:** `c093ad707ec7aac43aa3297c5a546b6e877a70ff` (this remediation
+commit). This is the SHA whose content defines the accepted contract; implementation MUST
+branch from it and MUST include every R1–R4 clause frozen herein.
+**Acceptance marker:** a subsequent pure-doc commit records that `c093ad7` is ACCEPTED; its
+SHA (the "implementation starting HEAD") is reported in the delivery note, NOT self-referenced
+inside this document (avoiding a self-referential commit).
+Implementation MUST NOT start from the older, FAIL-judged `8ba1e89`; it starts from the
+accepted contract SHA `c093ad7` (or the later acceptance-marker HEAD if one supersedes it).
 **Build plan refs:** Milestone 7 (§3619 / §3621 / §3623 — exit gate: "依赖故障降级和恢复
 测试通过；冻结 release reference profile"), §4214 (FastAPI runtime hardening list —
 "持久 Checkpoint / Health / readiness / Cancel / Backend failure degradation"), §5081
@@ -357,29 +361,47 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     changes which DB pair the process uses, the two DBs can never be observed at different
     generations by a restarted process. The old generation directory is retained (for
     rollback) but is not pointed-at.
-  - **Runtime activation after flip (R4-P1-3, FROZEN = option A, offline):** restore is an
-    OFFLINE operation for the local Internal MVP. After `CURRENT` is flipped, the operator
-    stops the service, then restarts it; on startup the service resolves `CURRENT` and opens
-    the new generation's DBs (the SQLite Store opens connections at container startup, so an
-    already-running process does NOT auto-switch — online reload is explicitly OUT of scope).
-    A post-restore restart is therefore mandatory; the runbook states this.
-  - **Bootstrap / `CURRENT` lifecycle (R4-P1-3, FROZEN startup correctness):**
-    - Fresh instance (no `CURRENT`): the service creates generation 0
-      (`restore-generations/gen-0/{metadata.db, evidence.db, manifest.json}`) with the
-      applied migrations + `EVIDENCE_SCHEMA_VERSION`, then writes `CURRENT` → `gen-0`
-      (using the same 4-step durable sequence). No legacy raw-DB mode.
-    - Legacy standalone `metadata.db` / `evidence.db` present (no `CURRENT`): a one-time
-      migration MOVES them into `restore-generations/gen-0/`, writes `CURRENT` → `gen-0`,
-      and removes/renames the originals. If BOTH legacy files are present → migrate both.
-      If ONLY ONE legacy file is present (missing sibling) → the instance FAILS CLOSED at
-      startup (`RuntimeError`, do NOT serve a single-DB generation); the operator must
-      repair from a backup.
-    - `CURRENT` missing/empty → fresh-instance bootstrap (above).
-    - `CURRENT` points at a non-existent generation directory, OR the pointed-at generation
-      fails manifest/checksum/`EVIDENCE_SCHEMA_VERSION` validation, OR `CURRENT` is a
-      half-written pointer (only `CURRENT.tmp` present, no valid `CURRENT`) → startup FAILS
-      CLOSED (`RuntimeError`), refusing to serve; operator restores from backup or runs the
-      bootstrap only when no `CURRENT.tmp` race is in flight.
+  - **Offline restore ordering (R4-P1-3 / R5-P1-1, FROZEN = option A, offline):** restore is
+    an OFFLINE operation for the local Internal MVP. The pointer flip MUST happen while NO
+    serving/worker process holds either SQLite DB, i.e. the service is stopped FIRST. The
+    mandatory operator sequence (runbook + code MUST follow this exact order):
+    1. stop the service;
+    2. verify no serving/worker process holds either SQLite DB (no open handles);
+    3. take a pre-restore backup of the currently pointed generation;
+    4. stage and validate the new generation (manifest/checksum/`EVIDENCE_SCHEMA_VERSION`);
+    5. run the staged-generation reconciler + readiness verification;
+    6. durably flip `CURRENT` (the 4-step sequence, commit point = parent-dir fsync);
+    7. restart the service;
+    8. verify `/ready`.
+    The SQLite Store opens connections at container startup, so an already-running process
+    does NOT auto-switch — online reload is explicitly OUT of scope. Under NO circumstance
+    may restore perform `flip CURRENT → stop service`; flipping while the service is live
+    would let accepted writes to the old generation vanish on restart. A post-restore restart
+    is therefore mandatory and happens AFTER the flip.
+  - **Bootstrap / `CURRENT` lifecycle (R4-P1-3 / R5-P1-2, FROZEN startup correctness):** the
+    instance first decides fresh vs legacy vs fail-closed by a MUTUALLY-EXCLUSIVE check (it
+    MUST NOT create an empty `gen-0` whenever a generation directory already exists):
+    - **TRUE FRESH:** no `CURRENT`, no `CURRENT.tmp`, generations root does not exist OR is
+      empty, AND no legacy `metadata.db` / `evidence.db` → create generation 0
+      (`restore-generations/gen-0/{metadata.db, evidence.db, manifest.json}`) with applied
+      migrations + `EVIDENCE_SCHEMA_VERSION`, then write `CURRENT` → `gen-0` (4-step durable
+      sequence). No legacy raw-DB mode.
+    - **LEGACY MIGRATION:** no `CURRENT`, generations root empty, AND BOTH legacy
+      `metadata.db` + `evidence.db` present (as a pair) → one-time migration MOVES them into
+      `restore-generations/gen-0/`, writes `CURRENT` → `gen-0`, renames the originals. A
+      single present legacy file (missing sibling) → FAILS CLOSED (`RuntimeError`), repair
+      from backup.
+    - **FAIL CLOSED (R5-P1-2):** no `CURRENT` BUT the generations root already contains ANY
+      generation directory (e.g. `gen-17/` with complete history while `CURRENT` was
+      accidentally deleted) → FAILS CLOSED (`RuntimeError`). The instance MUST NOT silently
+      create an empty `gen-0` and bypass the existing data; the operator must restore
+      `CURRENT` from backup.
+    - no `CURRENT` but only `CURRENT.tmp` present (interrupted flip) → FAILS CLOSED
+      (`RuntimeError`); do NOT bootstrap, do NOT serve — recover by completing/aborting the
+      flip from the staged generation.
+    - `CURRENT` empty/invalid, OR points at a non-existent generation directory, OR the
+      pointed-at generation fails manifest/checksum/`EVIDENCE_SCHEMA_VERSION` validation →
+      FAILS CLOSED (`RuntimeError`), refusing to serve; operator restores from backup.
   - Crash windows (R4-P1-4, FROZEN crash-point definitions):
     - before the `os.replace` (steps 1–2) → `CURRENT` still names the old generation;
       restart loads the FULL OLD generation.
@@ -546,13 +568,18 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     NEW generation (full new state); old generation retained for rollback.
   In every crash-point the two DBs are observed at the SAME generation via `CURRENT`; a
   mixed-generation pair is impossible by construction.
-- **`CURRENT` bootstrap / fail-closed (R4-P1-3, MUST test):** fresh instance creates gen-0
-  via the durable sequence; legacy standalone pair migrates into gen-0; legacy single file
-  FAILS CLOSED at startup; `CURRENT` naming a missing/invalid generation, or only
-  `CURRENT.tmp` present, FAILS CLOSED at startup.
-- **Offline activation (R4-P1-3, MUST test):** after a successful restore (post-flip), a
-  restarted service opens the new generation via `CURRENT`; an already-running process without
-  restart does NOT switch (online reload out of scope).
+- **`CURRENT` bootstrap / fail-closed (R4-P1-3 / R5-P1-2, MUST test):** TRUE FRESH (no
+  `CURRENT`, no `CURRENT.tmp`, empty/nonexistent generations root, no legacy pair) creates
+  gen-0 via the durable sequence; LEGACY PAIR migrates into gen-0; but no `CURRENT` with a
+  non-empty generations root containing ANY generation (e.g. `gen-17/` present) MUST FAIL
+  CLOSED at startup (no silent empty gen-0); single legacy file, `CURRENT` naming a missing/
+  invalid generation, or only `CURRENT.tmp` present also FAIL CLOSED at startup.
+- **Offline activation ordering (R4-P1-3 / R5-P1-1, MUST test):** restore follows the frozen
+  stop → verify-no-open-handles → pre-restore-backup → stage/validate → reconciler/readiness
+  → durably flip `CURRENT` → restart → `/ready` sequence; an implementation that flips
+  `CURRENT` while the service is still running is rejected. After a successful restore
+  (post-flip, post-restart), the restarted service opens the new generation via `CURRENT`; an
+  already-running process without restart does NOT switch (online reload out of scope).
 
 ### Runbooks
 - `docs/operations.md` + `docs/runbooks/{readiness-failure,cancel-stuck-run,backup,restore,reconcile,index-rollback}.md`
@@ -634,7 +661,9 @@ uv run mypy src/agentic_rag_enterprise
 - `src/agentic_rag_enterprise/api/schemas.py` — no `action` field on `ChatRequest` (cancel
   is a dedicated endpoint, P1-4); `ChatRequest` stays `query`+`corpus_id`+`run_id`+`resume`.
 - `docs/operations.md`, `docs/runbooks/*.md` (new) — the restore runbook MUST state that
-  restore is OFFLINE (stop service → flip `CURRENT` → restart; R4-P1-3 option A).
+  restore is OFFLINE and follows the frozen order: stop service → verify no open SQLite
+  handles → pre-restore backup → stage/validate → reconciler/readiness → durably flip
+  `CURRENT` → restart service → verify `/ready` (R4-P1-3 option A / R5-P1-1).
 - **Test DB hygiene (R4-P1-2):** hermetic unit tests use the container's non-managed mode with
   a PAIR of temp absolute paths; integration tests exercise the generation-pointer layout
   (bootstrap gen-0, legacy-migration, flip, restart) and MUST NOT open a root-dir
